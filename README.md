@@ -40,7 +40,7 @@ The Virtual Lab can be installed via pip.
 pip install virtual-lab
 ```
 
-To install a local version of the Virtual Lab, clone the repo and then install the package.
+To install the latest version of the Virtual Lab locally, clone the repo and then install the package.
 
 ```bash
 git clone https://github.com/zou-group/virtual_lab.git
@@ -51,4 +51,4 @@ pip install -e .
 
 ## OpenAI API Key
 
-The Virtual Lab currently uses GPT-4o from OpenAI. Save your OpenAI API key as the environment variable `OPENAI_API_KEY`. For example, add `export OPENAI_API_KEY=<your_key>` to your `.bashrc` or `.bash_profile`.
+The Virtual Lab currently uses GPT-5.2 from OpenAI by default. Save your OpenAI API key as the environment variable `OPENAI_API_KEY`. For example, add `export OPENAI_API_KEY=<your_key>` to your `.bashrc` or `.bash_profile`.
