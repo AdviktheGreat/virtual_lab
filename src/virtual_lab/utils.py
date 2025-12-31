@@ -19,9 +19,7 @@ from virtual_lab.constants import (
 from virtual_lab.prompts import format_references
 
 
-def get_pubmed_central_article(
-    pmcid: str, abstract_only: bool = False
-) -> tuple[str | None, list[str] | None]:
+def get_pubmed_central_article(pmcid: str, abstract_only: bool = False) -> tuple[str | None, list[str] | None]:
     """Gets the title and content (abstract or full text) of a PubMed Central article given a PMC ID.
 
     Note: This only returns main text, ignoring tables, figures, and references.
@@ -46,32 +44,19 @@ def get_pubmed_central_article(
     document = article[0]["documents"][0]
 
     # Get title
-    title = next(
-        passage["text"]
-        for passage in document["passages"]
-        if passage["infons"]["section_type"] == "TITLE"
-    )
+    title = next(passage["text"] for passage in document["passages"] if passage["infons"]["section_type"] == "TITLE")
 
     # Get relevant passages
-    passages = [
-        passage
-        for passage in document["passages"]
-        if passage["infons"]["type"] in {"abstract", "paragraph"}
-    ]
+    passages = [passage for passage in document["passages"] if passage["infons"]["type"] in {"abstract", "paragraph"}]
 
     # Get abstract or full text of article (excluding references)
     if abstract_only:
-        passages = [
-            passage
-            for passage in passages
-            if passage["infons"]["section_type"] in ["ABSTRACT"]
-        ]
+        passages = [passage for passage in passages if passage["infons"]["section_type"] in ["ABSTRACT"]]
     else:
         passages = [
             passage
             for passage in passages
-            if passage["infons"]["section_type"]
-            in ["ABSTRACT", "INTRO", "RESULTS", "DISCUSS", "CONCL", "METHODS"]
+            if passage["infons"]["section_type"] in ["ABSTRACT", "INTRO", "RESULTS", "DISCUSS", "CONCL", "METHODS"]
         ]
 
     # Get content
@@ -80,9 +65,7 @@ def get_pubmed_central_article(
     return title, content
 
 
-def run_pubmed_search(
-    query: str, num_articles: int = 3, abstract_only: bool = False
-) -> str:
+def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = False) -> str:
     """Runs a PubMed search, returning the full text of the top matching article.
 
     :param query: The query to search PubMed with.
@@ -194,9 +177,7 @@ def get_messages(client: OpenAI, thread_id: str) -> list[dict]:
             del params["after"]
 
         # Get messages
-        new_messages = [
-            message.to_dict() for message in client.beta.threads.messages.list(**params)
-        ]
+        new_messages = [message.to_dict() for message in client.beta.threads.messages.list(**params)]
 
         # Append new messages
         messages += new_messages
@@ -239,10 +220,7 @@ async def async_get_messages(client: AsyncOpenAI, thread_id: str) -> list[dict]:
             del params["after"]
 
         # Get messages
-        new_messages = [
-            message.to_dict()
-            async for message in client.beta.threads.messages.list(**params)
-        ]
+        new_messages = [message.to_dict() async for message in client.beta.threads.messages.list(**params)]
 
         # Append new messages
         messages += new_messages
@@ -290,9 +268,7 @@ def update_token_counts(
     token_counts["input"] += new_input_token_count
     token_counts["output"] += new_output_token_count
 
-    token_counts["max"] = max(
-        token_counts["max"], new_input_token_count + new_output_token_count
-    )
+    token_counts["max"] = max(token_counts["max"], new_input_token_count + new_output_token_count)
 
 
 def count_discussion_tokens(
@@ -320,9 +296,27 @@ def count_discussion_tokens(
     return token_counts
 
 
-def compute_token_cost(
-    model: str, input_token_count: int, output_token_count: int
-) -> float:
+def _find_model_price_key(model: str, price_dict: dict[str, float]) -> str | None:
+    """Finds the matching key in a price dictionary for a model.
+
+    First checks for an exact match, then finds the longest prefix match.
+
+    :param model: The name of the model.
+    :param price_dict: The price dictionary to search.
+    :return: The matching key or None if no match found.
+    """
+    if model in price_dict:
+        return model
+
+    # Find the longest prefix match
+    matching_keys = [key for key in price_dict if model.startswith(key)]
+    if matching_keys:
+        return max(matching_keys, key=len)
+
+    return None
+
+
+def compute_token_cost(model: str, input_token_count: int, output_token_count: int) -> float:
     """Computes the token cost of a model given input and output token counts.
 
     :param model: The name of the model.
@@ -330,15 +324,15 @@ def compute_token_cost(
     :param output_token_count: The number of tokens in the output.
     :return: The token cost of the model.
     """
-    if (
-        model not in MODEL_TO_INPUT_PRICE_PER_TOKEN
-        or model not in MODEL_TO_OUTPUT_PRICE_PER_TOKEN
-    ):
+    input_key = _find_model_price_key(model, MODEL_TO_INPUT_PRICE_PER_TOKEN)
+    output_key = _find_model_price_key(model, MODEL_TO_OUTPUT_PRICE_PER_TOKEN)
+
+    if input_key is None or output_key is None:
         raise ValueError(f'Cost of model "{model}" not known')
 
     return (
-        input_token_count * MODEL_TO_INPUT_PRICE_PER_TOKEN[model]
-        + output_token_count * MODEL_TO_OUTPUT_PRICE_PER_TOKEN[model]
+        input_token_count * MODEL_TO_INPUT_PRICE_PER_TOKEN[input_key]
+        + output_token_count * MODEL_TO_OUTPUT_PRICE_PER_TOKEN[output_key]
     )
 
 
@@ -368,9 +362,7 @@ def print_cost_and_time(
     print(f"Time: {int(elapsed_time // 60)}:{int(elapsed_time % 60):02d}")
 
 
-def compute_finetuning_cost(
-    model: str, token_count: int, num_epochs: int = DEFAULT_FINETUNING_EPOCHS
-) -> float:
+def compute_finetuning_cost(model: str, token_count: int, num_epochs: int = DEFAULT_FINETUNING_EPOCHS) -> float:
     """Computes the cost of fine-tuning a model.
 
     :param model: The model that will be finetuned.
@@ -381,14 +373,10 @@ def compute_finetuning_cost(
     if model not in FINETUNING_MODEL_TO_TRAINING_PRICE_PER_TOKEN:
         raise ValueError(f'Cost of model "{model}" not known')
 
-    return (
-        token_count * FINETUNING_MODEL_TO_TRAINING_PRICE_PER_TOKEN[model] * num_epochs
-    )
+    return token_count * FINETUNING_MODEL_TO_TRAINING_PRICE_PER_TOKEN[model] * num_epochs
 
 
-def convert_messages_to_discussion(
-    messages: list[dict], assistant_id_to_title: dict[str, str]
-) -> list[dict[str, str]]:
+def convert_messages_to_discussion(messages: list[dict], assistant_id_to_title: dict[str, str]) -> list[dict[str, str]]:
     """Converts OpenAI messages into discussion format (list of message dictionaries).
 
     :param messages: The messages to convert.
@@ -398,9 +386,7 @@ def convert_messages_to_discussion(
     return [
         {
             "agent": (
-                assistant_id_to_title[message["assistant_id"]]
-                if message["assistant_id"] is not None
-                else "User"
+                assistant_id_to_title[message["assistant_id"]] if message["assistant_id"] is not None else "User"
             ),
             "message": message["content"][0]["text"]["value"],
         }
@@ -432,9 +418,7 @@ def load_summaries(discussion_paths: list[Path]) -> tuple[str, ...]:
     return tuple(summaries)
 
 
-def save_meeting(
-    save_dir: Path, save_name: str, discussion: list[dict[str, str]]
-) -> None:
+def save_meeting(save_dir: Path, save_name: str, discussion: list[dict[str, str]]) -> None:
     """Save a meeting discussion to JSON and Markdown files.
 
     :param save_dir: The directory to save the discussion.
