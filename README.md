@@ -5,7 +5,7 @@
 [![Downloads](https://pepy.tech/badge/virtual-lab)](https://pepy.tech/project/virtual-lab)
 [![license](https://img.shields.io/github/license/zou-group/virtual-lab.svg)](https://github.com/zou-group/virtual-lab/blob/main/LICENSE.txt)
 
-![Virtual Lab](images/virtual_lab_architecture.png)
+![Virtual Lab](https://github.com/zou-group/virtual-lab/raw/main/images/virtual_lab_architecture.png)
 
 The **Virtual Lab** is an AI-human collaboration for science research. In the Virtual Lab, a human researcher works with a team of large language model (LLM) **agents** to perform scientific research. Interaction between the human researcher and the LLM agents occurs via a series of **team meetings**, where all the LLM agents discuss a scientific agenda posed by the human researcher, and **individual meetings**, where the human researcher interacts with a single LLM agent to solve a particular scientific task.
 
@@ -30,7 +30,7 @@ The Virtual Lab can be installed using pip or by cloning the repo and installing
 Optionally, first create a conda environment.
 
 ```bash
-conda create -y -n virtual_lab python=3.12
+conda create -y -n virtual_lab python=3.14
 conda activate virtual_lab
 ```
 
