@@ -39,6 +39,7 @@ def run_meeting(
     team_lead: Agent | None = None,
     team_members: tuple[Agent, ...] | None = None,
     team_member: Agent | None = None,
+    critic: Agent | None = None,
     agenda_questions: tuple[str, ...] = (),
     agenda_rules: tuple[str, ...] = (),
     summaries: tuple[str, ...] = (),
@@ -57,6 +58,9 @@ def run_meeting(
     :param team_lead: The team lead for a team meeting (None for individual meeting).
     :param team_members: The team members for a team meeting (None for individual meeting).
     :param team_member: The team member for an individual meeting (None for team meeting).
+    :param critic: The critic for an individual meeting (None for team meeting). If None, the
+        Scientific Critic is used with the same model as team_member so that the meeting does
+        not silently mix models.
     :param agenda_questions: The agenda questions to answer by the end of the meeting.
     :param agenda_rules: The rules for the meeting.
     :param summaries: The summaries of previous meetings.
@@ -77,11 +81,15 @@ def run_meeting(
             raise ValueError("Team lead must be separate from team members")
         if len(set(team_members)) != len(team_members):
             raise ValueError("Team members must be unique")
+        if critic is not None:
+            raise ValueError("Team meeting does not use a separate critic; include one in team_members")
     elif meeting_type == "individual":
         if team_member is None:
             raise ValueError("Individual meeting requires individual team member")
         if team_lead is not None or team_members is not None:
             raise ValueError("Individual meeting does not require team lead or team members")
+        if critic is not None and critic.title == team_member.title:
+            raise ValueError("Critic must be separate from the individual team member")
     else:
         raise ValueError(f"Invalid meeting type: {meeting_type}")
 
@@ -92,13 +100,16 @@ def run_meeting(
     client = OpenAI()
 
     # Set up team
+    meeting_critic: Agent | None = None
+
     if meeting_type == "team":
         assert team_lead is not None and team_members is not None
         team: list[Agent] = [team_lead] + list(team_members)
         primary_model = team_lead.model
     else:
         assert team_member is not None
-        team = [team_member, SCIENTIFIC_CRITIC]
+        meeting_critic = critic if critic is not None else SCIENTIFIC_CRITIC.with_model(team_member.model)
+        team = [team_member, meeting_critic]
         primary_model = team_member.model
 
     # Set up tools
@@ -141,7 +152,8 @@ def run_meeting(
             if meeting_type == "team":
                 assert team_lead is not None
                 # Team meeting prompts
-                if agent == team_lead:
+                # Compared by identity because two distinct agents can share a title
+                if agent is team_lead:
                     if round_index == 0:
                         prompt = team_meeting_team_lead_initial_prompt(team_lead=team_lead)
                     elif round_index == num_rounds:
@@ -162,10 +174,10 @@ def run_meeting(
                         team_member=agent, round_num=round_num, num_rounds=num_rounds
                     )
             else:
-                assert team_member is not None
+                assert team_member is not None and meeting_critic is not None
                 # Individual meeting prompts
-                if agent == SCIENTIFIC_CRITIC:
-                    prompt = individual_meeting_critic_prompt(critic=SCIENTIFIC_CRITIC, agent=team_member)
+                if agent is meeting_critic:
+                    prompt = individual_meeting_critic_prompt(critic=meeting_critic, agent=team_member)
                 else:
                     if round_index == 0:
                         prompt = individual_meeting_start_prompt(
@@ -177,7 +189,7 @@ def run_meeting(
                             contexts=contexts,
                         )
                     else:
-                        prompt = individual_meeting_agent_prompt(critic=SCIENTIFIC_CRITIC, agent=team_member)
+                        prompt = individual_meeting_agent_prompt(critic=meeting_critic, agent=team_member)
 
             # Add prompt as user message
             messages.append({"role": "user", "content": prompt})

@@ -89,7 +89,8 @@ principal_investigator = Agent(
 )
 
 # Scientific critic
-scientific_critic = SCIENTIFIC_CRITIC
+# Pinned to the project model; the library default tracks the latest OpenAI model
+scientific_critic = SCIENTIFIC_CRITIC.with_model(model)
 
 # Specialized science agents
 immunologist = Agent(

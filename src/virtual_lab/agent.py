@@ -30,6 +30,20 @@ class Agent:
             f"Your role is to {self.role}."
         )
 
+    def with_model(self, model: str) -> "Agent":
+        """Returns a copy of the agent that uses a different model.
+
+        :param model: The model for the new agent.
+        :return: A copy of the agent using the given model.
+        """
+        return Agent(
+            title=self.title,
+            expertise=self.expertise,
+            goal=self.goal,
+            role=self.role,
+            model=model,
+        )
+
     @property
     def message(self) -> ChatCompletionMessageParam:
         """Returns the message for the agent in OpenAI API form."""
