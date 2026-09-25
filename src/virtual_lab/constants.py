@@ -50,6 +50,15 @@ DEFAULT_FINETUNING_EPOCHS = 4
 # cl100k_base only applies to gpt-4 and gpt-3.5-turbo.
 DEFAULT_ENCODING = "o200k_base"
 
+# Subdirectory for the transcript of a meeting that failed partway through. Kept out of the
+# meeting's own directory so that globs over finished meetings cannot match it.
+PARTIAL_MEETING_DIR_NAME = "partial"
+
+# Retries for transient API failures (rate limits, timeouts, 5xx), applied with
+# exponential backoff by the OpenAI client. Higher than the SDK default of 2 because a
+# failed call discards a whole meeting's worth of work.
+DEFAULT_MAX_RETRIES = 5
+
 CONSISTENT_TEMPERATURE = 0.2
 CREATIVE_TEMPERATURE = 0.8
 

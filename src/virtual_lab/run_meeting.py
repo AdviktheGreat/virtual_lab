@@ -9,7 +9,12 @@ from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletio
 from tqdm import trange, tqdm
 
 from virtual_lab.agent import Agent
-from virtual_lab.constants import CONSISTENT_TEMPERATURE, PUBMED_TOOL_DESCRIPTION
+from virtual_lab.constants import (
+    CONSISTENT_TEMPERATURE,
+    DEFAULT_MAX_RETRIES,
+    PARTIAL_MEETING_DIR_NAME,
+    PUBMED_TOOL_DESCRIPTION,
+)
 from virtual_lab.prompts import (
     individual_meeting_agent_prompt,
     individual_meeting_critic_prompt,
@@ -46,6 +51,7 @@ def run_meeting(
     temperature: float = CONSISTENT_TEMPERATURE,
     pubmed_search: bool = False,
     return_summary: bool = False,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> str | None:
     """Runs a meeting with a LLM agents.
 
@@ -67,6 +73,9 @@ def run_meeting(
     :param temperature: The sampling temperature.
     :param pubmed_search: Whether to include a PubMed search tool.
     :param return_summary: Whether to return the summary of the meeting.
+    :param max_retries: The number of times to retry a failed API call, with exponential backoff.
+    :raises Exception: If an API call fails after all retries. The completed portion of the
+        discussion is saved under save_dir/partial/ before the error propagates.
     :return: The summary of the meeting (i.e., the last message) if return_summary is True, else None.
     """
     # Validate meeting type
@@ -95,7 +104,7 @@ def run_meeting(
     start_time = time.time()
 
     # Set up client
-    client = OpenAI()
+    client = OpenAI(max_retries=max_retries)
 
     # Set up team
     meeting_critic: Agent | None = None
@@ -139,115 +148,128 @@ def run_meeting(
         discussion.append({"agent": "User", "message": initial_content})
 
     # Loop through rounds
-    for round_index in trange(num_rounds + 1, desc="Rounds (+ Final Round)"):
-        round_num = round_index + 1
+    try:
+        for round_index in trange(num_rounds + 1, desc="Rounds (+ Final Round)"):
+            round_num = round_index + 1
 
-        # Loop through team and elicit responses
-        for agent in tqdm(team, desc="Team"):
-            # Prompt based on agent and round number
-            if meeting_type == "team":
-                assert team_lead is not None
-                # Team meeting prompts
-                # Compared by identity because two distinct agents can share a title
-                if agent is team_lead:
-                    if round_index == 0:
-                        prompt = team_meeting_team_lead_initial_prompt(team_lead=team_lead)
-                    elif round_index == num_rounds:
-                        prompt = team_meeting_team_lead_final_prompt(
-                            team_lead=team_lead,
-                            agenda=agenda,
-                            agenda_questions=agenda_questions,
-                            agenda_rules=agenda_rules,
-                        )
+            # Loop through team and elicit responses
+            for agent in tqdm(team, desc="Team"):
+                # Prompt based on agent and round number
+                if meeting_type == "team":
+                    assert team_lead is not None
+                    # Team meeting prompts
+                    # Compared by identity because two distinct agents can share a title
+                    if agent is team_lead:
+                        if round_index == 0:
+                            prompt = team_meeting_team_lead_initial_prompt(team_lead=team_lead)
+                        elif round_index == num_rounds:
+                            prompt = team_meeting_team_lead_final_prompt(
+                                team_lead=team_lead,
+                                agenda=agenda,
+                                agenda_questions=agenda_questions,
+                                agenda_rules=agenda_rules,
+                            )
+                        else:
+                            prompt = team_meeting_team_lead_intermediate_prompt(
+                                team_lead=team_lead,
+                                round_num=round_num - 1,
+                                num_rounds=num_rounds,
+                            )
                     else:
-                        prompt = team_meeting_team_lead_intermediate_prompt(
-                            team_lead=team_lead,
-                            round_num=round_num - 1,
-                            num_rounds=num_rounds,
+                        prompt = team_meeting_team_member_prompt(
+                            team_member=agent, round_num=round_num, num_rounds=num_rounds
                         )
                 else:
-                    prompt = team_meeting_team_member_prompt(
-                        team_member=agent, round_num=round_num, num_rounds=num_rounds
-                    )
-            else:
-                assert team_member is not None and meeting_critic is not None
-                # Individual meeting prompts
-                if agent is meeting_critic:
-                    prompt = individual_meeting_critic_prompt(critic=meeting_critic, agent=team_member)
-                else:
-                    if round_index == 0:
-                        prompt = individual_meeting_start_prompt(
-                            team_member=team_member,
-                            agenda=agenda,
-                            agenda_questions=agenda_questions,
-                            agenda_rules=agenda_rules,
-                            summaries=summaries,
-                            contexts=contexts,
-                        )
+                    assert team_member is not None and meeting_critic is not None
+                    # Individual meeting prompts
+                    if agent is meeting_critic:
+                        prompt = individual_meeting_critic_prompt(critic=meeting_critic, agent=team_member)
                     else:
-                        prompt = individual_meeting_agent_prompt(critic=meeting_critic, agent=team_member)
+                        if round_index == 0:
+                            prompt = individual_meeting_start_prompt(
+                                team_member=team_member,
+                                agenda=agenda,
+                                agenda_questions=agenda_questions,
+                                agenda_rules=agenda_rules,
+                                summaries=summaries,
+                                contexts=contexts,
+                            )
+                        else:
+                            prompt = individual_meeting_agent_prompt(critic=meeting_critic, agent=team_member)
 
-            # Add prompt as user message
-            messages.append({"role": "user", "content": prompt})
-            discussion.append({"agent": "User", "message": prompt})
+                # Add prompt as user message
+                messages.append({"role": "user", "content": prompt})
+                discussion.append({"agent": "User", "message": prompt})
 
-            # Build messages for this agent with their system prompt
-            agent_messages: list[ChatCompletionMessageParam] = [agent.message] + messages
+                # Build messages for this agent with their system prompt
+                agent_messages: list[ChatCompletionMessageParam] = [agent.message] + messages
 
-            # Call the chat completions API
-            response = client.chat.completions.create(
-                model=agent.model,
-                messages=agent_messages,
-                temperature=temperature,
-                tools=tools if tools else NOT_GIVEN,
-            )
-            usage.add(model=agent.model, usage=response.usage)
-
-            # Get the response message
-            response_message = response.choices[0].message
-
-            # Check if the model wants to call tools
-            if response_message.tool_calls:
-                # Run the tools and get outputs
-                tool_outputs, tool_messages = run_tools(tool_calls=response_message.tool_calls)
-
-                # Add the assistant's message with tool_calls to the messages
-                assistant_tool_message: ChatCompletionAssistantMessageParam = {
-                    "role": "assistant",
-                    "content": response_message.content,
-                    "tool_calls": [tc.model_dump() for tc in response_message.tool_calls],  # type: ignore[misc]
-                }
-                messages.append(assistant_tool_message)
-
-                # Add tool response messages
-                for tool_msg in tool_messages:
-                    messages.append(tool_msg)
-
-                # Add tool outputs to discussion for visibility
-                tool_output_content = "\n\n".join(tool_outputs)
-                discussion.append({"agent": "Tool", "message": tool_output_content})
-
-                # Make another API call with tool results
-                agent_messages = [agent.message] + messages
-
+                # Call the chat completions API
                 response = client.chat.completions.create(
                     model=agent.model,
                     messages=agent_messages,
                     temperature=temperature,
+                    tools=tools if tools else NOT_GIVEN,
                 )
                 usage.add(model=agent.model, usage=response.usage)
+
+                # Get the response message
                 response_message = response.choices[0].message
 
-            # Extract the response content
-            response_content = response_message.content or ""
+                # Check if the model wants to call tools
+                if response_message.tool_calls:
+                    # Run the tools and get outputs
+                    tool_outputs, tool_messages = run_tools(tool_calls=response_message.tool_calls)
 
-            # Add response to messages and discussion
-            messages.append({"role": "assistant", "content": response_content})
-            discussion.append({"agent": agent.title, "message": response_content})
+                    # Add the assistant's message with tool_calls to the messages
+                    assistant_tool_message: ChatCompletionAssistantMessageParam = {
+                        "role": "assistant",
+                        "content": response_message.content,
+                        "tool_calls": [tc.model_dump() for tc in response_message.tool_calls],  # type: ignore[misc]
+                    }
+                    messages.append(assistant_tool_message)
 
-            # If final round, only team lead or team member responds
-            if round_index == num_rounds:
-                break
+                    # Add tool response messages
+                    for tool_msg in tool_messages:
+                        messages.append(tool_msg)
+
+                    # Add tool outputs to discussion for visibility
+                    tool_output_content = "\n\n".join(tool_outputs)
+                    discussion.append({"agent": "Tool", "message": tool_output_content})
+
+                    # Make another API call with tool results
+                    agent_messages = [agent.message] + messages
+
+                    response = client.chat.completions.create(
+                        model=agent.model,
+                        messages=agent_messages,
+                        temperature=temperature,
+                    )
+                    usage.add(model=agent.model, usage=response.usage)
+                    response_message = response.choices[0].message
+
+                # Extract the response content
+                response_content = response_message.content or ""
+
+                # Add response to messages and discussion
+                messages.append({"role": "assistant", "content": response_content})
+                discussion.append({"agent": agent.title, "message": response_content})
+
+                # If final round, only team lead or team member responds
+                if round_index == num_rounds:
+                    break
+    except Exception:
+        # A meeting can be many minutes and many dollars of work, so preserve whatever
+        # completed. It goes in a subdirectory rather than alongside the finished meetings
+        # because callers glob patterns like "discussion_*.json" and feed the last turn of
+        # every match to load_summaries, which would treat a truncated meeting as a summary.
+        if discussion:
+            partial_dir = save_dir / PARTIAL_MEETING_DIR_NAME
+            save_meeting(save_dir=partial_dir, save_name=save_name, discussion=discussion)
+            print(f"Meeting failed. Partial discussion saved to {partial_dir / f'{save_name}.json'}")
+        print("Usage before the failure:")
+        usage.print_summary(elapsed_time=time.time() - start_time)
+        raise
 
     # Print the usage reported by the API, priced per model
     usage.print_summary(elapsed_time=time.time() - start_time)
