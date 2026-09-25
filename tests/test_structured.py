@@ -14,11 +14,15 @@ from conftest import TEST_MODEL, FakeClient, make_usage, parsed_response, text_r
 
 
 class Decision(BaseModel):
-    """A stand-in schema for a meeting's conclusions."""
+    """A stand-in schema for a meeting's conclusions.
+
+    No field has a default, because strict structured output mode makes every field required and
+    would ignore one.
+    """
 
     recommendation: str = Field(description="What the meeting decided to do.")
     confidence: float = Field(description="How confident the team is, from 0 to 1.")
-    open_questions: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(description="Anything the meeting could not settle.")
 
 
 DECISION = Decision(
@@ -38,6 +42,20 @@ def run_with_schema(team_member: Agent, save_dir, **kwargs):
         output_schema=Decision,
         **kwargs,
     )
+
+
+def test_defaults_in_a_schema_are_ignored_by_strict_mode() -> None:
+    # Recorded because it is surprising: a default does not make a field optional, the API
+    # promotes it to required and the default never applies. Schemas should not rely on them.
+    from openai.lib._pydantic import to_strict_json_schema
+
+    class WithDefault(BaseModel):
+        needed: str
+        defaulted: list[str] = Field(default_factory=list)
+
+    schema = to_strict_json_schema(WithDefault)
+
+    assert set(schema["required"]) == {"needed", "defaulted"}
 
 
 class TestRequestStructuredOutput:

@@ -85,7 +85,8 @@ def run_meeting(
     :param tools: Additional tools the agents may call during the meeting.
     :param output_schema: A pydantic model for the meeting's conclusions. When given, the agent who
         closed the meeting is asked to restate them against the schema in one additional call, the
-        result is saved under save_dir/outputs/, and the validated instance is returned.
+        result is saved under save_dir/outputs/, and the validated instance is returned. Note that
+        the API makes every field of the schema required, so a field default never applies.
     :param return_summary: Whether to return the summary of the meeting.
     :param max_retries: The number of times to retry a failed API call, with exponential backoff.
     :raises Exception: If an API call fails after all retries. The completed portion of the
