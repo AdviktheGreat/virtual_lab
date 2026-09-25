@@ -23,7 +23,6 @@ from virtual_lab.prompts import (
 )
 from virtual_lab.utils import (
     count_discussion_tokens,
-    count_tokens,
     get_summary,
     print_cost_and_time,
     run_tools,
@@ -116,9 +115,6 @@ def run_meeting(
     tools: list[ChatCompletionToolParam] | None = (
         [ChatCompletionToolParam(**PUBMED_TOOL_DESCRIPTION)] if pubmed_search else None  # type: ignore[misc]
     )
-
-    # Set up tool token count
-    tool_token_count = 0
 
     # Initialize discussion (list of agent/message dicts for output)
     discussion: list[dict[str, str]] = []
@@ -214,9 +210,6 @@ def run_meeting(
                 # Run the tools and get outputs
                 tool_outputs, tool_messages = run_tools(tool_calls=response_message.tool_calls)
 
-                # Update tool token count
-                tool_token_count += sum(count_tokens(output) for output in tool_outputs)
-
                 # Add the assistant's message with tool_calls to the messages
                 assistant_tool_message: ChatCompletionAssistantMessageParam = {
                     "role": "assistant",
@@ -256,9 +249,6 @@ def run_meeting(
 
     # Count discussion tokens
     token_counts = count_discussion_tokens(discussion=discussion)
-
-    # Add tool token count to total token count
-    token_counts["tool"] = tool_token_count
 
     # Print cost and time
     # TODO: handle different models for different agents
