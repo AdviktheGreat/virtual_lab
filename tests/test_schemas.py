@@ -8,7 +8,12 @@ from pydantic import ValidationError
 from virtual_lab.agent import Agent
 from virtual_lab.constants import OUTPUT_DIR_NAME
 from virtual_lab.run_meeting import run_meeting
-from virtual_lab.schemas import AgentSpec, TeamRoster
+from virtual_lab.schemas import (
+    AgentSpec,
+    ComponentAssignment,
+    ImplementationPlan,
+    TeamRoster,
+)
 
 from conftest import TEST_MODEL, FakeClient, parsed_response
 
@@ -102,6 +107,144 @@ class TestTeamRoster:
         speakers = {turn["agent"] for turn in discussion}
 
         assert {"Immunologist", "Structural Biologist"} <= speakers
+
+
+PLAN = ImplementationPlan(
+    assignments=[
+        ComponentAssignment(
+            component="ESM",
+            assignee_title="Immunologist",
+            rationale="Closest to the sequence-level analysis.",
+        ),
+        ComponentAssignment(
+            component="AlphaFold-Multimer",
+            assignee_title="Structural Biologist",
+            rationale="Owns structure prediction.",
+        ),
+        ComponentAssignment(
+            component="Rosetta",
+            assignee_title="Structural Biologist",
+            rationale="Same toolchain as AlphaFold-Multimer.",
+        ),
+    ]
+)
+
+
+class TestImplementationPlan:
+    @staticmethod
+    def team() -> tuple[Agent, ...]:
+        return ROSTER.to_agents(model=TEST_MODEL)
+
+    def test_each_component_resolves_to_an_agent(self) -> None:
+        resolved = PLAN.resolve(team=self.team())
+
+        assert set(resolved) == {"ESM", "AlphaFold-Multimer", "Rosetta"}
+        assert all(isinstance(agent, Agent) for agent in resolved.values())
+
+    def test_a_member_may_own_more_than_one_component(self) -> None:
+        resolved = PLAN.resolve(team=self.team())
+
+        assert resolved["AlphaFold-Multimer"] is resolved["Rosetta"]
+        assert resolved["ESM"] is not resolved["Rosetta"]
+
+    def test_assignment_order_is_preserved(self) -> None:
+        assert list(PLAN.resolve(team=self.team())) == [
+            "ESM",
+            "AlphaFold-Multimer",
+            "Rosetta",
+        ]
+
+    def test_resolved_agents_can_run_the_next_meeting(
+        self, fake_client: FakeClient, tmp_path
+    ) -> None:
+        # The whole point: the assignment decides who is in the chair for the follow-up meeting
+        resolved = PLAN.resolve(team=self.team())
+
+        run_meeting(
+            meeting_type="individual",
+            agenda="Implement the ESM component.",
+            save_dir=tmp_path,
+            team_member=resolved["ESM"],
+            num_rounds=0,
+        )
+
+        discussion = json.loads((tmp_path / "discussion.json").read_text())
+
+        assert discussion[-1]["agent"] == "Immunologist"
+
+    def test_an_invented_assignee_is_rejected(self) -> None:
+        plan = ImplementationPlan(
+            assignments=[
+                ComponentAssignment(
+                    component="ESM",
+                    assignee_title="Quantum Chemist",
+                    rationale="Made up.",
+                )
+            ]
+        )
+
+        with pytest.raises(ValueError, match="not on the team"):
+            plan.resolve(team=self.team())
+
+    def test_the_error_names_who_is_available(self) -> None:
+        plan = ImplementationPlan(
+            assignments=[
+                ComponentAssignment(
+                    component="ESM", assignee_title="Nobody", rationale="Made up."
+                )
+            ]
+        )
+
+        with pytest.raises(ValueError) as error:
+            plan.resolve(team=self.team())
+
+        assert "Immunologist" in str(error.value)
+        assert "Structural Biologist" in str(error.value)
+
+    def test_titles_match_despite_case_and_spacing(self) -> None:
+        # Models do not reproduce a title character for character across turns
+        plan = ImplementationPlan(
+            assignments=[
+                ComponentAssignment(
+                    component="ESM",
+                    assignee_title="  structural   BIOLOGIST ",
+                    rationale="Written loosely.",
+                )
+            ]
+        )
+
+        assert plan.resolve(team=self.team())["ESM"].title == "Structural Biologist"
+
+    def test_a_component_assigned_twice_is_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="once"):
+            ImplementationPlan(
+                assignments=[
+                    ComponentAssignment(
+                        component="ESM", assignee_title="Immunologist", rationale="First."
+                    ),
+                    ComponentAssignment(
+                        component="esm", assignee_title="Structural Biologist", rationale="Again."
+                    ),
+                ]
+            )
+
+    def test_a_meeting_can_hand_back_a_plan(
+        self, fake_client: FakeClient, team_lead: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=PLAN)]
+
+        result = run_meeting(
+            meeting_type="team",
+            agenda="Decide who builds each component.",
+            save_dir=tmp_path,
+            team_lead=team_lead,
+            team_members=self.team(),
+            num_rounds=1,
+            output_schema=ImplementationPlan,
+        )
+
+        assert isinstance(result, ImplementationPlan)
+        assert set(result.resolve(team=self.team())) == {"ESM", "AlphaFold-Multimer", "Rosetta"}
 
 
 class TestTeamSelectionMeeting:
