@@ -2,14 +2,17 @@
 
 import json
 import urllib.parse
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import requests
 import tiktoken
+from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
 from virtual_lab.constants import (
+    DEFAULT_ENCODING,
     DEFAULT_FINETUNING_EPOCHS,
     MODEL_TO_INPUT_PRICE_PER_TOKEN,
     MODEL_TO_OUTPUT_PRICE_PER_TOKEN,
@@ -158,8 +161,11 @@ def run_tools(
     return tool_outputs, tool_messages
 
 
-def count_tokens(string: str, encoding_name: str = "cl100k_base") -> int:
-    """Returns the number of tokens in a text string.
+def count_tokens(string: str, encoding_name: str = DEFAULT_ENCODING) -> int:
+    """Returns the estimated number of tokens in a text string.
+
+    This is an offline estimate. Prefer the token counts reported by the API (see MeetingUsage)
+    when they are available, since only those account for reasoning tokens and caching.
 
     :param string: The text string to count tokens in.
     :param encoding_name: The name of the encoding to use.
@@ -296,6 +302,129 @@ def print_cost_and_time(
 
     # Print time
     print(f"Time: {int(elapsed_time // 60)}:{int(elapsed_time % 60):02d}")
+
+
+@dataclass
+class ModelUsage:
+    """Token usage reported by the API for a single model."""
+
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    max_input_tokens: int = 0
+    num_calls: int = 0
+
+
+@dataclass
+class MeetingUsage:
+    """Accumulates the token usage reported by the API across all calls in a meeting.
+
+    Usage is tracked per model so that meetings with agents on different models are priced
+    correctly. Unlike an offline tiktoken estimate, these counts include reasoning tokens,
+    which are billed as output but never appear in the response content.
+    """
+
+    per_model: dict[str, ModelUsage] = field(default_factory=dict)
+
+    def add(self, model: str, usage: CompletionUsage | None) -> None:
+        """Records the usage from a single API response.
+
+        :param model: The model that produced the response.
+        :param usage: The usage reported by the API, or None if the API did not report any.
+        """
+        if usage is None:
+            return
+
+        model_usage = self.per_model.setdefault(model, ModelUsage())
+
+        input_tokens = usage.prompt_tokens or 0
+        model_usage.input_tokens += input_tokens
+        # Reasoning tokens are already included in completion_tokens, so they are not added again
+        model_usage.output_tokens += usage.completion_tokens or 0
+        model_usage.max_input_tokens = max(model_usage.max_input_tokens, input_tokens)
+        model_usage.num_calls += 1
+
+        # Detail fields vary across API and SDK versions, so they are read defensively
+        prompt_details = getattr(usage, "prompt_tokens_details", None)
+        if prompt_details is not None:
+            model_usage.cached_input_tokens += getattr(prompt_details, "cached_tokens", 0) or 0
+
+        completion_details = getattr(usage, "completion_tokens_details", None)
+        if completion_details is not None:
+            model_usage.reasoning_tokens += getattr(completion_details, "reasoning_tokens", 0) or 0
+
+    @property
+    def input_tokens(self) -> int:
+        """The total number of input tokens across all models."""
+        return sum(model_usage.input_tokens for model_usage in self.per_model.values())
+
+    @property
+    def cached_input_tokens(self) -> int:
+        """The total number of cached input tokens across all models."""
+        return sum(model_usage.cached_input_tokens for model_usage in self.per_model.values())
+
+    @property
+    def output_tokens(self) -> int:
+        """The total number of output tokens across all models."""
+        return sum(model_usage.output_tokens for model_usage in self.per_model.values())
+
+    @property
+    def reasoning_tokens(self) -> int:
+        """The total number of reasoning tokens across all models."""
+        return sum(model_usage.reasoning_tokens for model_usage in self.per_model.values())
+
+    @property
+    def max_input_tokens(self) -> int:
+        """The largest number of input tokens sent in any single call."""
+        return max((model_usage.max_input_tokens for model_usage in self.per_model.values()), default=0)
+
+    @property
+    def num_calls(self) -> int:
+        """The total number of API calls."""
+        return sum(model_usage.num_calls for model_usage in self.per_model.values())
+
+    def compute_cost(self) -> float:
+        """Computes the total cost across all models.
+
+        Cached input tokens are priced at the full input rate, so the result is an upper bound
+        for models and providers that discount them.
+
+        :raises ValueError: If the price of any model is not known.
+        :return: The total cost in USD.
+        """
+        return sum(
+            compute_token_cost(
+                model=model,
+                input_token_count=model_usage.input_tokens,
+                output_token_count=model_usage.output_tokens,
+            )
+            for model, model_usage in self.per_model.items()
+        )
+
+    def print_summary(self, elapsed_time: float) -> None:
+        """Prints the token usage, cost, and elapsed time.
+
+        :param elapsed_time: The elapsed time of the meeting in seconds.
+        """
+        # Break down by model only when more than one model was used
+        if len(self.per_model) > 1:
+            for model, model_usage in sorted(self.per_model.items()):
+                print(
+                    f"{model}: {model_usage.num_calls:,} calls, "
+                    f"{model_usage.input_tokens:,} input, {model_usage.output_tokens:,} output"
+                )
+
+        print(f"Input token count: {self.input_tokens:,} ({self.cached_input_tokens:,} cached)")
+        print(f"Output token count: {self.output_tokens:,} ({self.reasoning_tokens:,} reasoning)")
+        print(f"Max input token count: {self.max_input_tokens:,}")
+
+        try:
+            print(f"Cost: ${self.compute_cost():.2f}")
+        except ValueError as e:
+            print(f"Warning: {e}")
+
+        print(f"Time: {int(elapsed_time // 60)}:{int(elapsed_time % 60):02d}")
 
 
 def compute_finetuning_cost(model: str, token_count: int, num_epochs: int = DEFAULT_FINETUNING_EPOCHS) -> float:

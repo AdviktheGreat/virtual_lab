@@ -46,6 +46,10 @@ FINETUNING_MODEL_TO_TRAINING_PRICE_PER_TOKEN = {
 
 DEFAULT_FINETUNING_EPOCHS = 4
 
+# Encoding for offline token estimates. Correct for the gpt-4o and gpt-5 families;
+# cl100k_base only applies to gpt-4 and gpt-3.5-turbo.
+DEFAULT_ENCODING = "o200k_base"
+
 CONSISTENT_TEMPERATURE = 0.2
 CREATIVE_TEMPERATURE = 0.8
 

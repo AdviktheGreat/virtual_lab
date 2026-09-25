@@ -22,9 +22,8 @@ from virtual_lab.prompts import (
     team_meeting_team_member_prompt,
 )
 from virtual_lab.utils import (
-    count_discussion_tokens,
+    MeetingUsage,
     get_summary,
-    print_cost_and_time,
     run_tools,
     save_meeting,
 )
@@ -104,17 +103,18 @@ def run_meeting(
     if meeting_type == "team":
         assert team_lead is not None and team_members is not None
         team: list[Agent] = [team_lead] + list(team_members)
-        primary_model = team_lead.model
     else:
         assert team_member is not None
         meeting_critic = critic if critic is not None else SCIENTIFIC_CRITIC.with_model(team_member.model)
         team = [team_member, meeting_critic]
-        primary_model = team_member.model
 
     # Set up tools
     tools: list[ChatCompletionToolParam] | None = (
         [ChatCompletionToolParam(**PUBMED_TOOL_DESCRIPTION)] if pubmed_search else None  # type: ignore[misc]
     )
+
+    # Track the token usage reported by the API, per model
+    usage = MeetingUsage()
 
     # Initialize discussion (list of agent/message dicts for output)
     discussion: list[dict[str, str]] = []
@@ -201,6 +201,7 @@ def run_meeting(
                 temperature=temperature,
                 tools=tools if tools else NOT_GIVEN,
             )
+            usage.add(model=agent.model, usage=response.usage)
 
             # Get the response message
             response_message = response.choices[0].message
@@ -234,6 +235,7 @@ def run_meeting(
                     messages=agent_messages,
                     temperature=temperature,
                 )
+                usage.add(model=agent.model, usage=response.usage)
                 response_message = response.choices[0].message
 
             # Extract the response content
@@ -247,16 +249,8 @@ def run_meeting(
             if round_index == num_rounds:
                 break
 
-    # Count discussion tokens
-    token_counts = count_discussion_tokens(discussion=discussion)
-
-    # Print cost and time
-    # TODO: handle different models for different agents
-    print_cost_and_time(
-        token_counts=token_counts,
-        model=primary_model,
-        elapsed_time=time.time() - start_time,
-    )
+    # Print the usage reported by the API, priced per model
+    usage.print_summary(elapsed_time=time.time() - start_time)
 
     # Save the discussion as JSON and Markdown
     save_meeting(
