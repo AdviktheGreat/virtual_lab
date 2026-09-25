@@ -10,7 +10,6 @@ import requests
 import tiktoken
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionMessageParam
-from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
 from virtual_lab.constants import (
     CONTEXT_WARNING_THRESHOLD,
@@ -20,7 +19,6 @@ from virtual_lab.constants import (
     MODEL_TO_INPUT_PRICE_PER_TOKEN,
     MODEL_TO_MAX_INPUT_TOKENS,
     MODEL_TO_OUTPUT_PRICE_PER_TOKEN,
-    PUBMED_TOOL_NAME,
     TOKENS_PER_MESSAGE,
 )
 from virtual_lab.prompts import format_references
@@ -129,40 +127,6 @@ def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = F
         )
 
     return combined_text
-
-
-def run_tools(
-    tool_calls: list[ChatCompletionMessageToolCall],
-) -> tuple[list[str], list[ChatCompletionMessageParam]]:
-    """Runs the tools from chat completion tool calls.
-
-    :param tool_calls: The tool calls from the chat completion response.
-    :return: A tuple of (tool outputs as strings, tool response messages for API).
-    """
-    tool_outputs: list[str] = []
-    tool_messages: list[ChatCompletionMessageParam] = []
-
-    for tool_call in tool_calls:
-        if tool_call.function.name == PUBMED_TOOL_NAME:
-            # Extract the arguments from the tool call
-            args_dict = json.loads(tool_call.function.arguments)
-
-            # Run the tool
-            output = run_pubmed_search(**args_dict)
-            tool_outputs.append(output)
-
-            # Create tool response message for the API
-            tool_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": output,
-                }
-            )
-        else:
-            raise ValueError(f"Unknown tool: {tool_call.function.name}")
-
-    return tool_outputs, tool_messages
 
 
 def count_tokens(string: str, encoding_name: str = DEFAULT_ENCODING) -> int:

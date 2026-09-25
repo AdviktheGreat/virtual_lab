@@ -77,29 +77,7 @@ DEFAULT_MAX_RETRIES = 5
 CONSISTENT_TEMPERATURE = 0.2
 CREATIVE_TEMPERATURE = 0.8
 
-PUBMED_TOOL_NAME = "pubmed_search"
-PUBMED_TOOL_DESCRIPTION = {
-    "type": "function",
-    "function": {
-        "name": PUBMED_TOOL_NAME,
-        "description": "Get abstracts or the full text of biomedical and life sciences articles from PubMed Central.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to use to search PubMed Central for scientific articles.",
-                },
-                "num_articles": {
-                    "type": "integer",
-                    "description": "The number of articles to return from the search query.",
-                },
-                "abstract_only": {
-                    "type": "boolean",
-                    "description": "Whether to return only the abstract of the articles.",
-                },
-            },
-            "required": ["query", "num_articles"],
-        },
-    },
-}
+# Maximum consecutive rounds of tool calls allowed within a single agent's turn, so that an
+# agent cannot search indefinitely. Tool definitions are withheld on the final attempt to
+# force a text answer.
+MAX_TOOL_ITERATIONS = 5

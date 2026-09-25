@@ -12,8 +12,8 @@ from virtual_lab.agent import Agent
 from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
     DEFAULT_MAX_RETRIES,
+    MAX_TOOL_ITERATIONS,
     PARTIAL_MEETING_DIR_NAME,
-    PUBMED_TOOL_DESCRIPTION,
 )
 from virtual_lab.prompts import (
     individual_meeting_agent_prompt,
@@ -26,12 +26,12 @@ from virtual_lab.prompts import (
     team_meeting_team_lead_final_prompt,
     team_meeting_team_member_prompt,
 )
+from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
     MeetingUsage,
     check_context_length,
     get_max_input_tokens,
     get_summary,
-    run_tools,
     save_meeting,
 )
 
@@ -52,6 +52,7 @@ def run_meeting(
     num_rounds: int = 0,
     temperature: float = CONSISTENT_TEMPERATURE,
     pubmed_search: bool = False,
+    tools: tuple[Tool, ...] = (),
     return_summary: bool = False,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> str | None:
@@ -73,7 +74,9 @@ def run_meeting(
     :param contexts: The contexts for the meeting.
     :param num_rounds: The number of rounds of discussion.
     :param temperature: The sampling temperature.
-    :param pubmed_search: Whether to include a PubMed search tool.
+    :param pubmed_search: Whether to include a PubMed search tool. Shorthand for passing
+        PUBMED_TOOL in tools.
+    :param tools: Additional tools the agents may call during the meeting.
     :param return_summary: Whether to return the summary of the meeting.
     :param max_retries: The number of times to retry a failed API call, with exponential backoff.
     :raises Exception: If an API call fails after all retries. The completed portion of the
@@ -119,10 +122,17 @@ def run_meeting(
         meeting_critic = critic if critic is not None else SCIENTIFIC_CRITIC.with_model(team_member.model)
         team = [team_member, meeting_critic]
 
-    # Set up tools
-    tools: list[ChatCompletionToolParam] | None = (
-        [ChatCompletionToolParam(**PUBMED_TOOL_DESCRIPTION)] if pubmed_search else None  # type: ignore[misc]
-    )
+    # Set up tools, keeping pubmed_search as a shorthand for including the PubMed tool
+    meeting_tools = tools
+
+    if pubmed_search and not any(tool.name == PUBMED_TOOL.name for tool in meeting_tools):
+        meeting_tools = (PUBMED_TOOL,) + meeting_tools
+
+    duplicate_names = {tool.name for tool in meeting_tools}
+    if len(duplicate_names) != len(meeting_tools):
+        raise ValueError("Tool names must be unique")
+
+    tool_definitions: list[ChatCompletionToolParam] = [tool.definition for tool in meeting_tools]
 
     # Track the token usage reported by the API, per model
     usage = MeetingUsage()
@@ -221,22 +231,36 @@ def run_meeting(
                         f'"{agent.model}" and may not fit for many more rounds.'
                     )
 
-                # Call the chat completions API
-                response = client.chat.completions.create(
-                    model=agent.model,
-                    messages=agent_messages,
-                    temperature=temperature,
-                    tools=tools if tools else NOT_GIVEN,
-                )
-                usage.add(model=agent.model, usage=response.usage)
+                # Call the chat completions API, letting the agent use tools repeatedly until it
+                # has what it needs. Tool definitions are offered again after each result so
+                # that one search can inform the next.
+                for tool_iteration in range(MAX_TOOL_ITERATIONS + 1):
+                    # Withhold the tools on the final attempt to force a text answer
+                    is_final_attempt = tool_iteration == MAX_TOOL_ITERATIONS
 
-                # Get the response message
-                response_message = response.choices[0].message
+                    response = client.chat.completions.create(
+                        model=agent.model,
+                        messages=agent_messages,
+                        temperature=temperature,
+                        tools=tool_definitions if tool_definitions and not is_final_attempt else NOT_GIVEN,
+                    )
+                    usage.add(model=agent.model, usage=response.usage)
+                    response_message = response.choices[0].message
 
-                # Check if the model wants to call tools
-                if response_message.tool_calls:
+                    # Stop once the agent has answered, and never run tools on the forced attempt
+                    if not response_message.tool_calls or is_final_attempt:
+                        break
+
+                    if tool_iteration == MAX_TOOL_ITERATIONS - 1:
+                        print(
+                            f"Warning: {agent.title} reached the limit of {MAX_TOOL_ITERATIONS} "
+                            f"rounds of tool calls and will now be asked to answer without tools."
+                        )
+
                     # Run the tools and get outputs
-                    tool_outputs, tool_messages = run_tools(tool_calls=response_message.tool_calls)
+                    tool_outputs, tool_messages = run_tool_calls(
+                        tool_calls=response_message.tool_calls, tools=meeting_tools
+                    )
 
                     # Add the assistant's message with tool_calls to the messages
                     assistant_tool_message: ChatCompletionAssistantMessageParam = {
@@ -254,19 +278,11 @@ def run_meeting(
                     tool_output_content = "\n\n".join(tool_outputs)
                     discussion.append({"agent": "Tool", "message": tool_output_content})
 
-                    # Make another API call with tool results
+                    # Send the tool results back on the next iteration
                     agent_messages = [agent.message] + messages
 
                     # Tool output can be large, so re-check before sending it back
                     check_context_length(messages=agent_messages, model=agent.model)
-
-                    response = client.chat.completions.create(
-                        model=agent.model,
-                        messages=agent_messages,
-                        temperature=temperature,
-                    )
-                    usage.add(model=agent.model, usage=response.usage)
-                    response_message = response.choices[0].message
 
                 # Extract the response content
                 response_content = response_message.content or ""
