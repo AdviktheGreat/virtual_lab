@@ -5,6 +5,7 @@ import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import requests
 import tiktoken
@@ -450,6 +451,29 @@ class MeetingUsage:
             )
             for model, model_usage in self.per_model.items()
         )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Returns the usage as a JSON-serializable dictionary, including cost where known.
+
+        :return: Totals, the per-model breakdown, and the cost, or None if any model is unpriced.
+        """
+        try:
+            cost: float | None = self.compute_cost()
+        except ValueError:
+            cost = None
+
+        return {
+            "input_tokens": self.input_tokens,
+            "cached_input_tokens": self.cached_input_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "max_input_tokens": self.max_input_tokens,
+            "num_calls": self.num_calls,
+            "cost": cost,
+            "per_model": {
+                model: dict(model_usage.__dict__) for model, model_usage in self.per_model.items()
+            },
+        }
 
     def print_summary(self, elapsed_time: float) -> None:
         """Prints the token usage, cost, and elapsed time.

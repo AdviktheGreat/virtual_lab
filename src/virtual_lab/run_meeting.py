@@ -26,6 +26,7 @@ from virtual_lab.prompts import (
     team_meeting_team_lead_final_prompt,
     team_meeting_team_member_prompt,
 )
+from virtual_lab.provenance import MeetingRecord, describe_agent, save_record
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
     MeetingUsage,
@@ -137,6 +138,18 @@ def run_meeting(
     # Track the token usage reported by the API, per model
     usage = MeetingUsage()
 
+    # Record how the meeting was produced, saved alongside the transcript
+    record = MeetingRecord(
+        meeting_type=meeting_type,
+        save_name=save_name,
+        num_rounds=num_rounds,
+        temperature=temperature,
+        max_retries=max_retries,
+        team=[describe_agent(agent) for agent in team],
+        critic=describe_agent(meeting_critic) if meeting_critic is not None else None,
+        tools=[tool.name for tool in meeting_tools],
+    )
+
     # Warn only on the first request that approaches the model's input limit
     warned_about_context = False
 
@@ -161,6 +174,7 @@ def run_meeting(
         )
         messages.append({"role": "user", "content": initial_content})
         discussion.append({"agent": "User", "message": initial_content})
+        record.record_turn(speaker="User", kind="prompt")
 
     # Loop through rounds
     try:
@@ -215,6 +229,13 @@ def run_meeting(
                 # Add prompt as user message
                 messages.append({"role": "user", "content": prompt})
                 discussion.append({"agent": "User", "message": prompt})
+                record.record_turn(speaker="User", kind="prompt")
+
+                # A turn can span several API calls when the agent uses tools, so its usage is
+                # accumulated separately from the meeting total
+                turn_usage = MeetingUsage()
+                turn_tool_calls: list[str] = []
+                turn_fingerprint: str | None = None
 
                 # Build messages for this agent with their system prompt
                 agent_messages: list[ChatCompletionMessageParam] = [agent.message] + messages
@@ -245,11 +266,17 @@ def run_meeting(
                         tools=tool_definitions if tool_definitions and not is_final_attempt else NOT_GIVEN,
                     )
                     usage.add(model=agent.model, usage=response.usage)
+                    turn_usage.add(model=agent.model, usage=response.usage)
+                    turn_fingerprint = response.system_fingerprint or turn_fingerprint
                     response_message = response.choices[0].message
 
                     # Stop once the agent has answered, and never run tools on the forced attempt
                     if not response_message.tool_calls or is_final_attempt:
                         break
+
+                    turn_tool_calls.extend(
+                        tool_call.function.name for tool_call in response_message.tool_calls
+                    )
 
                     if tool_iteration == MAX_TOOL_ITERATIONS - 1:
                         print(
@@ -278,6 +305,7 @@ def run_meeting(
                     # Add tool outputs to discussion for visibility
                     tool_output_content = "\n\n".join(tool_outputs)
                     discussion.append({"agent": "Tool", "message": tool_output_content})
+                    record.record_turn(speaker="Tool", kind="tool_output")
 
                     # Send the tool results back on the next iteration
                     agent_messages = [agent.message] + messages
@@ -293,32 +321,51 @@ def run_meeting(
                 # the reader's own words, which pushes the whole meeting towards agreement.
                 messages.append({"role": "assistant", "name": agent.name, "content": response_content})
                 discussion.append({"agent": agent.title, "message": response_content})
+                record.record_turn(
+                    speaker=agent.title,
+                    kind="response",
+                    name=agent.name,
+                    model=agent.model,
+                    input_tokens=turn_usage.input_tokens,
+                    cached_input_tokens=turn_usage.cached_input_tokens,
+                    output_tokens=turn_usage.output_tokens,
+                    reasoning_tokens=turn_usage.reasoning_tokens,
+                    num_api_calls=turn_usage.num_calls,
+                    tool_calls=turn_tool_calls,
+                    system_fingerprint=turn_fingerprint,
+                )
 
                 # If final round, only team lead or team member responds
                 if round_index == num_rounds:
                     break
-    except Exception:
+    except Exception as error:
         # A meeting can be many minutes and many dollars of work, so preserve whatever
         # completed. It goes in a subdirectory rather than alongside the finished meetings
         # because callers glob patterns like "discussion_*.json" and feed the last turn of
         # every match to load_summaries, which would treat a truncated meeting as a summary.
+        record.finish(usage=usage, elapsed_time=time.time() - start_time, error=error)
+
         if discussion:
             partial_dir = save_dir / PARTIAL_MEETING_DIR_NAME
             save_meeting(save_dir=partial_dir, save_name=save_name, discussion=discussion)
+            save_record(save_dir=partial_dir, save_name=save_name, record=record)
             print(f"Meeting failed. Partial discussion saved to {partial_dir / f'{save_name}.json'}")
         print("Usage before the failure:")
         usage.print_summary(elapsed_time=time.time() - start_time)
         raise
 
+    record.finish(usage=usage, elapsed_time=time.time() - start_time, error=None)
+
     # Print the usage reported by the API, priced per model
     usage.print_summary(elapsed_time=time.time() - start_time)
 
-    # Save the discussion as JSON and Markdown
+    # Save the discussion as JSON and Markdown, plus the record of what produced it
     save_meeting(
         save_dir=save_dir,
         save_name=save_name,
         discussion=discussion,
     )
+    save_record(save_dir=save_dir, save_name=save_name, record=record)
 
     # Optionally, return summary
     if return_summary:

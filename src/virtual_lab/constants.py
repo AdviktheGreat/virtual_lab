@@ -72,6 +72,11 @@ MAX_AGENT_NAME_LENGTH = 64
 # meeting's own directory so that globs over finished meetings cannot match it.
 PARTIAL_MEETING_DIR_NAME = "partial"
 
+# Subdirectory for the provenance record of each meeting, mirroring the transcript's filename.
+# A sibling file would not do: "discussion_1.meta.json" matches the "discussion_*.json" globs
+# the notebooks use to collect transcripts, which would feed a record in as if it were one.
+METADATA_DIR_NAME = "metadata"
+
 # Retries for transient API failures (rate limits, timeouts, 5xx), applied with
 # exponential backoff by the OpenAI client. Higher than the SDK default of 2 because a
 # failed call discards a whole meeting's worth of work.
