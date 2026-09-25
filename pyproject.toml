@@ -51,9 +51,18 @@ nanobody-design = [
     "torch",
     "transformers",
 ]
+dev = [
+    "pytest",
+]
 
 [tool.hatch.version]
 path = "src/virtual_lab/__about__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The tests import their own helpers from conftest, so the tests directory is on sys.path
+pythonpath = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
 
 [project.urls]
 Homepage = "https://github.com/zou-group/virtual-lab"
