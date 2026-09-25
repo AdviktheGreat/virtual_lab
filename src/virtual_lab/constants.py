@@ -72,6 +72,9 @@ MAX_AGENT_NAME_LENGTH = 64
 # meeting's own directory so that globs over finished meetings cannot match it.
 PARTIAL_MEETING_DIR_NAME = "partial"
 
+# Subdirectory holding one directory per meeting for the files that meeting produced
+ARTIFACT_DIR_NAME = "artifacts"
+
 # Subdirectory for the structured output of each meeting, mirroring the transcript's filename.
 # In a subdirectory for the same reason as the provenance record below.
 OUTPUT_DIR_NAME = "outputs"
