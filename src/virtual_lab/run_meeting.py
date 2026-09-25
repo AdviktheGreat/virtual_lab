@@ -1,11 +1,13 @@
 """Runs a meeting with LLM agents."""
 
+import json
 import time
 from pathlib import Path
 from typing import Literal
 
 from openai import OpenAI, NOT_GIVEN
 from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionToolParam
+from pydantic import BaseModel
 from tqdm import trange, tqdm
 
 from virtual_lab.agent import Agent
@@ -20,6 +22,7 @@ from virtual_lab.prompts import (
     individual_meeting_critic_prompt,
     individual_meeting_start_prompt,
     SCIENTIFIC_CRITIC,
+    structured_output_prompt,
     team_meeting_start_prompt,
     team_meeting_team_lead_initial_prompt,
     team_meeting_team_lead_intermediate_prompt,
@@ -27,6 +30,7 @@ from virtual_lab.prompts import (
     team_meeting_team_member_prompt,
 )
 from virtual_lab.provenance import MeetingRecord, describe_agent, save_record
+from virtual_lab.structured import request_structured_output, save_output
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
     MeetingUsage,
@@ -54,9 +58,10 @@ def run_meeting(
     temperature: float = CONSISTENT_TEMPERATURE,
     pubmed_search: bool = False,
     tools: tuple[Tool, ...] = (),
+    output_schema: type[BaseModel] | None = None,
     return_summary: bool = False,
     max_retries: int = DEFAULT_MAX_RETRIES,
-) -> str | None:
+) -> str | BaseModel | None:
     """Runs a meeting with a LLM agents.
 
     :param meeting_type: The type of meeting.
@@ -78,12 +83,21 @@ def run_meeting(
     :param pubmed_search: Whether to include a PubMed search tool. Shorthand for passing
         PUBMED_TOOL in tools.
     :param tools: Additional tools the agents may call during the meeting.
+    :param output_schema: A pydantic model for the meeting's conclusions. When given, the agent who
+        closed the meeting is asked to restate them against the schema in one additional call, the
+        result is saved under save_dir/outputs/, and the validated instance is returned.
     :param return_summary: Whether to return the summary of the meeting.
     :param max_retries: The number of times to retry a failed API call, with exponential backoff.
     :raises Exception: If an API call fails after all retries. The completed portion of the
         discussion is saved under save_dir/partial/ before the error propagates.
-    :return: The summary of the meeting (i.e., the last message) if return_summary is True, else None.
+    :return: The structured output if output_schema is given, else the summary of the meeting
+        (i.e., the last message) if return_summary is True, else None.
     """
+    # A structured output replaces the summary as the return value, so asking for both is a
+    # mistake about which one the caller will get
+    if output_schema is not None and return_summary:
+        raise ValueError("Use either output_schema or return_summary, not both")
+
     # Validate meeting type
     if meeting_type == "team":
         if team_lead is None or team_members is None or len(team_members) == 0:
@@ -155,6 +169,9 @@ def run_meeting(
 
     # Initialize discussion (list of agent/message dicts for output)
     discussion: list[dict[str, str]] = []
+
+    # Set only when output_schema is given, and returned in place of the summary
+    structured_output: BaseModel | None = None
 
     # Initialize messages for API calls
     messages: list[ChatCompletionMessageParam] = []
@@ -338,6 +355,46 @@ def run_meeting(
                 # If final round, only team lead or team member responds
                 if round_index == num_rounds:
                     break
+
+        # Ask whoever closed the meeting to restate its conclusions against the schema. This is a
+        # separate pass rather than a constraint on the final turn so that the structured answer
+        # is drawn from the complete meeting, including that final summary.
+        if output_schema is not None:
+            closing_agent = team[0]
+            extraction_prompt = structured_output_prompt(agent=closing_agent)
+            messages.append({"role": "user", "content": extraction_prompt})
+            discussion.append({"agent": "User", "message": extraction_prompt})
+            record.record_turn(speaker="User", kind="prompt")
+
+            agent_messages = [closing_agent.message] + messages
+            check_context_length(messages=agent_messages, model=closing_agent.model)
+
+            structured_output, parsed_response = request_structured_output(
+                client=client,
+                model=closing_agent.model,
+                messages=agent_messages,
+                schema=output_schema,
+                temperature=temperature,
+            )
+            usage.add(model=closing_agent.model, usage=parsed_response.usage)
+
+            extraction_usage = MeetingUsage()
+            extraction_usage.add(model=closing_agent.model, usage=parsed_response.usage)
+
+            output_json = json.dumps(structured_output.model_dump(mode="json"), indent=4)
+            discussion.append({"agent": closing_agent.title, "message": output_json})
+            record.record_turn(
+                speaker=closing_agent.title,
+                kind="structured_output",
+                name=closing_agent.name,
+                model=closing_agent.model,
+                input_tokens=extraction_usage.input_tokens,
+                cached_input_tokens=extraction_usage.cached_input_tokens,
+                output_tokens=extraction_usage.output_tokens,
+                reasoning_tokens=extraction_usage.reasoning_tokens,
+                num_api_calls=extraction_usage.num_calls,
+                system_fingerprint=parsed_response.system_fingerprint,
+            )
     except Exception as error:
         # A meeting can be many minutes and many dollars of work, so preserve whatever
         # completed. It goes in a subdirectory rather than alongside the finished meetings
@@ -366,6 +423,11 @@ def run_meeting(
         discussion=discussion,
     )
     save_record(save_dir=save_dir, save_name=save_name, record=record)
+
+    if structured_output is not None:
+        save_output(save_dir=save_dir, save_name=save_name, output=structured_output)
+
+        return structured_output
 
     # Optionally, return summary
     if return_summary:

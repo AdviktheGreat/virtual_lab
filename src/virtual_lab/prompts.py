@@ -321,6 +321,19 @@ def individual_meeting_agent_prompt(
     )
 
 
+def structured_output_prompt(agent: Agent) -> str:
+    """Generates the prompt asking an agent to restate the meeting's conclusions as data.
+
+    :param agent: The agent who closed the meeting and will restate its conclusions.
+    """
+    return (
+        f"{agent.title}, please restate the conclusions of this meeting in the required structured "
+        f"format. Report only what the meeting decided; do not introduce new content, and do not "
+        f"soften or omit a conclusion to make it fit. If the meeting genuinely did not settle "
+        f"something the format requires, choose the option best supported by the discussion above."
+    )
+
+
 CODING_RULES = (
     "Your code must be self-contained (with appropriate imports) and complete.",
     "Your code may not include any undefined or unimplemented variables or functions.",

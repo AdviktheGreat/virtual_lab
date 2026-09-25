@@ -20,6 +20,8 @@ requires-python = ">=3.12"
 dependencies = [
     "notebook",
     "openai",
+    # Already required by openai, declared here because meeting output schemas are pydantic models
+    "pydantic>=2.4",
     "requests",
     "tiktoken",
     "tqdm",
