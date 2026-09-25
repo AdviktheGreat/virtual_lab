@@ -1,6 +1,10 @@
 """The LLM agent class."""
 
+import re
+
 from openai.types.chat import ChatCompletionMessageParam
+
+from virtual_lab.constants import MAX_AGENT_NAME_LENGTH
 
 
 class Agent:
@@ -29,6 +33,19 @@ class Agent:
             f"Your goal is to {self.goal}. "
             f"Your role is to {self.role}."
         )
+
+    @property
+    def name(self) -> str:
+        """Returns the agent's title as an author name the API will accept.
+
+        The API restricts message author names to letters, digits, underscores, and hyphens, so
+        a title such as "Principal Investigator" becomes "Principal_Investigator". The title is
+        still what appears in the saved transcript.
+        """
+        name = re.sub(r"[^a-zA-Z0-9_-]+", "_", self.title).strip("_")
+
+        # A title made entirely of punctuation would otherwise produce an empty, invalid name
+        return name[:MAX_AGENT_NAME_LENGTH] or "agent"
 
     def with_model(self, model: str) -> "Agent":
         """Returns a copy of the agent that uses a different model.

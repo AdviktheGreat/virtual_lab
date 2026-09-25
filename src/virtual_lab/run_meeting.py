@@ -265,6 +265,7 @@ def run_meeting(
                     # Add the assistant's message with tool_calls to the messages
                     assistant_tool_message: ChatCompletionAssistantMessageParam = {
                         "role": "assistant",
+                        "name": agent.name,
                         "content": response_message.content,
                         "tool_calls": [tc.model_dump() for tc in response_message.tool_calls],  # type: ignore[misc]
                     }
@@ -287,8 +288,10 @@ def run_meeting(
                 # Extract the response content
                 response_content = response_message.content or ""
 
-                # Add response to messages and discussion
-                messages.append({"role": "assistant", "content": response_content})
+                # Add response to messages and discussion. The author name is what lets the other
+                # agents tell whose turn they are reading; without it every prior turn arrives as
+                # the reader's own words, which pushes the whole meeting towards agreement.
+                messages.append({"role": "assistant", "name": agent.name, "content": response_content})
                 discussion.append({"agent": agent.title, "message": response_content})
 
                 # If final round, only team lead or team member responds

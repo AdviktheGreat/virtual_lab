@@ -65,6 +65,9 @@ CONTEXT_WARNING_THRESHOLD = 0.8
 # Rough per-message framing overhead used when estimating the size of a request
 TOKENS_PER_MESSAGE = 4
 
+# The API caps message author names at 64 characters
+MAX_AGENT_NAME_LENGTH = 64
+
 # Subdirectory for the transcript of a meeting that failed partway through. Kept out of the
 # meeting's own directory so that globs over finished meetings cannot match it.
 PARTIAL_MEETING_DIR_NAME = "partial"

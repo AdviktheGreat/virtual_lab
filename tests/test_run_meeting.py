@@ -115,6 +115,104 @@ class TestCriticModel:
             )
 
 
+class TestAgentAttribution:
+    """Each agent must be able to tell whose turn it is reading."""
+
+    @staticmethod
+    def assistant_messages(fake_client: FakeClient, call_index: int = -1) -> list[dict]:
+        messages = fake_client.completions.calls[call_index]["messages"]
+
+        return [message for message in messages if message["role"] == "assistant"]
+
+    def test_every_prior_turn_is_attributed(
+        self,
+        fake_client: FakeClient,
+        team_lead: Agent,
+        team_member: Agent,
+        second_team_member: Agent,
+        tmp_path,
+    ) -> None:
+        run_meeting(
+            meeting_type="team",
+            agenda="Design a nanobody.",
+            save_dir=tmp_path,
+            team_lead=team_lead,
+            team_members=(team_member, second_team_member),
+            num_rounds=1,
+        )
+
+        # By the final request, three different agents have spoken
+        assert [message["name"] for message in self.assistant_messages(fake_client)] == [
+            team_lead.name,
+            team_member.name,
+            second_team_member.name,
+        ]
+
+    def test_an_agent_does_not_read_a_colleague_as_itself(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        run_meeting(
+            meeting_type="individual",
+            agenda="Design a nanobody.",
+            save_dir=tmp_path,
+            team_member=team_member,
+            num_rounds=1,
+        )
+
+        # The final request is the team member's; the critique in its history must be labelled
+        # as the critic's, not left as an unattributed assistant turn
+        names = [message["name"] for message in self.assistant_messages(fake_client)]
+
+        assert names == [team_member.name, SCIENTIFIC_CRITIC.name]
+        assert None not in names
+
+    def test_tool_call_turns_are_attributed(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        from virtual_lab.tools import PUBMED_TOOL
+
+        from conftest import tool_call_response
+
+        fake_client.completions.responses = [
+            tool_call_response("pubmed_search", {"query": "nanobody", "num_articles": 1}),
+            text_response("Answer."),
+        ]
+
+        run_meeting(
+            meeting_type="individual",
+            agenda="Search the literature.",
+            save_dir=tmp_path,
+            team_member=team_member,
+            tools=(PUBMED_TOOL,),
+            num_rounds=0,
+        )
+
+        tool_call_turns = [
+            message
+            for message in self.assistant_messages(fake_client)
+            if message.get("tool_calls")
+        ]
+
+        assert tool_call_turns
+        assert all(message["name"] == team_member.name for message in tool_call_turns)
+
+    def test_transcript_still_records_the_readable_title(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        run_meeting(
+            meeting_type="individual",
+            agenda="Design a nanobody.",
+            save_dir=tmp_path,
+            team_member=team_member,
+            num_rounds=0,
+        )
+
+        discussion = json.loads((tmp_path / "discussion.json").read_text())
+
+        # The slug is for the API; humans still see "Immunologist", not "Immunologist_"
+        assert discussion[-1]["agent"] == team_member.title
+
+
 class TestRetries:
     def test_retries_are_delegated_to_the_client(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
