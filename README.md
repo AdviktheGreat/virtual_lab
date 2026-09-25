@@ -25,14 +25,16 @@ Please see the notebook [nanobody_design/run_nanobody_design.ipynb](https://gith
 
 ## Installation
 
-The Virtual Lab can be installed using pip or by cloning the repo and installing the required packages. Installation should only take a couple of minutes.
+The Virtual Lab requires Python 3.12 or later. It can be installed using pip or by cloning the repo and installing the required packages. Installation should only take a couple of minutes.
 
 Optionally, first create a conda environment.
 
 ```bash
-conda create -y -n virtual_lab python=3.14
+conda create -y -n virtual_lab python=3.12
 conda activate virtual_lab
 ```
+
+Python 3.12 is recommended rather than a newer version because reproducing the nanobody design study relies on `nanobody_design/requirements_nanobody_design_frozen.txt`, which pins `torch==2.4.1`. That release has no wheels beyond Python 3.12. If you only need the `virtual_lab` package itself, any version from 3.12 onwards works.
 
 The Virtual Lab can be installed via pip.
 

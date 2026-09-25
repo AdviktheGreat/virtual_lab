@@ -46,6 +46,7 @@ keywords = [
 nanobody-design = [
     "biopython",
     "pandas",
+    "scipy",
     "seaborn",
     "torch",
     "transformers",

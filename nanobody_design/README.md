@@ -13,7 +13,7 @@ cd /path/to/virtual_lab
 pip install -e .[nanobody-design]
 ```
 
-If there are any version incompatibility issues, please run `pip install -r nanobody_design/requirements_nanobody_design_frozen.txt`.
+If there are any version incompatibility issues, please run `pip install -r nanobody_design/requirements_nanobody_design_frozen.txt`. These are the exact versions used for the paper, and they require Python 3.12 (`torch==2.4.1` has no wheels for later versions).
 
 Additionally, create a separate virtual environment for running AlphaFold-Multimer via LocalColabFold by following these instructions: https://github.com/YoshitakaMo/localcolabfold (or by running `install_localcolabfold.sh`). Make sure the following versions are installed:
 
