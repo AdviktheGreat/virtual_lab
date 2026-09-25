@@ -50,6 +50,21 @@ DEFAULT_FINETUNING_EPOCHS = 4
 # cl100k_base only applies to gpt-4 and gpt-3.5-turbo.
 DEFAULT_ENCODING = "o200k_base"
 
+# Maximum input tokens accepted by each model. Keys are matched as prefixes, so "gpt-5"
+# also covers gpt-5-mini, gpt-5.2, and so on. Models with no matching entry are not checked.
+MODEL_TO_MAX_INPUT_TOKENS = {
+    "gpt-3.5-turbo": 16_385,
+    "gpt-4o": 128_000,
+    "o1-mini": 128_000,
+    "gpt-5": 272_000,
+}
+
+# Fraction of a model's input limit at which to warn that a meeting is running out of room
+CONTEXT_WARNING_THRESHOLD = 0.8
+
+# Rough per-message framing overhead used when estimating the size of a request
+TOKENS_PER_MESSAGE = 4
+
 # Subdirectory for the transcript of a meeting that failed partway through. Kept out of the
 # meeting's own directory so that globs over finished meetings cannot match it.
 PARTIAL_MEETING_DIR_NAME = "partial"

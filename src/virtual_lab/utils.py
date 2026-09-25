@@ -2,6 +2,7 @@
 
 import json
 import urllib.parse
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -12,12 +13,15 @@ from openai.types.chat import ChatCompletionMessageParam
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
 from virtual_lab.constants import (
+    CONTEXT_WARNING_THRESHOLD,
     DEFAULT_ENCODING,
     DEFAULT_FINETUNING_EPOCHS,
-    MODEL_TO_INPUT_PRICE_PER_TOKEN,
-    MODEL_TO_OUTPUT_PRICE_PER_TOKEN,
     FINETUNING_MODEL_TO_TRAINING_PRICE_PER_TOKEN,
+    MODEL_TO_INPUT_PRICE_PER_TOKEN,
+    MODEL_TO_MAX_INPUT_TOKENS,
+    MODEL_TO_OUTPUT_PRICE_PER_TOKEN,
     PUBMED_TOOL_NAME,
+    TOKENS_PER_MESSAGE,
 )
 from virtual_lab.prompts import format_references
 
@@ -232,20 +236,20 @@ def count_discussion_tokens(
     return token_counts
 
 
-def _find_model_price_key(model: str, price_dict: dict[str, float]) -> str | None:
-    """Finds the matching key in a price dictionary for a model.
+def _find_model_key[T](model: str, model_dict: dict[str, T]) -> str | None:
+    """Finds the matching key in a model-keyed dictionary for a model.
 
     First checks for an exact match, then finds the longest prefix match.
 
     :param model: The name of the model.
-    :param price_dict: The price dictionary to search.
+    :param model_dict: The model-keyed dictionary to search.
     :return: The matching key or None if no match found.
     """
-    if model in price_dict:
+    if model in model_dict:
         return model
 
     # Find the longest prefix match
-    matching_keys = [key for key in price_dict if model.startswith(key)]
+    matching_keys = [key for key in model_dict if model.startswith(key)]
     if matching_keys:
         return max(matching_keys, key=len)
 
@@ -260,8 +264,8 @@ def compute_token_cost(model: str, input_token_count: int, output_token_count: i
     :param output_token_count: The number of tokens in the output.
     :return: The token cost of the model.
     """
-    input_key = _find_model_price_key(model, MODEL_TO_INPUT_PRICE_PER_TOKEN)
-    output_key = _find_model_price_key(model, MODEL_TO_OUTPUT_PRICE_PER_TOKEN)
+    input_key = _find_model_key(model, MODEL_TO_INPUT_PRICE_PER_TOKEN)
+    output_key = _find_model_key(model, MODEL_TO_OUTPUT_PRICE_PER_TOKEN)
 
     if input_key is None or output_key is None:
         raise ValueError(f'Cost of model "{model}" not known')
@@ -270,6 +274,87 @@ def compute_token_cost(model: str, input_token_count: int, output_token_count: i
         input_token_count * MODEL_TO_INPUT_PRICE_PER_TOKEN[input_key]
         + output_token_count * MODEL_TO_OUTPUT_PRICE_PER_TOKEN[output_key]
     )
+
+
+class ContextLengthExceededError(ValueError):
+    """Raised when a request is too large for the model's input limit."""
+
+
+def count_message_tokens(messages: list[ChatCompletionMessageParam]) -> int:
+    """Estimates the number of tokens in a list of chat messages.
+
+    :param messages: The messages to count tokens in.
+    :return: The estimated number of tokens, including per-message framing overhead.
+    """
+    num_tokens = 0
+
+    for message in messages:
+        num_tokens += TOKENS_PER_MESSAGE
+
+        content = message.get("content")
+
+        if isinstance(content, str):
+            num_tokens += count_tokens(content)
+        elif isinstance(content, Iterable):
+            # Multi-part content, e.g. text and images interleaved
+            for part in content:
+                text = part.get("text") if isinstance(part, dict) else None
+                if isinstance(text, str):
+                    num_tokens += count_tokens(text)
+
+        # Tool calls and their arguments also occupy the context
+        for tool_call in message.get("tool_calls") or ():
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if isinstance(function, dict):
+                num_tokens += count_tokens(str(function.get("name", "")))
+                num_tokens += count_tokens(str(function.get("arguments", "")))
+
+    return num_tokens
+
+
+def get_max_input_tokens(model: str) -> int | None:
+    """Returns the maximum number of input tokens a model accepts.
+
+    :param model: The name of the model.
+    :return: The input limit, or None if the model is not known.
+    """
+    key = _find_model_key(model, MODEL_TO_MAX_INPUT_TOKENS)
+
+    return MODEL_TO_MAX_INPUT_TOKENS[key] if key is not None else None
+
+
+def check_context_length(
+    messages: list[ChatCompletionMessageParam],
+    model: str,
+    warning_threshold: float = CONTEXT_WARNING_THRESHOLD,
+) -> tuple[int, bool]:
+    """Checks that a request fits in a model's input limit before sending it.
+
+    The estimate omits tool schemas and some framing, so it is a lower bound on the true
+    request size. Exceeding the limit on the estimate therefore means the request cannot
+    succeed, which makes it safe to fail before paying for the call.
+
+    :param messages: The messages that would be sent.
+    :param model: The model the messages would be sent to.
+    :param warning_threshold: The fraction of the input limit above which to flag the request.
+    :raises ContextLengthExceededError: If the estimate already exceeds the model's input limit.
+    :return: The estimated token count, and whether it is above the warning threshold.
+    """
+    estimated_tokens = count_message_tokens(messages)
+    max_input_tokens = get_max_input_tokens(model)
+
+    # Unknown models are not checked rather than guessed at, to avoid blocking valid requests
+    if max_input_tokens is None:
+        return estimated_tokens, False
+
+    if estimated_tokens > max_input_tokens:
+        raise ContextLengthExceededError(
+            f"Request of about {estimated_tokens:,} tokens exceeds the {max_input_tokens:,} token "
+            f'input limit of "{model}". Reduce num_rounds, the number of team members, or the '
+            f"size of the summaries and contexts passed in."
+        )
+
+    return estimated_tokens, estimated_tokens > warning_threshold * max_input_tokens
 
 
 def print_cost_and_time(

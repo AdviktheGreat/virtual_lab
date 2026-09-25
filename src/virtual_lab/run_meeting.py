@@ -28,6 +28,8 @@ from virtual_lab.prompts import (
 )
 from virtual_lab.utils import (
     MeetingUsage,
+    check_context_length,
+    get_max_input_tokens,
     get_summary,
     run_tools,
     save_meeting,
@@ -125,6 +127,9 @@ def run_meeting(
     # Track the token usage reported by the API, per model
     usage = MeetingUsage()
 
+    # Warn only on the first request that approaches the model's input limit
+    warned_about_context = False
+
     # Initialize discussion (list of agent/message dicts for output)
     discussion: list[dict[str, str]] = []
 
@@ -204,6 +209,18 @@ def run_meeting(
                 # Build messages for this agent with their system prompt
                 agent_messages: list[ChatCompletionMessageParam] = [agent.message] + messages
 
+                # Fail before paying for a request that cannot fit
+                estimated_tokens, near_limit = check_context_length(
+                    messages=agent_messages, model=agent.model
+                )
+                if near_limit and not warned_about_context:
+                    warned_about_context = True
+                    print(
+                        f"Warning: this meeting is using about {estimated_tokens:,} of the "
+                        f"{get_max_input_tokens(agent.model):,} input tokens available to "
+                        f'"{agent.model}" and may not fit for many more rounds.'
+                    )
+
                 # Call the chat completions API
                 response = client.chat.completions.create(
                     model=agent.model,
@@ -239,6 +256,9 @@ def run_meeting(
 
                     # Make another API call with tool results
                     agent_messages = [agent.message] + messages
+
+                    # Tool output can be large, so re-check before sending it back
+                    check_context_length(messages=agent_messages, model=agent.model)
 
                     response = client.chat.completions.create(
                         model=agent.model,
