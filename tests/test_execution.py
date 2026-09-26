@@ -184,6 +184,15 @@ class TestExecutionResult:
         assert not result.succeeded
         assert "TIMED OUT" in result.report()
 
+    def test_a_timeout_is_failure_even_with_a_clean_exit_code(self) -> None:
+        # Without this, the timed_out half of succeeded is never exercised: a killed process
+        # normally reports no exit code at all, so the exit code check alone would cover it
+        result = ExecutionResult(
+            command=(), exit_code=0, stdout="partial", stderr="", duration=300.0, timed_out=True
+        )
+
+        assert not result.succeeded
+
     def test_the_report_names_the_failure(self) -> None:
         result = ExecutionResult(
             command=(), exit_code=2, stdout="", stderr="Traceback...", duration=0.5

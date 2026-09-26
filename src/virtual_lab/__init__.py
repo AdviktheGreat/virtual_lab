@@ -12,6 +12,12 @@ from virtual_lab.execution import (
     UnsupportedLanguageError,
     run_files,
 )
+from virtual_lab.repair import (
+    RepairAttempt,
+    RepairOutcome,
+    run_with_repair,
+    save_execution_record,
+)
 from virtual_lab.run_meeting import run_meeting
 from virtual_lab.schemas import AgentSpec, ComponentAssignment, ImplementationPlan, TeamRoster
 from virtual_lab.structured import StructuredOutputError
@@ -32,6 +38,8 @@ __all__ = [
     "ImplementationPlan",
     "LocalExecutor",
     "PUBMED_TOOL",
+    "RepairAttempt",
+    "RepairOutcome",
     "StructuredOutputError",
     "TeamRoster",
     "Tool",
@@ -39,5 +47,7 @@ __all__ = [
     "UnsupportedLanguageError",
     "run_files",
     "run_meeting",
+    "run_with_repair",
     "save_artifacts",
+    "save_execution_record",
 ]

@@ -1,9 +1,12 @@
 """Prompts for the language model agents and meetings."""
 
-from typing import Iterable
+from typing import Iterable, TYPE_CHECKING
 
 from virtual_lab.agent import Agent
 from virtual_lab.constants import DEFAULT_MODEL
+
+if TYPE_CHECKING:
+    from virtual_lab.artifacts import CodeFile
 
 
 PRINCIPAL_INVESTIGATOR = Agent(
@@ -318,6 +321,57 @@ def individual_meeting_agent_prompt(
     return (
         f"{agent.title}, please modify your answer to address {critic.title}'s most recent feedback. "
         "Remember that your ultimate goal is to make improvements that better address the agenda."
+    )
+
+
+def format_code_files(files: Iterable["CodeFile"]) -> str:
+    """Renders code files as labelled fenced blocks, so a model can see what it is fixing.
+
+    :param files: The files to render.
+    """
+    return "\n\n".join(
+        f"File: {file.filename}\n```{file.language}\n{file.contents}\n```" for file in files
+    )
+
+
+def code_repair_prompt(
+    agent: Agent,
+    files: Iterable["CodeFile"],
+    filename: str,
+    report: str,
+    attempt: int,
+    max_attempts: int,
+) -> str:
+    """Generates the prompt asking an agent to fix code of its own that failed to run.
+
+    The prohibitions are the point of this prompt. A model asked only to make an error go away
+    will frequently delete the failing computation, wrap it in a bare except, or substitute
+    placeholder values, all of which produce code that runs and answers nothing.
+
+    :param agent: The agent that wrote the code.
+    :param files: The files as they currently stand.
+    :param filename: The file that failed.
+    :param report: What happened when the code was run.
+    :param attempt: Which attempt this is, counting from one.
+    :param max_attempts: The most attempts allowed.
+    """
+    return (
+        f"{agent.title}, the code you wrote was run and it failed. Here is what happened.\n\n"
+        f"{report}\n\n"
+        f"The failure occurred while running {filename}. Here are the files as they currently "
+        f"stand.\n\n"
+        f"{format_code_files(files)}\n\n"
+        f"Please diagnose the cause and return the corrected files. This is attempt {attempt} of "
+        f"{max_attempts}.\n\n"
+        "Fix the underlying cause. Do not remove or stub out the computation to make the error "
+        "go away, do not catch the exception in order to continue past it, and do not substitute "
+        "placeholder, random, or hard-coded values for a real result. Code that runs but no "
+        "longer does what the agenda asked for is a worse outcome than code that fails. If a "
+        "dependency is genuinely unavailable in the execution environment, say so in the file's "
+        "description and implement the closest thing that does work, rather than pretending to "
+        "compute the original quantity.\n\n"
+        "Return every file in full, including any file you did not change. Do not return diffs, "
+        "fragments, or instructions describing what to change."
     )
 
 

@@ -74,6 +74,8 @@ class TestRequestStructuredOutput:
         assert response.usage is not None
 
     def test_schema_is_sent_as_the_response_format(self, fake_client: FakeClient) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=DECISION)]
+
         request_structured_output(
             client=fake_client,
             model=TEST_MODEL,
@@ -151,6 +153,8 @@ class TestMeetingWithSchema:
     ) -> None:
         # The structured answer should be drawn from the finished meeting, so the parse call
         # comes last and sees every prior turn
+        fake_client.completions.parsed_responses = [parsed_response(parsed=DECISION)]
+
         run_with_schema(team_member, tmp_path, num_rounds=1)
 
         assert len(fake_client.completions.parse_calls) == 1
@@ -163,6 +167,8 @@ class TestMeetingWithSchema:
     def test_the_closing_agent_does_the_extraction(
         self, fake_client: FakeClient, team_lead: Agent, team_member: Agent, tmp_path
     ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=DECISION)]
+
         run_meeting(
             meeting_type="team",
             agenda="Design a nanobody.",
@@ -226,6 +232,8 @@ class TestMeetingWithSchema:
     def test_turns_still_align_with_the_transcript(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
     ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=DECISION)]
+
         run_with_schema(team_member, tmp_path, num_rounds=1)
 
         discussion = json.loads((tmp_path / "discussion.json").read_text())
