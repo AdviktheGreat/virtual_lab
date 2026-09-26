@@ -3,6 +3,15 @@
 from virtual_lab.__about__ import __version__
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile, UnsafeFilenameError, save_artifacts
+from virtual_lab.execution import (
+    DockerExecutor,
+    DockerUnavailableError,
+    ExecutionError,
+    ExecutionResult,
+    LocalExecutor,
+    UnsupportedLanguageError,
+    run_files,
+)
 from virtual_lab.run_meeting import run_meeting
 from virtual_lab.schemas import AgentSpec, ComponentAssignment, ImplementationPlan, TeamRoster
 from virtual_lab.structured import StructuredOutputError
@@ -16,12 +25,19 @@ __all__ = [
     "CodeArtifacts",
     "CodeFile",
     "ComponentAssignment",
+    "DockerExecutor",
+    "DockerUnavailableError",
+    "ExecutionError",
+    "ExecutionResult",
     "ImplementationPlan",
+    "LocalExecutor",
     "PUBMED_TOOL",
     "StructuredOutputError",
     "TeamRoster",
     "Tool",
     "UnsafeFilenameError",
+    "UnsupportedLanguageError",
+    "run_files",
     "run_meeting",
     "save_artifacts",
 ]

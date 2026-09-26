@@ -54,3 +54,24 @@ pip install -e .
 ## OpenAI API Key
 
 The Virtual Lab currently uses GPT-5.2 from OpenAI by default. Save your OpenAI API key as the environment variable `OPENAI_API_KEY`. For example, add `export OPENAI_API_KEY=<your_key>` to your `.bashrc` or `.bash_profile`.
+
+
+## Running the code that agents write
+
+Agents can write code, and the Virtual Lab can run it. Because that code is written by a model and read by nobody before it runs, it is executed in a container rather than on your machine. Install [Docker](https://docs.docker.com/get-started/get-docker/) and make sure it is running.
+
+```python
+from pathlib import Path
+from virtual_lab import DockerExecutor, run_files, save_artifacts
+
+paths = save_artifacts(save_dir=Path("results"), save_name="discussion", artifacts=code)
+results = run_files(
+    directory=paths[0].parent, files=code.files, executor=DockerExecutor()
+)
+```
+
+The container has no network access, no view of your filesystem beyond the meeting's own output directory, a read-only root filesystem, and hard limits on memory, processes, and wall clock time. It is not given your environment, so the code cannot read your API key. Scripts that genuinely need to reach the internet require `DockerExecutor(allow_network=True)`.
+
+The first run pulls the sandbox image, which takes a minute. Files the code writes into its working directory appear on your machine; everything else it does is discarded with the container.
+
+If you do not have Docker, `LocalExecutor` runs code directly on your machine instead. It is not a sandbox: code run through it can read and write any file you can. It applies a timeout and withholds your API key, and that is the extent of it.
