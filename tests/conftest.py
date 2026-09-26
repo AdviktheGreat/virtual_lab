@@ -149,11 +149,16 @@ class FakeCompletions:
         self.calls.append(kwargs)
 
         if not self.parsed_responses:
-            # Default to a valid instance of whatever schema was asked for, built from its
-            # example values, so tests that do not care about the payload need not queue one
+            # A generic instance cannot be built without inventing values for required fields,
+            # and model_construct leaves them unset, so an unqueued response surfaces later as
+            # a confusing AttributeError on the first field a caller touches. Failing here names
+            # the schema instead.
             schema = kwargs["response_format"]
 
-            return parsed_response(parsed=schema.model_construct())
+            raise AssertionError(
+                f"No parsed response was queued for {schema.__name__}. Append one to "
+                f"fake_client.completions.parsed_responses."
+            )
 
         response = self.parsed_responses.pop(0)
 

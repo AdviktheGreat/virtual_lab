@@ -75,3 +75,43 @@ The container has no network access, no view of your filesystem beyond the meeti
 The first run pulls the sandbox image, which takes a minute. Files the code writes into its working directory appear on your machine; everything else it does is discarded with the container.
 
 If you do not have Docker, `LocalExecutor` runs code directly on your machine instead. It is not a sandbox: code run through it can read and write any file you can. It applies a timeout and withholds your API key, and that is the extent of it.
+
+
+## Fixing code that fails
+
+`run_with_repair` writes a meeting's code, runs it, and hands the traceback back to the agent that wrote it, asking for a correction. It stops as soon as the code runs, when the attempts are used up, or when an attempt reproduces the previous error.
+
+```python
+from virtual_lab import DockerExecutor, run_with_repair, save_execution_record
+
+outcome = run_with_repair(
+    artifacts=code,
+    author=machine_learning_specialist,
+    save_dir=Path("results"),
+    save_name="discussion",
+    executor=DockerExecutor(),
+)
+save_execution_record(
+    save_dir=Path("results"),
+    save_name="discussion",
+    outcome=outcome,
+    author=machine_learning_specialist,
+    executor=DockerExecutor(),
+)
+```
+
+The failure goes to the author rather than to the critic because the author knows what the code was meant to do, while the critic's job is scientific judgement rather than debugging. Each attempt past the first costs another round of code generation, so `max_attempts` defaults to 3 and every attempt is written to `executions/<save_name>.json` with its cost, making the multiplier visible rather than buried.
+
+The result can then be reviewed as evidence rather than as a claim, by passing it into the next meeting as context:
+
+```python
+run_meeting(
+    meeting_type="individual",
+    agenda="Review the results of running the analysis.",
+    save_dir=Path("results"),
+    team_member=machine_learning_specialist,
+    contexts=(outcome.report(),),
+)
+```
+
+`outcome.report()` states plainly whether the code worked, whether it had to be corrected first, and whether it was abandoned. A critic that is not told the code failed three times will review the code as though it had worked.

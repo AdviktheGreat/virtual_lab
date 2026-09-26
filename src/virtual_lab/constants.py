@@ -126,3 +126,12 @@ MAX_CAPTURED_OUTPUT_CHARS = 50_000
 # Most output shown to an agent when it is told how its code behaved. Far smaller than what is
 # captured, because this goes into a request and is paid for by the token.
 MAX_REPORTED_OUTPUT_CHARS = 4_000
+
+# Times code may be run before giving up, counting the first run. Every attempt past the first
+# costs another round of code generation, so this is a budget and not a limit to raise freely:
+# three attempts means a failing meeting can cost roughly three times a passing one.
+DEFAULT_MAX_REPAIR_ATTEMPTS = 3
+
+# Subdirectory for the record of what happened when a meeting's code was run, kept separate
+# from the meeting's own record for the same reason the others are in their own directories.
+EXECUTION_DIR_NAME = "executions"
