@@ -1,13 +1,11 @@
 """Contains useful utility functions."""
 
 import json
-import urllib.parse
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import requests
 import tiktoken
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionMessageParam
@@ -23,6 +21,7 @@ from virtual_lab.constants import (
     TOKENS_PER_MESSAGE,
 )
 from virtual_lab.prompts import format_references
+from virtual_lab.web import WebRequestError, build_url, request_json
 
 
 def get_pubmed_central_article(pmcid: str, abstract_only: bool = False) -> tuple[str | None, list[str] | None]:
@@ -35,15 +34,20 @@ def get_pubmed_central_article(pmcid: str, abstract_only: bool = False) -> tuple
     :return: The title and content (abstract or full text of the article as a list of paragraphs)
         or None if the article is not found.
     """
-    # Get article from PMC ID in JSON form
-    text_url = f"https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_JSON/PMC{pmcid}/unicode"
-    response = requests.get(text_url)
-    response.raise_for_status()
+    # Requested through the checked layer, which applies a timeout, a size limit, retries, and a
+    # polite request rate. A full text article is a large document from a service that asks
+    # clients to identify themselves and rate limits those that do not.
+    text_url = build_url(
+        "https://www.ncbi.nlm.nih.gov/research/bionlp/RESTful/pmcoa.cgi/BioC_JSON/PMC{pmcid}/unicode",
+        pmcid=pmcid,
+    )
 
-    # Try to parse JSON
+    # An article that cannot be fetched or parsed is skipped rather than fatal, since the caller
+    # is working through a list of search results and the next one may be fine. A body that is
+    # not JSON already arrives as a WebRequestError, so that is the only case to catch.
     try:
-        article = response.json()
-    except json.JSONDecodeError:
+        article = request_json(text_url)
+    except WebRequestError:
         return None, None
 
     # Get document
@@ -84,11 +88,23 @@ def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = F
         f'Searching PubMed Central for {num_articles} articles ({"abstracts" if abstract_only else "full text"}) with query: "{query}"'
     )
 
-    # Perform PubMed Central search for query to get PMC ID
-    search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pmc&term={urllib.parse.quote_plus(query)}&retmax={2 * num_articles}&retmode=json&sort=relevance"
-    response = requests.get(search_url)
-    response.raise_for_status()
-    pmcids_found = response.json()["esearchresult"]["idlist"]
+    # Perform PubMed Central search for query to get PMC ID. The query is passed as a parameter
+    # rather than interpolated into the URL, so that a query containing a separator cannot alter
+    # the rest of the request.
+    search = request_json(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params={
+            "db": "pmc",
+            "term": query,
+            "retmax": 2 * num_articles,
+            "retmode": "json",
+            "sort": "relevance",
+        },
+    )
+    # Read with defaults rather than indexed. The query comes from a model, and a query the
+    # service cannot parse is answered with HTTP 200 and an ERROR object in place of the list,
+    # which indexing would turn into a KeyError in the middle of a meeting.
+    pmcids_found = search.get("esearchresult", {}).get("idlist", [])
 
     # Loop through top articles
     texts = []

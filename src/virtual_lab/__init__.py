@@ -22,15 +22,25 @@ from virtual_lab.run_meeting import run_meeting
 from virtual_lab.schemas import AgentSpec, ComponentAssignment, ImplementationPlan, TeamRoster
 from virtual_lab.structured import StructuredOutputError
 from virtual_lab.tools import PUBMED_TOOL, Tool
+from virtual_lab.web import (
+    ALLOWED_HOSTS,
+    DisallowedHostError,
+    ResponseTooLargeError,
+    WebRequestError,
+    request_json,
+    request_text,
+)
 
 
 __all__ = [
     "__version__",
+    "ALLOWED_HOSTS",
     "Agent",
     "AgentSpec",
     "CodeArtifacts",
     "CodeFile",
     "ComponentAssignment",
+    "DisallowedHostError",
     "DockerExecutor",
     "DockerUnavailableError",
     "ExecutionError",
@@ -40,11 +50,15 @@ __all__ = [
     "PUBMED_TOOL",
     "RepairAttempt",
     "RepairOutcome",
+    "ResponseTooLargeError",
     "StructuredOutputError",
     "TeamRoster",
     "Tool",
     "UnsafeFilenameError",
     "UnsupportedLanguageError",
+    "WebRequestError",
+    "request_json",
+    "request_text",
     "run_files",
     "run_meeting",
     "run_with_repair",

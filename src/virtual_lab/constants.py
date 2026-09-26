@@ -135,3 +135,39 @@ DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 # Subdirectory for the record of what happened when a meeting's code was run, kept separate
 # from the meeting's own record for the same reason the others are in their own directories.
 EXECUTION_DIR_NAME = "executions"
+
+# Identifies this library to the services it queries. NCBI and EMBL-EBI both ask clients to say
+# who they are, and an unidentified client is the first to be throttled.
+WEB_USER_AGENT = "virtual-lab (https://github.com/zou-group/virtual_lab)"
+
+# Seconds to allow for a connection and for each read. A service that stops responding mid-answer
+# would otherwise hold a meeting open indefinitely.
+WEB_TIMEOUT_SECONDS = 30
+
+# Attempts for a request that fails in a way worth repeating, counting the first
+WEB_MAX_ATTEMPTS = 3
+
+# Base for exponential backoff between attempts, in seconds. Overridden by a Retry-After header.
+WEB_BACKOFF_SECONDS = 1.0
+
+# Redirects to follow before concluding a service is sending a client in circles
+WEB_MAX_REDIRECTS = 5
+
+# Smallest gap between two requests to the same host. NCBI limits unauthenticated clients to a
+# few requests a second and refuses the rest, so several tool calls in a row would otherwise
+# spend their retries on rate limits this library brought on itself.
+MIN_SECONDS_BETWEEN_REQUESTS = 0.34
+
+# Most bytes to accept from one response. A structure file or a full-text article can be far
+# larger than a meeting can be given, and the body is abandoned rather than read once it is over
+# this, so an unbounded response cannot exhaust memory either.
+MAX_RESPONSE_BYTES = 5_000_000
+
+# Responses remembered per process. Agents ask the same question more than once, and a repeat
+# costs a service bandwidth for an answer already known.
+MAX_WEB_CACHE_ENTRIES = 256
+
+# Total size of the remembered responses. Needed alongside the entry count because a count on its
+# own is not a bound on memory: 256 entries of the largest allowed response would be well over a
+# gigabyte, which would undo the limit above it.
+MAX_WEB_CACHE_CHARACTERS = 32_000_000
