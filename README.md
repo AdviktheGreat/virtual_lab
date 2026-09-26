@@ -100,7 +100,7 @@ save_execution_record(
 )
 ```
 
-The failure goes to the author rather than to the critic because the author knows what the code was meant to do, while the critic's job is scientific judgement rather than debugging. Each attempt past the first costs another round of code generation, so `max_attempts` defaults to 3 and every attempt is written to `executions/<save_name>.json` with its cost, making the multiplier visible rather than buried.
+The failure goes to the author rather than to the critic because the author knows what the code was meant to do, while the critic's job is scientific judgement rather than debugging. Each attempt past the first costs another round of code generation, so `max_attempts` defaults to 3. The record written to `executions/<save_name>.json` lists every attempt and what it produced, alongside the total token usage and cost of the repairs, making the multiplier visible rather than buried.
 
 The result can then be reviewed as evidence rather than as a claim, by passing it into the next meeting as context:
 

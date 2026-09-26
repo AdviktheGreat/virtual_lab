@@ -43,7 +43,7 @@ def error_signature(result: ExecutionResult) -> str:
     """Summarizes a failure closely enough to tell two of them apart.
 
     The last line of standard error is used because that is where an exception type and message
-    land. Two consecutive attempts with the same signature mean the agent is not making progress.
+    land.
 
     :param result: The failed execution.
     :return: A short string identifying the failure.
@@ -51,6 +51,21 @@ def error_signature(result: ExecutionResult) -> str:
     lines = [line.strip() for line in result.stderr.strip().splitlines() if line.strip()]
 
     return f"{result.exit_code}|{result.timed_out}|{lines[-1] if lines else ''}"
+
+
+def failure_signature(failure: tuple[CodeFile, ExecutionResult]) -> str:
+    """Identifies a failure by both the file that failed and how it failed.
+
+    The filename has to be part of this. Files are run in order and the run stops at the first
+    failure, so a repair that fixes the first file reveals a failure in the second, and two files
+    failing for the same reason produce the same message. Comparing messages alone would read
+    that as an agent going in circles and abandon a project that was in fact progressing, which
+    is a particular risk in the sandbox, where a missing dependency fails every file identically.
+
+    :param failure: The file that failed, with its result.
+    :return: A short string identifying the failure.
+    """
+    return f"{failure[0].filename}|{error_signature(failure[1])}"
 
 
 def merge_artifacts(previous: CodeArtifacts, repaired: CodeArtifacts) -> CodeArtifacts:
@@ -145,6 +160,11 @@ class RepairOutcome:
         """Whether the code that finally ran differed from the code the meeting produced."""
         return self.succeeded and self.num_attempts > 1
 
+    @property
+    def ran_nothing(self) -> bool:
+        """Whether nothing was executed, because no file was in a language that can be run."""
+        return bool(self.attempts) and not self.attempts[-1].results
+
     def report(self, max_chars: int = MAX_REPORTED_OUTPUT_CHARS) -> str:
         """Describes the outcome in the form a critic is shown when reviewing results.
 
@@ -160,7 +180,15 @@ class RepairOutcome:
         final = self.attempts[-1]
         attempts = f"{self.num_attempts} attempt{'s' if self.num_attempts > 1 else ''}"
 
-        if self.succeeded and self.num_attempts == 1:
+        # Nothing having failed is not the same as something having worked. Saying "it ran
+        # successfully" when no file was in a runnable language would hand the reviewer exactly
+        # the false assurance this module exists to remove.
+        if self.ran_nothing:
+            heading = (
+                "No file was run. None of the files produced are in a language that can be "
+                "executed, so nothing here has been demonstrated to work."
+            )
+        elif self.succeeded and self.num_attempts == 1:
             heading = "The code ran successfully on the first attempt."
         elif self.succeeded:
             heading = f"The code ran successfully after {attempts}, having been corrected."
@@ -183,6 +211,7 @@ class RepairOutcome:
         """Returns the outcome as a JSON-serializable dictionary."""
         return {
             "succeeded": self.succeeded,
+            "ran_nothing": self.ran_nothing,
             "num_attempts": self.num_attempts,
             "was_repaired": self.was_repaired,
             "stopped_early": self.stopped_early,
@@ -273,7 +302,7 @@ def run_with_repair(
             if (
                 latest is not None
                 and previous is not None
-                and error_signature(latest[1]) == error_signature(previous[1])
+                and failure_signature(latest) == failure_signature(previous)
             ):
                 outcome.stopped_early = True
                 break

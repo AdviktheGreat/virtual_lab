@@ -158,8 +158,10 @@ class TestCodeThatIsRepaired:
         run(fake_client, BROKEN, team_member, tmp_path)
         request = fake_client.completions.parse_calls[0]["messages"][1]["content"]
 
-        assert "ValueError" in request
-        assert "boom" in request
+        # Asserting on "ValueError" alone would pass even with no report attached, because the
+        # restated source contains that text too. Only the report produces these.
+        assert "FAILED with exit code 1" in request
+        assert "Traceback (most recent call last)" in request
 
     def test_the_request_carries_the_current_code(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
@@ -172,8 +174,9 @@ class TestCodeThatIsRepaired:
         run(fake_client, BROKEN, team_member, tmp_path)
         request = fake_client.completions.parse_calls[0]["messages"][1]["content"]
 
-        assert "raise ValueError('boom')" in request
-        assert "analysis.py" in request
+        # The traceback quotes the offending source line and names the file, so both would be
+        # present even if no code were restated. Only the rendered block proves the code is there.
+        assert "File: analysis.py\n```python\nraise ValueError('boom')\n```" in request
 
     def test_a_repair_is_asked_for_as_a_schema(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
@@ -204,6 +207,47 @@ class TestGivingUp:
         assert outcome.num_attempts == 2
         assert len(fake_client.completions.parse_calls) == 1
 
+    def test_a_failure_moving_to_another_file_is_progress_not_a_stall(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        # Files run in order and stop at the first failure, so fixing the first file reveals the
+        # second. Two files failing for the same reason produce the same message, and treating
+        # that as going in circles abandons a project that was in fact progressing.
+        both_broken = CodeArtifacts(
+            files=[
+                *script("import missing_module_xyz", "first.py").files,
+                *script("import missing_module_xyz", "second.py").files,
+            ]
+        )
+        fake_client.completions.parsed_responses = [
+            parsed_response(parsed=script("print('first fixed')", "first.py")),
+            parsed_response(parsed=script("print('second fixed')", "second.py")),
+        ]
+
+        outcome = run(fake_client, both_broken, team_member, tmp_path, max_attempts=3)
+
+        assert not outcome.stopped_early
+        assert outcome.succeeded
+        assert outcome.num_attempts == 3
+
+    def test_the_same_file_failing_the_same_way_still_stops(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        both_broken = CodeArtifacts(
+            files=[
+                *script("import missing_module_xyz", "first.py").files,
+                *script("import missing_module_xyz", "second.py").files,
+            ]
+        )
+        fake_client.completions.parsed_responses = [
+            parsed_response(parsed=script("import missing_module_xyz", "first.py"))
+        ]
+
+        outcome = run(fake_client, both_broken, team_member, tmp_path, max_attempts=5)
+
+        assert outcome.stopped_early
+        assert outcome.num_attempts == 2
+
     def test_different_errors_use_the_whole_budget(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
     ) -> None:
@@ -222,15 +266,16 @@ class TestGivingUp:
     def test_the_last_attempt_does_not_pay_for_a_correction(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
     ) -> None:
-        # Asking for a fix nobody will run is money spent for nothing
+        # Asking for a fix nobody will run is money spent for nothing, so N attempts buy at
+        # most N-1 corrections
         fake_client.completions.parsed_responses = [
-            parsed_response(parsed=script("raise ValueError('second')")),
-            parsed_response(parsed=script("raise ValueError('third')")),
+            parsed_response(parsed=script("raise ValueError('second')"))
         ]
 
-        run(fake_client, BROKEN, team_member, tmp_path, max_attempts=3)
+        outcome = run(fake_client, BROKEN, team_member, tmp_path, max_attempts=2)
 
-        assert len(fake_client.completions.parse_calls) == 2
+        assert outcome.num_attempts == 2
+        assert len(fake_client.completions.parse_calls) == 1
 
     def test_a_single_attempt_never_asks_for_a_repair(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
@@ -247,7 +292,7 @@ class TestGivingUp:
         with pytest.raises(ValueError, match="at least 1"):
             run(fake_client, BROKEN, team_member, tmp_path, max_attempts=0)
 
-    def test_a_timeout_is_treated_as_a_failure_to_repair(
+    def test_a_timeout_is_a_repairable_failure(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
     ) -> None:
         fake_client.completions.parsed_responses = [
@@ -544,6 +589,37 @@ class TestNothingToRun:
         assert outcome.num_attempts == 1
         assert outcome.attempts[0].results == ()
         assert fake_client.completions.parse_calls == []
+
+    def test_nothing_having_failed_is_not_reported_as_having_worked(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        # A language with no interpreter is skipped, not failed. Telling the reviewer the code
+        # "ran successfully" would be the exact false assurance this module exists to remove.
+        unrunnable = CodeArtifacts(
+            files=[
+                CodeFile(
+                    filename="model.jl",
+                    language="julia",
+                    description="Fits the model.",
+                    contents="println(42)",
+                )
+            ]
+        )
+
+        outcome = run(fake_client, unrunnable, team_member, tmp_path)
+        report = outcome.report()
+
+        assert outcome.ran_nothing
+        assert "No file was run" in report
+        assert "ran successfully" not in report
+
+    def test_code_that_really_ran_is_not_marked_as_having_run_nothing(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        outcome = run(fake_client, WORKING, team_member, tmp_path)
+
+        assert not outcome.ran_nothing
+        assert "ran successfully" in outcome.report()
 
 
 class TestAttemptHelpers:
