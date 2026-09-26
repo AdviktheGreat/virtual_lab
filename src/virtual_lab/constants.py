@@ -166,3 +166,8 @@ MAX_RESPONSE_BYTES = 5_000_000
 # Responses remembered per process. Agents ask the same question more than once, and a repeat
 # costs a service bandwidth for an answer already known.
 MAX_WEB_CACHE_ENTRIES = 256
+
+# Total size of the remembered responses. Needed alongside the entry count because a count on its
+# own is not a bound on memory: 256 entries of the largest allowed response would be well over a
+# gigabyte, which would undo the limit above it.
+MAX_WEB_CACHE_CHARACTERS = 32_000_000

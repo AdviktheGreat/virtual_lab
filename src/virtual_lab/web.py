@@ -23,6 +23,7 @@ import requests
 
 from virtual_lab.constants import (
     MAX_RESPONSE_BYTES,
+    MAX_WEB_CACHE_CHARACTERS,
     MAX_WEB_CACHE_ENTRIES,
     MIN_SECONDS_BETWEEN_REQUESTS,
     WEB_BACKOFF_SECONDS,
@@ -72,30 +73,72 @@ class ResponseTooLargeError(WebRequestError):
     """Raised when a service returns more data than a meeting can be given."""
 
 
+def normalize_url(url: str) -> str:
+    """Rewrites a URL the way the HTTP client will, so that what is checked is what is sent.
+
+    Checking a URL with one parser and requesting it with another is not safe, because the two
+    need only disagree about where the host ends. CPython's urlsplit ends the authority at a
+    slash, question mark, or hash; urllib3 also ends it at a backslash. So in
+    "https://169.254.169.254\\@rest.uniprot.org/" the first sees the allowed host with some
+    credentials attached, while the second opens a socket to the cloud metadata service. Letting
+    the client normalise the URL first, and checking the result, removes the disagreement rather
+    than trying to predict it.
+
+    :param url: The URL to normalize.
+    :raises DisallowedHostError: If the URL cannot be prepared for a request at all.
+    :return: The URL as the client would send it.
+    """
+    prepared = requests.models.PreparedRequest()
+
+    try:
+        prepared.prepare_url(url, None)
+    except (requests.RequestException, ValueError, UnicodeError) as error:
+        raise DisallowedHostError(f'Refusing to request "{url}": {error}') from error
+
+    if prepared.url is None:
+        raise DisallowedHostError(f'Refusing to request "{url}": it is not a usable URL')
+
+    return prepared.url
+
+
 def check_host(url: str) -> str:
     """Checks that a URL points somewhere this library is willing to talk to.
 
     :param url: The URL to check.
-    :raises DisallowedHostError: If the scheme is not HTTPS or the host is not allowed.
-    :return: The URL, unchanged.
+    :raises DisallowedHostError: If the scheme is not HTTPS, the host is not allowed, or the URL
+        carries credentials.
+    :return: The URL as it should be requested, which may differ from the URL given.
     """
-    parsed = urllib.parse.urlsplit(url)
+    normalized = normalize_url(url)
+
+    try:
+        parsed = urllib.parse.urlsplit(normalized)
+        hostname = parsed.hostname
+    except ValueError as error:
+        raise DisallowedHostError(f'Refusing to request "{url}": {error}') from error
 
     # Plain HTTP would let anything between here and the service read and rewrite the exchange,
     # and every service in the list below speaks HTTPS
     if parsed.scheme != "https":
         raise DisallowedHostError(f'Refusing to request "{url}": only https is allowed')
 
-    if parsed.hostname is None:
+    # Credentials in a URL would be sent to the host, logged by it, and are not something a
+    # meeting should be able to introduce. No allowed service authenticates this way.
+    if parsed.username is not None or parsed.password is not None:
+        raise DisallowedHostError(f'Refusing to request "{url}": a URL may not carry credentials')
+
+    if hostname is None:
         raise DisallowedHostError(f'Refusing to request "{url}": no host')
 
-    if parsed.hostname.lower() not in ALLOWED_HOSTS:
+    # Exact membership, not a suffix test: "evilrest.uniprot.org" ends in an allowed host and
+    # "x.rest.uniprot.org" is a subdomain of one, and neither is the service in question
+    if hostname.lower() not in ALLOWED_HOSTS:
         raise DisallowedHostError(
-            f'Refusing to request "{url}": {parsed.hostname} is not an allowed host. '
+            f'Refusing to request "{url}": {hostname} is not an allowed host. '
             f"Allowed hosts: {', '.join(sorted(ALLOWED_HOSTS))}."
         )
 
-    return url
+    return normalized
 
 
 def encode_segment(value: str) -> str:
@@ -105,13 +148,20 @@ def encode_segment(value: str) -> str:
     add path segments of its own or climb out of the path it was given.
 
     :param value: The value to encode.
-    :raises ValueError: If the value is empty.
+    :raises ValueError: If the value is empty or is a relative path segment.
     :return: The encoded value.
     """
     if not value or not value.strip():
         raise ValueError("A path segment may not be empty")
 
-    return urllib.parse.quote(value.strip(), safe="")
+    stripped = value.strip()
+
+    # Encoding leaves a dot alone, since it is unreserved, so these two would survive intact and
+    # be resolved by the server against the path the template chose
+    if stripped in {".", ".."}:
+        raise ValueError(f'"{stripped}" is a relative path segment, not an identifier')
+
+    return urllib.parse.quote(stripped, safe="")
 
 
 def build_url(template: str, **segments: str) -> str:
@@ -142,22 +192,27 @@ class RateLimiter:
 
     def __init__(self, min_interval: float = MIN_SECONDS_BETWEEN_REQUESTS) -> None:
         self.min_interval = min_interval
-        self._last_request: dict[str, float] = {}
+        self._next_allowed: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def wait(self, host: str) -> None:
         """Sleeps if the last request to this host was too recent.
 
+        A slot is claimed under the lock and then waited for outside it. Sleeping while holding
+        the lock would make every host queue behind whichever one happened to be waiting, which
+        is the opposite of a per-host limit.
+
         :param host: The host about to be contacted.
         """
         with self._lock:
-            elapsed = time.monotonic() - self._last_request.get(host, float("-inf"))
-            delay = self.min_interval - elapsed
+            now = time.monotonic()
+            scheduled = max(now, self._next_allowed.get(host, now))
+            self._next_allowed[host] = scheduled + self.min_interval
 
-            if delay > 0:
-                time.sleep(delay)
+        delay = scheduled - time.monotonic()
 
-            self._last_request[host] = time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
 
 
 class ResponseCache:
@@ -169,9 +224,15 @@ class ResponseCache:
     week's answer to a question about a database is worse than asking again.
     """
 
-    def __init__(self, max_entries: int = MAX_WEB_CACHE_ENTRIES) -> None:
+    def __init__(
+        self,
+        max_entries: int = MAX_WEB_CACHE_ENTRIES,
+        max_characters: int = MAX_WEB_CACHE_CHARACTERS,
+    ) -> None:
         self.max_entries = max_entries
+        self.max_characters = max_characters
         self._entries: OrderedDict[str, str] = OrderedDict()
+        self._characters = 0
         self._lock = threading.Lock()
 
     def get(self, key: str) -> str | None:
@@ -185,32 +246,76 @@ class ResponseCache:
             return self._entries[key]
 
     def put(self, key: str, value: str) -> None:
-        """Stores a response, discarding the least recently used if the cache is full."""
+        """Stores a response, discarding the least recently used to stay within both limits."""
         with self._lock:
-            self._entries[key] = value
-            self._entries.move_to_end(key)
+            if key in self._entries:
+                self._characters -= len(self._entries.pop(key))
 
-            while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+            self._entries[key] = value
+            self._characters += len(value)
+
+            # Bounded by total size as well as by count, because one bound without the other is
+            # not a bound: the entry limit alone permits every entry to be the largest allowed
+            while self._entries and (
+                len(self._entries) > self.max_entries or self._characters > self.max_characters
+            ):
+                _, discarded = self._entries.popitem(last=False)
+                self._characters -= len(discarded)
 
     def clear(self) -> None:
         """Forgets everything, so that a caller can guarantee a fresh request."""
         with self._lock:
             self._entries.clear()
+            self._characters = 0
 
 
 RATE_LIMITER = RateLimiter()
 RESPONSE_CACHE = ResponseCache()
 
 
-def cache_key(url: str, params: dict[str, Any] | None) -> str:
+def cache_key(
+    url: str,
+    params: dict[str, Any] | None,
+    headers: dict[str, str] | None = None,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+) -> str:
     """Builds the key a response is cached under.
+
+    The headers are part of the key because several allowed services vary their answer by Accept,
+    so a body fetched as text must not be handed to a caller that asked for JSON. The size limit
+    is part of it because the cache is consulted before the limit is applied, and a body stored
+    under a generous limit would otherwise be returned to a caller that asked for a small one.
 
     :param url: The URL requested.
     :param params: The query parameters, if any.
-    :return: A key that distinguishes requests differing only in their parameters.
+    :param headers: The request headers, if any.
+    :param max_bytes: The size limit the response was read under.
+    :return: A key that distinguishes requests differing in any of these.
     """
-    return f"{url}?{urllib.parse.urlencode(sorted((params or {}).items()))}"
+    query = urllib.parse.urlencode(sorted((params or {}).items()))
+    varying = urllib.parse.urlencode(sorted((headers or {}).items()))
+
+    return f"{url}?{query}|{varying}|{max_bytes}"
+
+
+def response_encoding(response: requests.Response) -> str:
+    """Decides how to decode a response body.
+
+    The client's own guess is not used: it falls back to ISO-8859-1 for any text response with no
+    charset, which is what the older HTTP specification called for and what almost no modern
+    service means. Reading a UniProt flat file or a PDB entry that way silently produces mojibake
+    and hands it to a model as though it were the record.
+
+    :param response: The response whose body is about to be read.
+    :return: The name of a codec.
+    """
+    for parameter in response.headers.get("Content-Type", "").split(";")[1:]:
+        name, _, value = parameter.strip().partition("=")
+
+        if name.strip().lower() == "charset" and value.strip().strip('"'):
+            return value.strip().strip('"')
+
+    return "utf-8"
 
 
 def read_capped(response: requests.Response, max_bytes: int) -> str:
@@ -226,10 +331,17 @@ def read_capped(response: requests.Response, max_bytes: int) -> str:
     """
     declared = response.headers.get("Content-Length")
 
-    if declared is not None and declared.isdigit() and int(declared) > max_bytes:
-        raise ResponseTooLargeError(
-            f"{response.url} declared {int(declared):,} bytes, over the {max_bytes:,} byte limit"
-        )
+    if declared is not None:
+        # isdecimal rather than isdigit: a superscript passes isdigit and then fails int(), and
+        # headers are decoded as latin-1, so such a character can reach here from the wire
+        try:
+            if declared.strip().isdecimal() and int(declared.strip()) > max_bytes:
+                raise ResponseTooLargeError(
+                    f"{response.url} declared {int(declared.strip()):,} bytes, over the "
+                    f"{max_bytes:,} byte limit"
+                )
+        except ValueError:
+            pass
 
     chunks: list[bytes] = []
     total = 0
@@ -244,7 +356,14 @@ def read_capped(response: requests.Response, max_bytes: int) -> str:
 
         chunks.append(chunk)
 
-    return b"".join(chunks).decode(response.encoding or "utf-8", errors="replace")
+    encoding = response_encoding(response)
+
+    try:
+        return b"".join(chunks).decode(encoding, errors="replace")
+    except LookupError:
+        # A service naming a codec Python does not have is not a reason to abandon the body, and
+        # letting LookupError escape would bypass every caller's handling of WebRequestError
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
 
 def retry_delay(attempt: int, response: requests.Response | None) -> float:
@@ -299,21 +418,22 @@ def request_text(
     :raises WebRequestError: If the request fails after all attempts.
     :return: The response body.
     """
-    check_host(url)
+    checked = check_host(url)
 
-    key = cache_key(url, params)
+    request_headers = {"User-Agent": WEB_USER_AGENT, **(headers or {})}
+    key = cache_key(checked, params, headers=request_headers, max_bytes=max_bytes)
 
     if use_cache and (cached := RESPONSE_CACHE.get(key)) is not None:
         return cached
 
-    request_headers = {"User-Agent": WEB_USER_AGENT, **(headers or {})}
     body: str | None = None
     last_error: str = "no attempts were made"
+    last_exception: BaseException | None = None
 
     for attempt in range(1, max_attempts + 1):
         try:
             body = follow(
-                url=url,
+                url=checked,
                 params=params,
                 headers=request_headers,
                 timeout=timeout,
@@ -322,6 +442,7 @@ def request_text(
             break
         except RetryableResponse as retryable:
             last_error = retryable.detail
+            last_exception = retryable
 
             if attempt == max_attempts:
                 break
@@ -329,6 +450,7 @@ def request_text(
             time.sleep(retry_delay(attempt=attempt, response=retryable.response))
         except requests.RequestException as error:
             last_error = f"{type(error).__name__}: {error}"
+            last_exception = error
 
             if attempt == max_attempts:
                 break
@@ -339,7 +461,7 @@ def request_text(
         raise WebRequestError(
             f"Could not fetch {url} after {max_attempts} "
             f"attempt{'s' if max_attempts > 1 else ''}: {last_error}"
-        )
+        ) from last_exception
 
     if use_cache:
         RESPONSE_CACHE.put(key, body)
@@ -374,7 +496,9 @@ def follow(
     query = params
 
     for _ in range(WEB_MAX_REDIRECTS + 1):
-        check_host(current)
+        # Reassigned, not just checked: the URL requested below must be the one that was
+        # approved, or the check applies to a different address than the request does
+        current = check_host(current)
         RATE_LIMITER.wait(urllib.parse.urlsplit(current).hostname or "")
 
         with requests.get(
@@ -385,11 +509,17 @@ def follow(
             stream=True,
             allow_redirects=False,
         ) as response:
-            if response.is_redirect or response.is_permanent_redirect:
+            # Tested by status rather than with is_redirect, which is only true when a Location
+            # header is present. A 3xx without one would otherwise fall past every branch below,
+            # since ok() is true for anything under 400, and its body would be returned and
+            # cached as though it were the resource asked for.
+            if 300 <= response.status_code < 400:
                 location = response.headers.get("Location")
 
                 if not location:
-                    raise WebRequestError(f"{current} returned {response.status_code} with no location")
+                    raise WebRequestError(
+                        f"{current} returned {response.status_code} with no location"
+                    )
 
                 # A relative location resolves against the current URL, which keeps it on the
                 # same host; an absolute one is checked on the next pass round this loop
@@ -470,7 +600,7 @@ def post_json(
     :raises WebRequestError: If the request fails, or the body is not JSON.
     :return: The parsed body.
     """
-    check_host(url)
+    checked = check_host(url)
 
     request_headers = {
         "User-Agent": WEB_USER_AGENT,
@@ -481,17 +611,26 @@ def post_json(
     last_error = "no attempts were made"
 
     for attempt in range(1, max_attempts + 1):
-        RATE_LIMITER.wait(urllib.parse.urlsplit(url).hostname or "")
+        RATE_LIMITER.wait(urllib.parse.urlsplit(checked).hostname or "")
 
         try:
             with requests.post(
-                url,
+                checked,
                 json=payload,
                 headers=request_headers,
                 timeout=timeout,
                 stream=True,
                 allow_redirects=False,
             ) as response:
+                # Named explicitly, because ok() is true for a 3xx and the body of a redirect
+                # would otherwise be reported as a service that "did not return JSON"
+                if 300 <= response.status_code < 400:
+                    raise WebRequestError(
+                        f"{url} redirected to "
+                        f"{response.headers.get('Location', 'an unnamed address')}, and a request "
+                        f"body is not replayed to a new address"
+                    )
+
                 if response.status_code in RETRYABLE_STATUSES:
                     last_error = f"{url} returned {response.status_code}"
 

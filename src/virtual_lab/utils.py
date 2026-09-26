@@ -43,10 +43,11 @@ def get_pubmed_central_article(pmcid: str, abstract_only: bool = False) -> tuple
     )
 
     # An article that cannot be fetched or parsed is skipped rather than fatal, since the caller
-    # is working through a list of search results and the next one may be fine
+    # is working through a list of search results and the next one may be fine. A body that is
+    # not JSON already arrives as a WebRequestError, so that is the only case to catch.
     try:
         article = request_json(text_url)
-    except (WebRequestError, json.JSONDecodeError):
+    except WebRequestError:
         return None, None
 
     # Get document
@@ -100,7 +101,10 @@ def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = F
             "sort": "relevance",
         },
     )
-    pmcids_found = search["esearchresult"]["idlist"]
+    # Read with defaults rather than indexed. The query comes from a model, and a query the
+    # service cannot parse is answered with HTTP 200 and an ERROR object in place of the list,
+    # which indexing would turn into a KeyError in the middle of a meeting.
+    pmcids_found = search.get("esearchresult", {}).get("idlist", [])
 
     # Loop through top articles
     texts = []
