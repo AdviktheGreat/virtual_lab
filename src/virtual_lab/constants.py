@@ -96,3 +96,33 @@ CREATIVE_TEMPERATURE = 0.8
 # agent cannot search indefinitely. Tool definitions are withheld on the final attempt to
 # force a text answer.
 MAX_TOOL_ITERATIONS = 5
+
+# Image used to run model-authored code. Pinned to a digest-free but explicit tag so that a
+# meeting is not silently handed a different interpreter than the one it was written for.
+DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
+
+# Where the meeting's files are mounted inside the container. Model-authored code sees only
+# this directory, so paths it writes into its own output are relative to here.
+SANDBOX_WORK_DIR = "/workspace"
+
+# Wall clock limit for a single execution, in seconds. Model-authored code has no notion of
+# how long it should take, so something has to stop an accidental infinite loop.
+DEFAULT_EXECUTION_TIMEOUT = 300
+
+# Resource ceilings for a single execution. A runaway allocation or a fork bomb has to hit a
+# limit inside the container rather than exhaust the host.
+DEFAULT_MEMORY_LIMIT = "2g"
+DEFAULT_CPU_LIMIT = "2"
+DEFAULT_PIDS_LIMIT = 256
+
+# Size of the writable scratch space mounted at /tmp, since the container's root filesystem
+# is read-only and many libraries expect somewhere to write
+DEFAULT_TMPFS_SIZE = "256m"
+
+# Most output that is kept from an execution, per stream. Untrusted code can print without
+# bound, so output is spooled to disk and only the tail of it is read back.
+MAX_CAPTURED_OUTPUT_CHARS = 50_000
+
+# Most output shown to an agent when it is told how its code behaved. Far smaller than what is
+# captured, because this goes into a request and is paid for by the token.
+MAX_REPORTED_OUTPUT_CHARS = 4_000
