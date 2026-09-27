@@ -21,6 +21,8 @@ from typing import Any
 from virtual_lab.artifacts import UnsafeFilenameError, check_filename
 from virtual_lab.constants import (
     MAX_CHAINS_REPORTED,
+    MAX_COMMENT_CHARACTERS,
+    MAX_COMMENTS_REPORTED,
     MAX_FEATURES_REPORTED,
     MAX_SEARCH_RESULTS,
     MAX_SEQUENCE_RESIDUES_REPORTED,
@@ -58,6 +60,13 @@ REPORTED_COMMENT_TYPES = (
     "DISEASE",
     "BIOTECHNOLOGY",
 )
+
+
+# Statuses that mean "there is no such record", as opposed to "the service could not answer".
+# Only these become a RecordNotFoundError: telling an agent a protein does not exist because the
+# service returned 503 is worse than telling it nothing, since it will stop looking. UniProt
+# answers an unknown accession with 400 rather than 404.
+NO_SUCH_RECORD_STATUSES = frozenset({400, 404})
 
 
 class DatabaseError(Exception):
@@ -101,6 +110,22 @@ def bounded(value: int, most: int, name: str) -> int:
     return min(value, most)
 
 
+def truncate_text(text: str, limit: int = MAX_COMMENT_CHARACTERS) -> str:
+    """Shortens a free text annotation for display, saying how much it left out.
+
+    A curated protein carries kilobytes of prose. Capping the sequence and then spending the
+    saving on a disease description is no saving at all.
+
+    :param text: The full text.
+    :param limit: The most characters to show.
+    :return: The text, or its start with a note of how much was left out.
+    """
+    if len(text) <= limit:
+        return text
+
+    return f"{text[:limit]}... ({len(text) - limit:,} of {len(text):,} characters not shown)"
+
+
 def first_text(comment: dict[str, Any]) -> str:
     """Returns the text of a UniProt comment, which nests it two levels down."""
     texts = comment.get("texts") or []
@@ -109,6 +134,39 @@ def first_text(comment: dict[str, Any]) -> str:
         return ""
 
     return str(texts[0].get("value", ""))
+
+
+def features_from(raw: list[dict[str, Any]]) -> tuple[tuple[str, str, str], ...]:
+    """Selects the annotated positions worth reporting, a kind at a time.
+
+    A well studied protein carries far more eligible features than the cap allows: p53 has 99.
+    Taking the first 25 in the order the service returns them takes whatever is near the start of
+    the sequence, which for p53 is 21 interaction regions and not one binding site. Taking them
+    a kind at a time instead means every kind of annotation the protein has appears before any
+    kind gets a second entry, so the cap costs detail rather than whole categories.
+
+    :param raw: The features as UniProt returned them.
+    :return: The features to report, as type, position, and description.
+    """
+    by_type: dict[str, list[tuple[str, str, str]]] = {kind: [] for kind in REPORTED_FEATURE_TYPES}
+
+    for feature in raw:
+        kind = str(feature.get("type", ""))
+
+        if kind in by_type:
+            by_type[kind].append(
+                (kind, position_of(feature), str(feature.get("description", "")))
+            )
+
+    deepest = max((len(found) for found in by_type.values()), default=0)
+    selected = [
+        found[depth]
+        for depth in range(deepest)
+        for found in (by_type[kind] for kind in REPORTED_FEATURE_TYPES)
+        if depth < len(found)
+    ]
+
+    return tuple(selected[:MAX_FEATURES_REPORTED])
 
 
 def position_of(feature: dict[str, Any]) -> str:
@@ -120,10 +178,13 @@ def position_of(feature: dict[str, Any]) -> str:
     if start is None and end is None:
         return "?"
 
-    if start == end or end is None:
+    if start == end:
         return str(start)
 
-    return f"{start}-{end}"
+    # UniProt reports a terminus it never determined as a null value with an UNKNOWN modifier, so
+    # one end of a range can be missing while the other is exact. Writing that as "None-1465"
+    # reads as a parsing failure; UniProt itself writes "?-1465"
+    return f"{'?' if start is None else start}-{'?' if end is None else end}"
 
 
 @dataclass(frozen=True)
@@ -185,8 +246,13 @@ class Protein:
                 f"{f' and {remaining} more' if remaining > 0 else ''}"
             )
 
-        for comment_type, text in self.comments:
-            lines.append(f"\n{comment_type.title()}: {text}")
+        for comment_type, text in self.comments[:MAX_COMMENTS_REPORTED]:
+            lines.append(f"\n{comment_type.title()}: {truncate_text(text)}")
+
+        remaining_comments = len(self.comments) - MAX_COMMENTS_REPORTED
+
+        if remaining_comments > 0:
+            lines.append(f"\nand {remaining_comments} more annotation(s) not shown")
 
         if self.features:
             lines.append("\nAnnotated positions:")
@@ -284,7 +350,9 @@ class Structure:
     :param method: How it was determined, such as X-ray diffraction.
     :param resolution: The resolution in angstroms, where the method has one.
     :param released: The date it was first released.
-    :param chains: The polymer chains it contains.
+    :param chains: The polymer chains that were fetched, which for a large assembly is fewer than
+        the structure has.
+    :param entity_count: How many distinct polymer chains the structure has in total.
     :param ligand_ids: The chemical components bound in it.
     :param pubmed_id: The article describing it.
     """
@@ -295,8 +363,19 @@ class Structure:
     resolution: float | None
     released: str
     chains: tuple[Chain, ...] = ()
+    entity_count: int | None = None
     ligand_ids: tuple[str, ...] = ()
     pubmed_id: int | None = None
+
+    @property
+    def chain_count(self) -> int:
+        """How many distinct polymer chains the structure has, fetched or not."""
+        return len(self.chains) if self.entity_count is None else self.entity_count
+
+    @property
+    def chains_not_shown(self) -> int:
+        """How many of the structure's chains the report leaves out."""
+        return max(self.chain_count - min(len(self.chains), MAX_CHAINS_REPORTED), 0)
 
     def report(self) -> str:
         """Renders the structure for a model."""
@@ -311,11 +390,14 @@ class Structure:
 
         if self.chains:
             shown = self.chains[:MAX_CHAINS_REPORTED]
-            lines.append(f"\n{len(self.chains)} polymer chain(s):")
+            # The count is the structure's own, not the number that happened to be fetched: a
+            # ribosome has dozens of entities and only the first few are retrieved, so counting
+            # the tuple would tell an agent a 56 chain assembly is an 8 chain one
+            lines.append(f"\n{self.chain_count} polymer chain(s):")
             lines.extend(chain.summary() for chain in shown)
 
-            if len(self.chains) > len(shown):
-                lines.append(f"  and {len(self.chains) - len(shown)} more")
+            if self.chains_not_shown:
+                lines.append(f"  and {self.chains_not_shown} more, not fetched")
 
         if self.ligand_ids:
             lines.append(f"\nBound components: {', '.join(self.ligand_ids)}")
@@ -420,18 +502,20 @@ class DownloadedFile:
     :param path: Where the file was written.
     :param source_url: Where it came from.
     :param characters: How much was written.
+    :param read_as: The path to open from the directory the code runs in.
     """
 
     path: Path
     source_url: str
     characters: int
+    read_as: str = ""
 
     def report(self) -> str:
         """Renders the download for a model."""
         return (
             f"Downloaded {self.source_url}\n"
             f"Saved to {self.path} ({self.characters:,} characters).\n"
-            f'Read it from code as "{self.path.name}" in the working directory.'
+            f'Read it from code as "{self.read_as or self.path.name}".'
         )
 
 
@@ -448,12 +532,26 @@ def get_protein(accession: str) -> Protein:
     try:
         entry = request_json(url)
     except WebRequestError as error:
-        # UniProt answers an unknown accession with 400 rather than 404, so the status does not
-        # distinguish a bad identifier from a bad request
+        if error.status_code not in NO_SUCH_RECORD_STATUSES:
+            raise
+
         raise RecordNotFoundError(
             f'No UniProt entry for "{accession}". Accessions look like P01308 or A0A0F6YEF6; '
             f"search by name if you do not have one."
         ) from error
+
+    # A withdrawn accession comes back as 200 with a stub in place of the entry, which parses
+    # into a plausible looking protein of zero residues. A model proposing an accession it
+    # remembers from an older paper hits this, so it has to be an error rather than a record
+    if entry.get("entryType") == "Inactive":
+        reason = entry.get("inactiveReason") or {}
+        merged_into = ", ".join(str(value) for value in reason.get("mergeDemergeTo") or [])
+
+        raise RecordNotFoundError(
+            f'UniProt entry "{accession}" is no longer active '
+            f'({str(reason.get("inactiveReasonType", "withdrawn")).lower()})'
+            f"{f'; it became {merged_into}' if merged_into else ''}."
+        )
 
     return protein_from(entry)
 
@@ -487,15 +585,7 @@ def protein_from(entry: dict[str, Any]) -> Protein:
         if comment.get("commentType") == comment_type and first_text(comment)
     )
 
-    features = tuple(
-        (
-            str(feature.get("type", "")),
-            position_of(feature),
-            str(feature.get("description", "")),
-        )
-        for feature in entry.get("features") or []
-        if feature.get("type") in REPORTED_FEATURE_TYPES
-    )[:MAX_FEATURES_REPORTED]
+    features = features_from(entry.get("features") or [])
 
     pdb_ids = tuple(
         str(reference.get("id", ""))
@@ -590,6 +680,9 @@ def get_structure(pdb_id: str, include_sequences: bool = True) -> Structure:
     try:
         entry = request_json(url)
     except WebRequestError as error:
+        if error.status_code not in NO_SUCH_RECORD_STATUSES:
+            raise
+
         raise RecordNotFoundError(
             f'No PDB entry for "{pdb_id}". Identifiers are four characters, such as 4HHB.'
         ) from error
@@ -621,6 +714,7 @@ def get_structure(pdb_id: str, include_sequences: bool = True) -> Structure:
         # The date carries a time and a zone that nothing here needs
         released=released.split("T")[0],
         chains=chains,
+        entity_count=len(entity_ids),
         ligand_ids=tuple(
             str(value)
             for value in (entry.get("rcsb_entry_info") or {}).get("nonpolymer_bound_components")
@@ -679,18 +773,29 @@ def get_predicted_structure(accession: str) -> PredictedStructure:
     try:
         predictions = request_json(url)
     except WebRequestError as error:
+        if error.status_code not in NO_SUCH_RECORD_STATUSES:
+            raise
+
         raise RecordNotFoundError(
             f'No AlphaFold prediction for "{accession}". The database covers UniProt entries, '
             f"so this needs an accession such as P01308."
         ) from error
 
-    if not predictions:
+    # The endpoint answers with a list of models. Anything else is a service that has changed
+    # shape, and indexing it blindly turns that into a KeyError the agent cannot act on
+    if not isinstance(predictions, list) or not predictions:
         raise RecordNotFoundError(f'No AlphaFold prediction for "{accession}".')
 
     prediction = predictions[0]
-    confident = (prediction.get("fractionPlddtConfident") or 0) + (
-        prediction.get("fractionPlddtVeryHigh") or 0
+    # A prediction where nothing is confidently modelled reports 0.0 for both bands, which is a
+    # fact worth stating rather than a missing field. Treating it as absent hides the disordered
+    # protein, which is the case a confidence figure exists for
+    bands = tuple(
+        prediction.get(key)
+        for key in ("fractionPlddtConfident", "fractionPlddtVeryHigh")
+        if prediction.get(key) is not None
     )
+    confident = sum(bands) if bands else None
 
     return PredictedStructure(
         accession=str(prediction.get("uniprotAccession", accession)),
@@ -699,7 +804,7 @@ def get_predicted_structure(accession: str) -> PredictedStructure:
         sequence=str(prediction.get("uniprotSequence", "")),
         mean_plddt=prediction.get("globalMetricValue"),
         version=prediction.get("latestVersion"),
-        fraction_confident=confident if confident else None,
+        fraction_confident=confident,
         pdb_url=str(prediction.get("pdbUrl", "")),
         cif_url=str(prediction.get("cifUrl", "")),
     )
@@ -710,6 +815,7 @@ def download_structure(
     save_dir: Path,
     source: str = "pdb",
     file_format: str = "cif",
+    working_dir: Path | None = None,
 ) -> DownloadedFile:
     """Fetches a structure file and writes it where sandboxed code can read it.
 
@@ -721,6 +827,8 @@ def download_structure(
     :param save_dir: The directory to write into, chosen by the caller and never by a model.
     :param source: Either "pdb" for an experimental structure or "alphafold" for a prediction.
     :param file_format: Either "cif" or "pdb".
+    :param working_dir: The directory the code that reads the file will run in, so the report can
+        say how to open it from there. Without it the report gives the absolute path.
     :raises ValueError: If the source or format is not one of the values above.
     :raises RecordNotFoundError: If the structure does not exist.
     :raises WebRequestError: If the file cannot be fetched.
@@ -767,4 +875,13 @@ def download_structure(
 
     path.write_text(content, encoding="utf-8")
 
-    return DownloadedFile(path=path, source_url=url, characters=len(content))
+    # How to open it from the directory the code will run in, which is not the directory it was
+    # written to. Telling a model the bare filename is only right when the two coincide
+    if working_dir is not None and path.is_relative_to(working_dir.resolve()):
+        read_as = str(path.relative_to(working_dir.resolve()))
+    else:
+        read_as = str(path)
+
+    return DownloadedFile(
+        path=path, source_url=url, characters=len(content), read_as=read_as
+    )

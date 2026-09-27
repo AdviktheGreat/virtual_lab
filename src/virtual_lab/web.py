@@ -62,7 +62,20 @@ RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
 
 
 class WebRequestError(Exception):
-    """Raised when a request to an external service cannot be completed."""
+    """Raised when a request to an external service cannot be completed.
+
+    A caller often needs to tell "the service says there is no such thing" from "the service could
+    not be reached", since the first is an answer and the second is not. The status is carried here
+    so that distinction does not have to be made by reading the message.
+
+    :param message: What went wrong.
+    :param status_code: The HTTP status, where the failure was a status rather than a transport
+        error or a request that was refused before it was sent.
+    """
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class DisallowedHostError(WebRequestError):
@@ -533,7 +546,10 @@ def follow(
                 )
 
             if not response.ok:
-                raise WebRequestError(f"{current} returned {response.status_code}")
+                raise WebRequestError(
+                    f"{current} returned {response.status_code}",
+                    status_code=response.status_code,
+                )
 
             return read_capped(response=response, max_bytes=max_bytes)
 
@@ -641,7 +657,10 @@ def post_json(
                     continue
 
                 if not response.ok:
-                    raise WebRequestError(f"{url} returned {response.status_code}")
+                    raise WebRequestError(
+                        f"{url} returned {response.status_code}",
+                        status_code=response.status_code,
+                    )
 
                 body = read_capped(response=response, max_bytes=max_bytes)
 

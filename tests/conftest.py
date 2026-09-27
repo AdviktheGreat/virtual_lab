@@ -255,8 +255,14 @@ class FakeTransport:
     def get(self, url: str, **kwargs: Any) -> FakeResponse:
         self.requests.append({"url": url, **kwargs})
 
+        # An unexpected request is a test result, not something to answer. Replying 200 with an
+        # empty body here would let a test that makes one more request than it queued pass, and
+        # pass with the wrong body, which is how a test comes to assert nothing
         if not self.responses:
-            return FakeResponse(url=url)
+            raise AssertionError(
+                f"Unexpected request to {url}: the queue is empty after "
+                f"{len(self.requests) - 1} request(s)"
+            )
 
         return self.responses.pop(0)
 
@@ -264,7 +270,10 @@ class FakeTransport:
         self.post_requests.append({"url": url, **kwargs})
 
         if not self.post_responses:
-            return FakeResponse(url=url)
+            raise AssertionError(
+                f"Unexpected POST to {url}: the queue is empty after "
+                f"{len(self.post_requests) - 1} request(s)"
+            )
 
         return self.post_responses.pop(0)
 

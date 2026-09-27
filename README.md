@@ -147,9 +147,11 @@ run_meeting(
     meeting_type="team",
     agenda="Choose a target epitope for a nanobody against the spike protein.",
     save_dir=Path("results"),
+    save_name="epitope_choice",
     team_lead=principal_investigator,
     team_members=(immunologist, computational_biologist),
-    tools=all_tools(save_dir=Path("results")),
+    # The same two arguments, so downloads land where this meeting's code will run
+    tools=all_tools(save_dir=Path("results"), save_name="epitope_choice"),
 )
 ```
 
@@ -162,7 +164,7 @@ run_meeting(
 | `fetch_structure_file` | Download coordinates to disk for code to parse |
 | `pubmed_search` | Abstracts or full text from PubMed Central |
 
-Use `tools_for("uniprot_lookup", "pdb_lookup")` to give a particular agent only part of the set, and `TOOL_REGISTRY` to see what is available. Each underlying function can also be called directly, which is what tests and analysis scripts do:
+Use `tools_for("uniprot_lookup", "pdb_lookup")` to give a particular agent only part of the set, and `TOOL_REGISTRY` to see what is available. `fetch_structure_file` is not in the registry, because it cannot exist until it has been told where to write; get it from `all_tools(save_dir=...)` or build one with `structure_file_tool(work_dir)`. Each underlying function can also be called directly, which is what tests and analysis scripts do:
 
 ```python
 from virtual_lab import get_protein
@@ -178,6 +180,6 @@ Three things about this are deliberate:
 
 **Queries are built from named arguments, not written by a model.** A model asked to compose a query payload writes a plausible one whose mistakes come back as an empty result rather than as an error, which is the hardest kind to notice. The cost is a function signature per database, which is also what makes these testable.
 
-**Coordinates go to disk, not into the conversation.** One moderate structure file is several hundred kilobytes, and code an agent writes runs in a sandbox with no network of its own. So `fetch_structure_file` fetches outside the sandbox and leaves the file in the directory mounted into it, reporting the name back. Where it writes is bound when the tool is built and is not a parameter a model fills in.
+**Coordinates go to disk, not into the conversation.** One moderate structure file is several hundred kilobytes, and code an agent writes runs in a sandbox with no network of its own. So `fetch_structure_file` fetches outside the sandbox and writes into `artifacts/<save_name>/structures`, which is inside the one directory mounted into the container, and reports back the path to use from there. A file written anywhere else is invisible to the code that needs it. Where it writes is bound when the tool is built and is not a parameter a model fills in, which is why `all_tools` takes the same `save_dir` and `save_name` that `run_meeting` does.
 
 A note on `uniprot_search`: `reviewed_only` is off by default. Curation covers a small fraction of UniProt, and for some classes of sequence it covers none of it, so a search for a nanobody with it on returns proteins whose reference titles mention one while filtering out every real camelid VHH.

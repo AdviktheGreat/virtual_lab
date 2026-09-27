@@ -16,7 +16,7 @@ from typing import Any
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
-from virtual_lab.constants import MAX_SEARCH_RESULTS, STRUCTURE_DIR_NAME
+from virtual_lab.constants import ARTIFACT_DIR_NAME, MAX_SEARCH_RESULTS, STRUCTURE_DIR_NAME
 from virtual_lab.databases import (
     download_structure,
     get_predicted_structure,
@@ -104,7 +104,7 @@ def look_up_predicted_structure(accession: str) -> str:
 
 
 def fetch_structure_file(
-    save_dir: Path,
+    work_dir: Path,
     identifier: str,
     source: str = "pdb",
     file_format: str = "cif",
@@ -116,9 +116,10 @@ def fetch_structure_file(
     """
     return download_structure(
         identifier=identifier,
-        save_dir=save_dir,
+        save_dir=work_dir / STRUCTURE_DIR_NAME,
         source=source,
         file_format=file_format,
+        working_dir=work_dir,
     ).report()
 
 
@@ -223,24 +224,25 @@ ALPHAFOLD_LOOKUP_TOOL = Tool(
 )
 
 
-def structure_file_tool(save_dir: Path) -> Tool:
+def structure_file_tool(work_dir: Path) -> Tool:
     """Builds the structure download tool, bound to a directory.
 
     This one is a function rather than a constant because it needs somewhere to write, and that
     somewhere must not be a parameter a model fills in.
 
-    :param save_dir: The directory to write structure files into.
+    :param work_dir: The directory the sandboxed code will run in. Files are written to a
+        subdirectory of it, so that code can open them by the path it is told.
     :return: The tool.
     """
     return Tool(
         name="fetch_structure_file",
         description=(
             "Download the atomic coordinates of a structure so that code can read them. The file "
-            "is written next to the code that will be run, and its name is reported back. Use "
-            "this rather than asking for coordinates directly: a structure file is hundreds of "
-            "kilobytes and is for code to parse, not to read in a discussion. Code written in "
-            "this project runs without network access, so anything it needs must be fetched here "
-            "first."
+            "is written where the code that will be run can open it, and the path to use is "
+            "reported back. Use this rather than asking for coordinates directly: a structure "
+            "file is hundreds of kilobytes and is for code to parse, not to read in a "
+            "discussion. Code written in this project runs without network access, so anything "
+            "it needs must be fetched here first."
         ),
         parameters={
             "type": "object",
@@ -265,7 +267,7 @@ def structure_file_tool(save_dir: Path) -> Tool:
             },
             "required": ["identifier"],
         },
-        function=partial(fetch_structure_file, save_dir),
+        function=partial(fetch_structure_file, work_dir),
     )
 
 
@@ -299,18 +301,27 @@ def tools_for(*names: str) -> tuple[Tool, ...]:
     return tuple(TOOL_REGISTRY[name] for name in names)
 
 
-def all_tools(save_dir: Path | None = None) -> tuple[Tool, ...]:
+def all_tools(save_dir: Path | None = None, save_name: str = "discussion") -> tuple[Tool, ...]:
     """Returns every tool an agent can be given.
 
-    :param save_dir: Where a downloaded structure file should be written. Without it the download
-        tool is left out rather than given a default, since a library should not decide to write
-        into a caller's working directory.
+    A downloaded file is only useful if the code that reads it can see it, and the only host
+    directory the sandbox mounts is the meeting's artifact directory. So the download is bound
+    inside that directory rather than beside it, and takes the same two arguments that decide
+    where a meeting's code is written.
+
+    :param save_dir: Where the meeting is being saved. Without it the download tool is left out
+        rather than given a default, since a library should not decide to write into a caller's
+        working directory.
+    :param save_name: The name the meeting is saved under, which is the artifact subdirectory
+        the code runs in.
     :return: The tools.
     """
     if save_dir is None:
         return DATABASE_TOOLS
 
-    return DATABASE_TOOLS + (structure_file_tool(save_dir / STRUCTURE_DIR_NAME),)
+    work_dir = save_dir / ARTIFACT_DIR_NAME / save_name
+
+    return DATABASE_TOOLS + (structure_file_tool(work_dir),)
 
 
 def run_tool_calls(

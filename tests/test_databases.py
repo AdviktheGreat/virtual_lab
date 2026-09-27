@@ -12,9 +12,11 @@ from pathlib import Path
 
 import pytest
 
+from virtual_lab import databases
 from virtual_lab.artifacts import UnsafeFilenameError
 from virtual_lab.constants import (
     MAX_CHAINS_REPORTED,
+    MAX_COMMENTS_REPORTED,
     MAX_FEATURES_REPORTED,
     MAX_SEARCH_RESULTS,
     MAX_SEQUENCE_RESIDUES_REPORTED,
@@ -35,6 +37,7 @@ from virtual_lab.databases import (
     protein_from,
     search_proteins,
     truncate_sequence,
+    truncate_text,
     wrap_sequence,
 )
 from virtual_lab.web import WebRequestError
@@ -139,8 +142,14 @@ class TestReadingAProteinRecord:
         # they would crowd out the ones an agent needs
         protein = protein_from(INSULIN_ENTRY)
 
+        report = protein.report()
+
         assert [kind for kind, _ in protein.comments] == ["FUNCTION", "SUBUNIT"]
-        assert "insulin family" not in protein.report()
+        # Both halves matter: the kept comments have to reach the report, or dropping the
+        # uninformative one would be satisfied just as well by rendering none of them
+        assert "Function: Insulin decreases blood glucose" in report
+        assert "Subunit:" in report
+        assert "insulin family" not in report
 
     def test_comments_come_out_in_a_fixed_order(self) -> None:
         # Not the order the service happened to use, so two reports can be compared
@@ -240,6 +249,13 @@ class TestWhatAReportCosts:
 
         assert [len(line) for line in wrapped.splitlines()] == [60, 60, 10]
 
+    def test_the_default_width_is_the_one_the_reports_use(self) -> None:
+        # Passing a width tests the argument, not the value every report relies on
+        lines = wrap_sequence("M" * 130).splitlines()
+
+        assert max(len(line) for line in lines) == 60
+        assert len(lines) == 3
+
     def test_the_pdb_list_is_capped(self) -> None:
         # A well studied protein has hundreds of structures, and listing them all would cost more
         # than the rest of the record put together
@@ -267,7 +283,7 @@ class TestWhatAReportCosts:
                     description=f"protein {i}",
                     chain_ids=(chr(65 + i),),
                     organism="Escherichia coli",
-                    sequence="M" * 50,
+                    sequence=f"{chr(65 + i)}" * 300,
                     copies=1,
                 )
                 for i in range(MAX_CHAINS_REPORTED + 5)
@@ -279,6 +295,249 @@ class TestWhatAReportCosts:
         assert "and 5 more" in report
         assert "protein 0" in report
         assert f"protein {MAX_CHAINS_REPORTED + 4}" not in report
+
+        # The chain summaries are one line each; the sequence blocks are the bulk of the report
+        # and are capped separately, so a test that only reads the summary list misses the half
+        # that actually costs anything
+        assert report.count("Sequence of chain ") == MAX_CHAINS_REPORTED
+        assert "Sequence of chain A" in report
+        assert "A" * 60 in report
+        assert f"Sequence of chain {chr(65 + MAX_CHAINS_REPORTED + 4)}" not in report
+        assert f"{chr(65 + MAX_CHAINS_REPORTED + 4)}" * 60 not in report
+
+    def test_every_protein_field_that_is_parsed_reaches_the_report(self) -> None:
+        # The parsing tests assert on the record. A field can be read correctly and then be
+        # missing from the one thing the model actually sees.
+        report = protein_from(INSULIN_ENTRY).report()
+
+        assert "P01308" in report
+        assert "INS_HUMAN" in report
+        assert "Insulin" in report
+        assert "Homo sapiens" in report
+        assert "taxon 9606" in report
+        assert "Genes: INS" in report
+        assert "24 residues" in report
+        assert "11,981 Da" in report
+        assert "1A7F" in report
+        assert "Annotated positions" in report
+        assert "Disulfide bond" in report
+        assert "MALWMRLLPLLALLALWGPDPAAA" in report
+
+    def test_every_structure_field_that_is_parsed_reaches_the_report(self) -> None:
+        structure = Structure(
+            pdb_id="4HHB",
+            title="THE CRYSTAL STRUCTURE OF HUMAN DEOXYHAEMOGLOBIN",
+            method="X-RAY DIFFRACTION",
+            resolution=1.74,
+            released="1984-07-17",
+            chains=(
+                Chain(
+                    entity_id="1",
+                    description="Hemoglobin subunit alpha",
+                    chain_ids=("A", "C"),
+                    organism="Homo sapiens",
+                    sequence="VLSPADKTNV",
+                    copies=2,
+                ),
+            ),
+            entity_count=2,
+            ligand_ids=("HEM",),
+            pubmed_id=6726807,
+        )
+        report = structure.report()
+
+        assert "4HHB" in report
+        assert "DEOXYHAEMOGLOBIN" in report
+        assert "X-RAY DIFFRACTION" in report
+        assert "1.74 A resolution" in report
+        assert "Released: 1984-07-17" in report
+        assert "Chain A/C" in report
+        assert "2 copies" in report
+        assert "Homo sapiens" in report
+        assert "Bound components: HEM" in report
+        assert "Described in PubMed 6726807" in report
+        assert "VLSPADKTNV" in report
+
+    def test_a_structure_reports_the_chain_count_it_has_not_the_number_fetched(self) -> None:
+        # get_structure retrieves only the first few entities of a large assembly. Counting the
+        # tuple would tell an agent a 56 chain ribosome is an 8 chain complex.
+        structure = Structure(
+            pdb_id="7K00",
+            title="A 70S ribosome",
+            method="ELECTRON MICROSCOPY",
+            resolution=2.0,
+            released="2020-01-01",
+            chains=tuple(
+                Chain(
+                    entity_id=str(i),
+                    description=f"protein {i}",
+                    chain_ids=(str(i),),
+                    organism="Escherichia coli",
+                    sequence="M" * 50,
+                    copies=1,
+                )
+                for i in range(MAX_CHAINS_REPORTED)
+            ),
+            entity_count=56,
+        )
+        report = structure.report()
+
+        assert "56 polymer chain(s)" in report
+        assert f"and {56 - MAX_CHAINS_REPORTED} more, not fetched" in report
+
+
+class TestWhatTheReviewFound:
+    """Behaviour added because a review showed the report or the error was misleading."""
+
+    def test_the_comments_are_capped_like_everything_else(self) -> None:
+        # Comments were the one unbounded field: a well curated entry carries over 11,000
+        # characters of them, which is more than the capped sequence and the rest put together
+        entry = INSULIN_ENTRY | {
+            "comments": [
+                {"commentType": "FUNCTION", "texts": [{"value": "F" * 5_000}]},
+                {"commentType": "SUBUNIT", "texts": [{"value": "S" * 5_000}]},
+            ]
+        }
+        report = protein_from(entry).report()
+
+        assert "characters not shown" in report
+        assert "F" * 5_000 not in report
+        assert len(report) < 3_000
+
+    def test_a_long_annotation_says_how_much_it_left_out(self) -> None:
+        assert "400 of 1,400 characters not shown" in truncate_text("x" * 1_400, limit=1_000)
+
+    def test_the_annotations_shown_are_capped_by_count(self) -> None:
+        # A curated entry carries many comments of one type rather than one of each, and there
+        # are fewer reportable types than the cap, so only the former exercises it
+        entry = INSULIN_ENTRY | {
+            "comments": [
+                {"commentType": "FUNCTION", "texts": [{"value": f"finding {i}"}]}
+                for i in range(MAX_COMMENTS_REPORTED + 6)
+            ]
+        }
+        protein = protein_from(entry)
+        report = protein.report()
+
+        assert len(protein.comments) == MAX_COMMENTS_REPORTED + 6
+        assert report.count("finding ") == MAX_COMMENTS_REPORTED
+        assert "and 6 more annotation(s) not shown" in report
+
+    def test_features_are_kept_by_importance_not_by_position(self) -> None:
+        # A protein carries far more eligible features than the cap. Taken in the order the
+        # service returns them, the cap keeps whatever is near the N terminus and discards the
+        # binding sites, which is the opposite of why the list was chosen.
+        entry = INSULIN_ENTRY | {
+            "features": [
+                {"type": "Region", "location": {"start": {"value": i}, "end": {"value": i}}}
+                for i in range(MAX_FEATURES_REPORTED + 10)
+            ]
+            + [{"type": "Binding site", "location": {"start": {"value": 900}, "end": {"value": 900}}}]
+        }
+        kinds = [kind for kind, _, _ in protein_from(entry).features]
+
+        assert "Binding site" in kinds
+
+    def test_a_half_known_range_is_not_rendered_as_none(self) -> None:
+        # UniProt reports an undetermined terminus as a null, and writing "None-1465" reads as
+        # a parsing failure rather than as the fact that one end is unknown
+        entry = INSULIN_ENTRY | {
+            "features": [
+                {
+                    "type": "Chain",
+                    "location": {"start": {"value": None}, "end": {"value": 1465}},
+                    "description": "WND",
+                }
+            ]
+        }
+        protein = protein_from(entry)
+
+        assert protein.features[0][1] == "?-1465"
+        assert "None" not in protein.report()
+
+
+class TestWhenADatabaseCannotAnswer:
+    """A service being down and an identifier naming nothing are different answers."""
+
+    def test_a_service_outage_is_not_reported_as_a_missing_protein(self, web_transport) -> None:
+        # Telling an agent the protein does not exist because the service returned 503 is worse
+        # than telling it nothing, because it will stop looking
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(status_code=503) for _ in range(5)]
+
+        with pytest.raises(WebRequestError) as raised:
+            get_protein("P01308")
+
+        assert not isinstance(raised.value, RecordNotFoundError)
+
+    def test_a_rejected_accession_is_reported_as_a_missing_protein(self, web_transport) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(status_code=400)]
+
+        with pytest.raises(RecordNotFoundError):
+            get_protein("NOTANACCESSION")
+
+    def test_an_outage_is_not_reported_as_a_missing_structure(self, web_transport) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(status_code=503) for _ in range(5)]
+
+        with pytest.raises(WebRequestError) as raised:
+            get_structure("4HHB")
+
+        assert not isinstance(raised.value, RecordNotFoundError)
+
+    def test_an_outage_is_not_reported_as_a_missing_prediction(self, web_transport) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(status_code=503) for _ in range(5)]
+
+        with pytest.raises(WebRequestError) as raised:
+            get_predicted_structure("P01308")
+
+        assert not isinstance(raised.value, RecordNotFoundError)
+
+    def test_a_withdrawn_accession_is_an_error_not_a_zero_length_protein(
+        self, web_transport
+    ) -> None:
+        # UniProt answers a deleted accession with 200 and a stub, which parses into a plausible
+        # protein of no residues. A model proposing an accession from an older paper hits this.
+        web_transport.queue(
+            {
+                "entryType": "Inactive",
+                "primaryAccession": "A0A008APQ8",
+                "uniProtkbId": "A0A008APQ8_STAAU",
+                "inactiveReason": {"inactiveReasonType": "DELETED"},
+            }
+        )
+
+        with pytest.raises(RecordNotFoundError, match="no longer active"):
+            get_protein("A0A008APQ8")
+
+    def test_a_demerged_accession_names_what_it_became(self, web_transport) -> None:
+        web_transport.queue(
+            {
+                "entryType": "Inactive",
+                "primaryAccession": "Q00001",
+                "inactiveReason": {
+                    "inactiveReasonType": "DEMERGED",
+                    "mergeDemergeTo": ["P11111", "P22222"],
+                },
+            }
+        )
+
+        with pytest.raises(RecordNotFoundError, match="P11111, P22222"):
+            get_protein("Q00001")
+
+    def test_a_prediction_endpoint_that_changes_shape_is_an_error(self, web_transport) -> None:
+        # Indexing an object as if it were the documented list gives a KeyError the agent
+        # cannot act on
+        web_transport.queue({"predictions": []})
+
+        with pytest.raises(RecordNotFoundError):
+            get_predicted_structure("P01308")
 
 
 class TestLookingUpAProtein:
@@ -320,6 +579,25 @@ class TestSearchingForProteins:
 
         assert web_transport.params[0]["query"] == "insulin receptor"
         assert web_transport.params[0]["size"] == 5
+
+    def test_the_search_goes_to_the_search_endpoint(self, web_transport) -> None:
+        # Asserting the parameters says nothing about where they were sent
+        web_transport.queue({"results": []})
+
+        search_proteins("insulin")
+
+        assert web_transport.urls == ["https://rest.uniprot.org/uniprotkb/search"]
+
+    def test_only_the_fields_a_hit_needs_are_asked_for(self, web_transport) -> None:
+        # Without this the service returns whole entries, and a 25 hit search becomes megabytes
+        web_transport.queue({"results": []})
+
+        search_proteins("insulin")
+
+        requested = web_transport.params[0]["fields"].split(",")
+
+        assert "accession" in requested
+        assert "sequence" not in requested
 
     def test_curated_entries_are_not_the_default(self) -> None:
         # Learned the hard way: with this on, a search for a nanobody returns proteins whose
@@ -508,6 +786,42 @@ class TestLookingUpAPrediction:
         assert prediction.version == 6
         assert prediction.cif_url.endswith("model_v6.cif")
 
+    def test_the_request_goes_to_the_prediction_endpoint(self, web_transport) -> None:
+        web_transport.queue(INSULIN_PREDICTION)
+
+        get_predicted_structure("P01308")
+
+        assert web_transport.urls == [
+            "https://alphafold.ebi.ac.uk/api/prediction/P01308"
+        ]
+
+    def test_every_field_the_record_holds_reaches_the_report(self, web_transport) -> None:
+        # Parsing a field and then dropping it on the way to the model is the same as not
+        # having it, and the parsing tests above cannot see the difference
+        web_transport.queue(INSULIN_PREDICTION)
+
+        report = get_predicted_structure("P01308").report()
+
+        assert "P01308" in report
+        assert "Insulin" in report
+        assert "version 6" in report
+        assert "52.9" in report
+        assert "pLDDT over 70" in report
+
+    def test_a_prediction_with_nothing_confident_says_so(self, web_transport) -> None:
+        # Both bands at zero is a fact about a disordered protein, not a missing field
+        web_transport.queue(
+            [
+                INSULIN_PREDICTION[0]
+                | {"fractionPlddtConfident": 0.0, "fractionPlddtVeryHigh": 0.0}
+            ]
+        )
+
+        prediction = get_predicted_structure("P01308")
+
+        assert prediction.fraction_confident == 0.0
+        assert "Residues at pLDDT over 70: 0%" in prediction.report()
+
     def test_the_confident_fraction_combines_both_bands(self, web_transport) -> None:
         web_transport.queue(INSULIN_PREDICTION)
 
@@ -594,7 +908,36 @@ class TestDownloadingAStructureFile:
         report = download_structure("4HHB", save_dir=tmp_path).report()
 
         assert "4HHB.cif" in report
-        assert "working directory" in report
+        # With no working directory to relate it to, the only honest answer is the full path
+        assert str(tmp_path / "4HHB.cif") in report
+
+    def test_the_report_gives_the_path_the_running_code_will_use(
+        self, web_transport, tmp_path
+    ) -> None:
+        # The file is written beside the code, not into it, so the bare name would be wrong
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(body=b"data")]
+
+        report = download_structure(
+            "4HHB", save_dir=tmp_path / "structures", working_dir=tmp_path
+        ).report()
+
+        assert 'Read it from code as "structures/4HHB.cif"' in report
+
+    def test_a_file_outside_the_working_directory_is_reported_absolutely(
+        self, web_transport, tmp_path
+    ) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(body=b"data")]
+        elsewhere = tmp_path / "elsewhere"
+
+        report = download_structure(
+            "4HHB", save_dir=elsewhere, working_dir=tmp_path / "code"
+        ).report()
+
+        assert f'Read it from code as "{elsewhere / "4HHB.cif"}"' in report
 
     def test_the_directory_is_created(self, web_transport, tmp_path) -> None:
         from conftest import FakeResponse
@@ -664,6 +1007,31 @@ class TestDownloadingAStructureFile:
 
         with pytest.raises(UnsafeFilenameError):
             download_structure("P01308", save_dir=tmp_path, source="alphafold")
+
+    def test_a_name_that_escapes_after_resolution_is_refused(
+        self, web_transport, tmp_path, monkeypatch
+    ) -> None:
+        # check_filename runs on the name as written; the containment check runs on the path as
+        # resolved. Only the second can see a name that becomes an escape once it is joined, so
+        # it is tested by letting a name through the first and asserting the second still holds.
+        from conftest import FakeResponse
+
+        monkeypatch.setattr(databases, "check_filename", lambda name: name)
+        web_transport.responses = [
+            FakeResponse(
+                json_body=[INSULIN_PREDICTION[0] | {"cifUrl": "https://alphafold.ebi.ac.uk/f/.."}]
+            ),
+            FakeResponse(body=b"data"),
+        ]
+
+        with pytest.raises(UnsafeFilenameError, match="outside"):
+            download_structure("P01308", save_dir=tmp_path / "inside", source="alphafold")
+
+    def test_the_name_check_refuses_a_traversing_segment_on_its_own(self) -> None:
+        # The guard above is the second of two. This is the first, which is what actually stops
+        # the case above in production, so neither is left resting on the other.
+        with pytest.raises(UnsafeFilenameError):
+            databases.check_filename("..")
 
     def test_a_download_that_fails_does_not_leave_a_file(self, web_transport, tmp_path) -> None:
         from conftest import FakeResponse

@@ -306,6 +306,8 @@ class TestRedirects:
         assert transport.requests[1]["params"] is None
 
     def test_the_transport_is_told_not_to_follow_redirects_itself(self, transport) -> None:
+        transport.responses = [FakeResponse(body=b"ok")]
+
         request_text(UNIPROT)
 
         assert transport.requests[0]["allow_redirects"] is False
@@ -630,6 +632,7 @@ class TestRateLimiting:
         # NCBI refuses an unauthenticated client that exceeds its limit.
         waited: list[str] = []
         monkeypatch.setattr(web.RATE_LIMITER, "wait", waited.append)
+        transport.queue({"ok": True})
 
         request_json(UNIPROT)
 
@@ -684,12 +687,16 @@ class TestJsonHandling:
             request_json(UNIPROT)
 
     def test_json_is_requested_explicitly(self, transport) -> None:
+        transport.queue({"ok": True})
+
         request_json(UNIPROT)
 
         assert transport.requests[0]["headers"]["Accept"] == "application/json"
 
     def test_the_library_identifies_itself(self, transport) -> None:
         # Services ask clients to say who they are, and throttle those that do not
+        transport.responses = [FakeResponse(body=b"ok")]
+
         request_text(UNIPROT)
 
         assert "virtual-lab" in transport.requests[0]["headers"]["User-Agent"]
@@ -703,6 +710,8 @@ class TestJsonHandling:
 
     def test_a_timeout_is_always_set(self, transport) -> None:
         # Without one, a service that stops responding holds the meeting open indefinitely
+        transport.responses = [FakeResponse(body=b"ok")]
+
         request_text(UNIPROT)
 
         assert transport.requests[0]["timeout"] > 0
