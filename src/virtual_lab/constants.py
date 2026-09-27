@@ -171,3 +171,34 @@ MAX_WEB_CACHE_ENTRIES = 256
 # own is not a bound on memory: 256 entries of the largest allowed response would be well over a
 # gigabyte, which would undo the limit above it.
 MAX_WEB_CACHE_CHARACTERS = 32_000_000
+
+# Residues of a sequence to show a model. A sequence is the most useful thing a protein record
+# holds and also the longest: titin runs to roughly 35,000 residues, which is most of a context
+# window spent on one field. The whole sequence stays on the record for code to use.
+MAX_SEQUENCE_RESIDUES_REPORTED = 1_200
+
+# Most results a search may be asked for. A model chooses this number, and a request for hundreds
+# would be answered, charged for, and then largely ignored.
+MAX_SEARCH_RESULTS = 25
+
+# Chains of a structure to describe. A ribosome has dozens, and the first few are enough to tell
+# an agent what the structure contains.
+MAX_CHAINS_REPORTED = 8
+
+# Annotated positions to list per protein, since a well studied one carries hundreds
+MAX_FEATURES_REPORTED = 25
+
+# Free text annotations to show per protein, and how much of each. These are the largest thing in
+# a protein report after the sequence: the comments on a well curated entry run to over 11,000
+# characters, which is more than the capped sequence and the rest of the record put together.
+MAX_COMMENTS_REPORTED = 8
+MAX_COMMENT_CHARACTERS = 600
+
+# Most bytes to accept for a structure file. Far larger than an ordinary response because these
+# are written to disk for code to read rather than shown to a model, and a large complex runs to
+# tens of megabytes.
+MAX_STRUCTURE_FILE_BYTES = 30_000_000
+
+# Subdirectory that downloaded structure files are written to. Code an agent writes runs with no
+# network, so anything it needs to read has to be fetched for it and left somewhere it can reach.
+STRUCTURE_DIR_NAME = "structures"
