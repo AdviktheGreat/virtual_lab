@@ -211,6 +211,15 @@ MAX_ASSAY_DESCRIPTION_CHARACTERS = 200
 # against a single well studied kinase, and the most potent handful is what answers the question.
 MAX_ACTIVITIES_REPORTED = 15
 
+# Characters of a structure string or a systematic name to show. A small molecule's SMILES is
+# under a hundred, but ChEMBL holds peptides and antibody-drug conjugates whose SMILES runs to
+# thousands, and a systematic name grows with it. One of those would be the whole report.
+MAX_STRUCTURE_CHARACTERS = 500
+
+# Mechanisms of action to list for one molecule. A promiscuous kinase inhibitor has dozens on
+# record, and the report is meant to say what the drug does rather than enumerate every target.
+MAX_MECHANISMS_REPORTED = 10
+
 # Smallest pChEMBL value worth reporting, on a scale where 6 is a micromolar affinity and 9 is
 # nanomolar. Below this a compound is not usefully a binder, and the rows are mostly the inactive
 # arm of a screen.

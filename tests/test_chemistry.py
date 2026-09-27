@@ -39,8 +39,11 @@ from virtual_lab.constants import (
     MAX_ACTIVITIES_REPORTED,
     MAX_ASSAY_DESCRIPTION_CHARACTERS,
     MAX_DESCRIPTION_CHARACTERS,
+    MAX_MECHANISMS_REPORTED,
     MAX_SEARCH_RESULTS,
+    MAX_STRUCTURE_CHARACTERS,
     MIN_PCHEMBL_REPORTED,
+    WEB_MAX_ATTEMPTS,
 )
 from virtual_lab.records import RecordNotFoundError
 from virtual_lab.web import WebRequestError
@@ -205,6 +208,29 @@ class TestReadingACompoundRecord:
         assert "None" not in report
         assert "XLogP" not in report
 
+    def test_a_field_sent_as_null_is_not_rendered_as_the_word_none(self) -> None:
+        # A key present with a JSON null never takes a default, so str() on it writes "None" into
+        # the report where the formula should be, and int() on a null CID raises instead
+        compound = compound_from(
+            {key: None for key in ("CID", "MolecularFormula", "SMILES", "IUPACName")}
+        )
+
+        assert compound.cid == 0
+        assert compound.formula == ""
+        assert "None" not in compound.report()
+
+    @pytest.mark.parametrize(
+        "key, letter", [("SMILES", "C"), ("IUPACName", "z")]
+    )
+    def test_a_structure_too_long_to_show_is_capped(self, key, letter) -> None:
+        # ChEMBL and PubChem both hold peptides whose SMILES runs to thousands of characters,
+        # and a systematic name grows with the molecule it names
+        compound = compound_from(ASPIRIN_PROPERTIES | {key: letter * 4_000})
+        report = compound.report()
+
+        assert letter * MAX_STRUCTURE_CHARACTERS in report
+        assert letter * (MAX_STRUCTURE_CHARACTERS + 1) not in report
+
     def test_a_long_description_is_capped(self) -> None:
         compound = compound_from(ASPIRIN_PROPERTIES, description="x" * 2_000)
         report = compound.report()
@@ -250,6 +276,23 @@ class TestReadingADrugRecord:
         )
 
         assert "inhibitor Cyclooxygenase inhibitor (CHEMBL2094253)" in drug.report()
+
+    def test_a_drug_acting_on_everything_does_not_list_everything(self) -> None:
+        # A promiscuous kinase inhibitor has dozens of mechanisms on record
+        drug = molecule_from(
+            ASPIRIN_MOLECULE,
+            mechanisms=tuple(("INHIBITOR", f"Kinase {index} inhibitor", "") for index in range(40)),
+        )
+        report = drug.report()
+
+        assert f"Kinase {MAX_MECHANISMS_REPORTED - 1} inhibitor" in report
+        assert f"Kinase {MAX_MECHANISMS_REPORTED} inhibitor" not in report
+        assert f"and {40 - MAX_MECHANISMS_REPORTED} more" in report
+
+    def test_a_drug_that_was_not_withdrawn_is_not_labelled_withdrawn(self) -> None:
+        drug = molecule_from(ASPIRIN_MOLECULE | {"withdrawn_flag": False}, mechanisms=())
+
+        assert "Withdrawn" not in drug.report()
 
     def test_a_withdrawn_drug_says_so(self) -> None:
         drug = molecule_from(ASPIRIN_MOLECULE | {"withdrawn_flag": True}, mechanisms=())
@@ -349,6 +392,17 @@ class TestLookingUpACompound:
         assert "etc/passwd" not in web_transport.urls[0]
         assert "%2F" in web_transport.urls[0]
 
+    @pytest.mark.parametrize("namespace", ["name", "smiles"])
+    def test_an_empty_identifier_is_refused_before_any_request(
+        self, web_transport, namespace
+    ) -> None:
+        # The path namespaces are caught by the segment encoder, but a SMILES goes in a query
+        # parameter and reaches PubChem without passing through it
+        with pytest.raises(ValueError):
+            get_compound("   ", namespace=namespace)
+
+        assert web_transport.requests == []
+
     def test_an_unknown_namespace_is_refused_before_any_request(self, web_transport) -> None:
         with pytest.raises(ValueError, match="inchi"):
             get_compound("x", namespace="inchi")
@@ -396,11 +450,17 @@ class TestWhenPubChemCannotAnswer:
             get_compound("notacompound")
 
     def test_a_service_outage_is_not_reported_as_a_missing_compound(self, web_transport) -> None:
-        web_transport.responses = [FakeResponse(status_code=503) for _ in range(5)]
+        web_transport.responses = [
+            FakeResponse(status_code=503) for _ in range(WEB_MAX_ATTEMPTS)
+        ]
 
-        with pytest.raises(WebRequestError) as raised:
+        # Caught as Exception rather than as WebRequestError, so that the check below is the
+        # thing being tested. The two hierarchies are disjoint, so naming the class in raises()
+        # would satisfy the assertion before the code under test ran.
+        with pytest.raises(Exception) as raised:
             get_compound("aspirin")
 
+        assert isinstance(raised.value, WebRequestError)
         assert not isinstance(raised.value, RecordNotFoundError)
 
     def test_a_rejected_request_is_not_reported_as_a_missing_compound(self, web_transport) -> None:
@@ -409,9 +469,10 @@ class TestWhenPubChemCannotAnswer:
         # which is how the SMILES path encoding would have been hidden.
         web_transport.responses = [FakeResponse(status_code=400)]
 
-        with pytest.raises(WebRequestError) as raised:
+        with pytest.raises(Exception) as raised:
             get_compound("aspirin")
 
+        assert isinstance(raised.value, WebRequestError)
         assert not isinstance(raised.value, RecordNotFoundError)
 
     def test_a_structure_pubchem_does_not_hold_is_reported_as_missing(self, web_transport) -> None:
@@ -458,11 +519,14 @@ class TestLookingUpADrug:
             get_drug("CHEMBL99999999")
 
     def test_an_outage_is_not_reported_as_a_missing_drug(self, web_transport) -> None:
-        web_transport.responses = [FakeResponse(status_code=503) for _ in range(5)]
+        web_transport.responses = [
+            FakeResponse(status_code=503) for _ in range(WEB_MAX_ATTEMPTS)
+        ]
 
-        with pytest.raises(WebRequestError) as raised:
+        with pytest.raises(Exception) as raised:
             get_drug("CHEMBL25")
 
+        assert isinstance(raised.value, WebRequestError)
         assert not isinstance(raised.value, RecordNotFoundError)
 
     def test_a_response_that_is_not_a_molecule_is_reported_as_missing(self, web_transport) -> None:
@@ -471,17 +535,29 @@ class TestLookingUpADrug:
         with pytest.raises(RecordNotFoundError):
             get_drug("CHEMBL25")
 
-    def test_a_failed_mechanism_lookup_does_not_lose_the_drug(self, web_transport) -> None:
+    def test_a_molecule_with_no_recorded_mechanism_is_still_returned(self, web_transport) -> None:
         web_transport.responses = [
             FakeResponse(json_body=ASPIRIN_MOLECULE),
-            FakeResponse(status_code=500),
-            FakeResponse(status_code=500),
-            FakeResponse(status_code=500),
+            FakeResponse(status_code=404),
         ]
         drug = get_drug("CHEMBL25")
 
         assert drug.name == "ASPIRIN"
         assert drug.mechanisms == ()
+
+    def test_an_unreachable_mechanism_endpoint_is_not_reported_as_no_mechanism(
+        self, web_transport
+    ) -> None:
+        # The molecule lookup succeeded, so it is tempting to return what was found. But aspirin
+        # with an empty mechanism list is a claim, and an agent told a drug acts on nothing does
+        # not go back and check.
+        web_transport.responses = [
+            FakeResponse(json_body=ASPIRIN_MOLECULE),
+            *(FakeResponse(status_code=500) for _ in range(WEB_MAX_ATTEMPTS)),
+        ]
+
+        with pytest.raises(WebRequestError, match="mechanism"):
+            get_drug("CHEMBL25")
 
 
 class TestSearchingChEMBL:
@@ -563,6 +639,33 @@ class TestSearchingChEMBL:
 
         assert '"EGFR in Homo sapiens"' in report
         assert '""' not in report
+        # The hit itself, not only the heading: which organism a target came from is the whole
+        # reason for the filter, and a report that names it once at the top has not said it
+        assert "CHEMBL203  EGFR [SINGLE PROTEIN, Homo sapiens]" in report
+
+    def test_a_target_missing_its_type_and_organism_says_so(self) -> None:
+        report = SearchHits(
+            query="x", kind="targets", total=1, hits=(Target("CHEMBL1"),)
+        ).report()
+
+        assert "CHEMBL1  unnamed [not stated, not stated]" in report
+
+    @pytest.mark.parametrize(
+        "search, key, record",
+        [
+            (search_drugs, "molecules", {"molecule_chembl_id": "CHEMBL1"}),
+            (search_targets, "targets", {"target_chembl_id": "CHEMBL2"}),
+        ],
+    )
+    def test_a_service_that_ignores_the_limit_is_still_held_to_it(
+        self, web_transport, search, key, record
+    ) -> None:
+        # ChEMBL is asked for a limit and is trusted to honour it nowhere: the response is cut to
+        # the requested size on arrival too, so a service that ignores the parameter, or a cached
+        # response from a larger request, cannot put forty rows into a meeting.
+        queue(web_transport, {key: [record for _ in range(40)], "page_meta": {"total_count": 40}})
+
+        assert len(search("x", limit=3).hits) == 3
 
 
 class TestLookingUpBioactivity:
@@ -597,6 +700,22 @@ class TestLookingUpBioactivity:
 
         assert web_transport.params[0]["limit"] == MAX_ACTIVITIES_REPORTED
 
+    def test_a_service_that_ignores_the_limit_is_still_held_to_it(self, web_transport) -> None:
+        queue(
+            web_transport,
+            {"activities": [EGFR_ACTIVITY for _ in range(40)], "page_meta": {"total_count": 40}},
+        )
+
+        assert len(get_activities(target_chembl_id="CHEMBL203", limit=2).activities) == 2
+
+    def test_an_identifier_of_nothing_but_space_is_not_a_question(self, web_transport) -> None:
+        # " " is not falsy, so without stripping first this asks ChEMBL for activity against the
+        # empty string, which it reads as no filter and answers with the whole database
+        with pytest.raises(ValueError, match="target_chembl_id or a molecule_chembl_id"):
+            get_activities(target_chembl_id="   ")
+
+        assert web_transport.requests == []
+
     def test_a_measurement_is_parsed(self) -> None:
         activity = activity_from(EGFR_ACTIVITY)
 
@@ -605,6 +724,13 @@ class TestLookingUpBioactivity:
         assert activity.pchembl == pytest.approx(11.0)
         assert activity.units == "nM"
         assert activity.year == 1996
+
+    def test_a_measurement_with_no_units_reads_as_one_field(self) -> None:
+        # ChEMBL leaves the units off a ratio or a percentage, and the spare separator that
+        # leaves behind reads as a value whose units were dropped in parsing
+        activity = activity_from(EGFR_ACTIVITY | {"standard_units": None, "standard_value": "5"})
+
+        assert activity.summary().strip() == "IC50 = 5, pChEMBL 11.0, 1996"
 
     def test_html_entities_in_an_assay_description_are_decoded(self) -> None:
         # The assay descriptions ChEMBL imported from PubChem BioAssay carry HTML entities
@@ -704,13 +830,26 @@ class TestHowMeasurementsAreGrouped:
         assert results.report().count("BLM helicase") == 1
 
     def test_the_strongest_result_still_leads(self) -> None:
-        strong = Activity("CHEMBL1", target_name="A", target_chembl_id="CHEMBLA", pchembl=11.0)
-        weak = Activity("CHEMBL2", target_name="B", target_chembl_id="CHEMBLB", pchembl=5.0)
+        # Named so that the potency order and the alphabetical order disagree. With the strong
+        # one called "A" this passes whether the groups are ordered by arrival or sorted.
+        strong = Activity("CHEMBL1", target_name="Zeta", target_chembl_id="CHEMBLZ", pchembl=11.0)
+        weak = Activity("CHEMBL2", target_name="Alpha", target_chembl_id="CHEMBLA", pchembl=5.0)
         results = ActivityResults(
             subject="molecule X", total=2, activities=(strong, weak), grouped_by="target"
         )
 
-        assert results.groups()[0][0].startswith("A ")
+        assert [heading for heading, _ in results.groups()] == [
+            "Zeta (CHEMBLZ)",
+            "Alpha (CHEMBLA)",
+        ]
+
+    def test_an_unnamed_target_does_not_have_its_identifier_printed_twice(self) -> None:
+        nameless = Activity("CHEMBL1", target_chembl_id="CHEMBL9999", pchembl=8.0)
+        results = ActivityResults(
+            subject="molecule X", total=1, activities=(nameless,), grouped_by="target"
+        )
+
+        assert [heading for heading, _ in results.groups()] == ["CHEMBL9999"]
 
 
 class TestWhatAReportCosts:

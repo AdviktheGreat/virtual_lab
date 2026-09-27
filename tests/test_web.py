@@ -869,7 +869,35 @@ class TestHostsNeedingTheirOwnHandshake:
         everything = {cipher["name"] for cipher in default.get_ciphers()}
 
         assert chosen < everything
-        assert any(name.startswith("TLS_AES") for name in chosen)
+
+        # Asserted about the suites set_ciphers actually controls. TLS 1.3 suites are set
+        # separately, by set_ciphersuites, so an assertion that one of those is present holds
+        # whatever this cipher list says and would go on holding it if the list were emptied.
+        negotiable = {name for name in chosen if not name.startswith("TLS_")}
+
+        assert negotiable
+        assert all(name.startswith("ECDHE") for name in negotiable)
+
+        # The list that worked first also enabled two DSS suites the default context excludes,
+        # which is the opposite of leaving the connection alone
+        assert not any("DSS" in name for name in negotiable)
+
+    def test_the_cipher_list_survives_a_proxy(self) -> None:
+        # A proxied connection is built from proxy_kwargs, which does not inherit the pool
+        # arguments. Overriding only init_poolmanager leaves the workaround in place and inert
+        # for whoever has HTTPS_PROXY set, and PubChem answering 503 again is the only sign.
+        adapter = web.CipherAdapter(web.HOST_CIPHERS["pubchem.ncbi.nlm.nih.gov"])
+        manager = adapter.proxy_manager_for("https://proxy.example:3128")
+
+        context = manager.connection_pool_kw["ssl_context"]
+        chosen = {cipher["name"] for cipher in context.get_ciphers()}
+
+        assert chosen == {
+            cipher["name"]
+            for cipher in self.built_context(
+                web.HOST_CIPHERS["pubchem.ncbi.nlm.nih.gov"]
+            ).get_ciphers()
+        }
 
     def test_certificate_checking_is_not_what_was_changed(self) -> None:
         # The point of the cipher list is to change the handshake fingerprint, not to weaken it

@@ -87,15 +87,34 @@ class CipherAdapter(HTTPAdapter):
         self.ciphers = ciphers
         super().__init__(**kwargs)
 
-    def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
-        """Builds the pool manager with a context offering this adapter's ciphers."""
+    def context(self) -> ssl.SSLContext:
+        """Builds a context offering this adapter's ciphers.
+
+        :return: The context to connect with.
+        """
         # Built from the default context rather than a bare one, so that verification and
         # hostname checking are on for the same reason they are on everywhere else
         context = ssl.create_default_context()
         context.set_ciphers(self.ciphers)
-        kwargs["ssl_context"] = context
+
+        return context
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
+        """Builds the pool manager with a context offering this adapter's ciphers."""
+        kwargs["ssl_context"] = self.context()
 
         return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args: Any, **kwargs: Any) -> Any:
+        """Builds a proxy manager with the same context, for the same reason.
+
+        Overridden as well as init_poolmanager because the two do not share their pool arguments:
+        a proxied connection is built from proxy_kwargs alone, so without this the cipher list is
+        silently dropped and PubChem returns 503 again, but only for whoever set HTTPS_PROXY.
+        """
+        kwargs["ssl_context"] = self.context()
+
+        return super().proxy_manager_for(*args, **kwargs)
 
 
 # Kept between requests so the connection pool is reused, the same as requests.get does not
@@ -126,8 +145,9 @@ def session_for(host: str) -> requests.Session | None:
 def http_get(url: str, **kwargs: Any) -> requests.Response:
     """Makes one GET request, through a host's own session where it needs one.
 
-    The single place a request leaves this library, so that a host needing particular treatment
-    is handled in one line rather than at every call site.
+    The single place a GET leaves this library, so that a host needing particular treatment is
+    handled in one line rather than at every call site. post_json does not come through here,
+    since no allowed service needs both a request body and a configured handshake.
 
     :param url: The URL to fetch, already checked.
     :param kwargs: Passed through to requests.

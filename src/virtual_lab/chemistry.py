@@ -18,7 +18,9 @@ from virtual_lab.constants import (
     MAX_ACTIVITIES_REPORTED,
     MAX_ASSAY_DESCRIPTION_CHARACTERS,
     MAX_DESCRIPTION_CHARACTERS,
+    MAX_MECHANISMS_REPORTED,
     MAX_SEARCH_RESULTS,
+    MAX_STRUCTURE_CHARACTERS,
     MIN_PCHEMBL_REPORTED,
 )
 from virtual_lab.records import (
@@ -171,10 +173,13 @@ class Compound:
 
     def report(self) -> str:
         """Renders the compound for a model."""
-        lines = [f"PubChem CID {self.cid}: {self.title or self.iupac_name or 'unnamed'}"]
+        # Capped here too, not only on the line below: with no curated title this falls back to
+        # the systematic name, which for anything peptide-sized is the length of a paragraph
+        named = truncate_text(self.title or self.iupac_name or "unnamed", MAX_STRUCTURE_CHARACTERS)
+        lines = [f"PubChem CID {self.cid}: {named}"]
 
         if self.iupac_name and self.iupac_name != self.title:
-            lines.append(f"IUPAC name: {self.iupac_name}")
+            lines.append(f"IUPAC name: {truncate_text(self.iupac_name, MAX_STRUCTURE_CHARACTERS)}")
 
         lines.append(f"Formula: {tidy(self.formula)}")
 
@@ -182,11 +187,14 @@ class Compound:
             lines.append(f"Molecular weight: {self.weight:.2f}")
 
         if self.smiles:
-            lines.append(f"SMILES: {self.smiles}")
+            lines.append(f"SMILES: {truncate_text(self.smiles, MAX_STRUCTURE_CHARACTERS)}")
 
         # Only worth the line when it differs, which is when the compound has stereochemistry
         if self.connectivity_smiles and self.connectivity_smiles != self.smiles:
-            lines.append(f"SMILES without stereochemistry: {self.connectivity_smiles}")
+            lines.append(
+                "SMILES without stereochemistry: "
+                f"{truncate_text(self.connectivity_smiles, MAX_STRUCTURE_CHARACTERS)}"
+            )
 
         if self.inchikey:
             lines.append(f"InChIKey: {self.inchikey}")
@@ -288,7 +296,7 @@ class Drug:
             lines.append(f"Routes: {', '.join(self.routes)}")
 
         if self.smiles:
-            lines.append(f"SMILES: {self.smiles}")
+            lines.append(f"SMILES: {truncate_text(self.smiles, MAX_STRUCTURE_CHARACTERS)}")
 
         if self.inchikey:
             lines.append(f"InChIKey: {self.inchikey}")
@@ -311,12 +319,16 @@ class Drug:
             lines.append(f"\n{', '.join(descriptors)}")
 
         if self.mechanisms:
+            shown = self.mechanisms[:MAX_MECHANISMS_REPORTED]
             lines.append("\nMechanism(s) of action:")
             lines.extend(
                 f"  {action.lower() if action else 'acts on'} {description}"
                 f"{f' ({target})' if target else ''}"
-                for action, description, target in self.mechanisms
+                for action, description, target in shown
             )
+
+            if len(self.mechanisms) > len(shown):
+                lines.append(f"  ... and {len(self.mechanisms) - len(shown)} more")
 
         lines.append(f"\n{self.url}")
 
@@ -396,14 +408,14 @@ class Activity:
 
     def summary(self) -> str:
         """Renders the measurement as one line."""
+        # The units joined to the number rather than appended after it: ChEMBL leaves them off a
+        # ratio or a percentage, and the spare separator reads as a dropped field
         amount = "?" if self.value is None else f"{self.value:g}"
+        measured = f"{amount} {self.units}" if self.units else amount
         strength = f", pChEMBL {self.pchembl:.1f}" if self.pchembl is not None else ""
         when = f", {self.year}" if self.year else ""
 
-        return (
-            f"  {tidy(self.measurement)} {self.relation} {amount} {self.units}"
-            f"{strength}{when}"
-        )
+        return f"  {tidy(self.measurement)} {self.relation} {measured}{strength}{when}"
 
 
 @dataclass(frozen=True)
@@ -467,7 +479,14 @@ class ActivityResults:
             if self.grouped_by == "target":
                 name = activity.target_name or activity.target_chembl_id or "unnamed target"
                 organism = f" [{activity.organism}]" if activity.organism else ""
-                heading = f"{name} ({activity.target_chembl_id}){organism}"
+                # Not repeated when the name is already the identifier, which is what an
+                # unnamed target falls back to and would render as "CHEMBL203 (CHEMBL203)"
+                identifier = (
+                    f" ({activity.target_chembl_id})"
+                    if activity.target_chembl_id and activity.target_chembl_id != name
+                    else ""
+                )
+                heading = f"{name}{identifier}{organism}"
             else:
                 heading = activity.molecule_chembl_id or "unnamed molecule"
 
@@ -518,15 +537,18 @@ def compound_from(properties: dict[str, Any], description: str = "", title: str 
     :param title: The name PubChem shows for it.
     :return: The compound.
     """
+    # "or" rather than a default, throughout: a key PubChem sends as JSON null is present, so a
+    # default never applies and str() would write the word "None" into a report as though it were
+    # the compound's formula. A null CID would raise TypeError here instead.
     return Compound(
-        cid=int(properties.get("CID", 0)),
+        cid=int(properties.get("CID") or 0),
         title=title,
-        formula=str(properties.get("MolecularFormula", "")),
+        formula=str(properties.get("MolecularFormula") or ""),
         weight=number_or_none(properties.get("MolecularWeight")),
-        smiles=str(properties.get("SMILES", "")),
-        connectivity_smiles=str(properties.get("ConnectivitySMILES", "")),
-        inchikey=str(properties.get("InChIKey", "")),
-        iupac_name=str(properties.get("IUPACName", "")),
+        smiles=str(properties.get("SMILES") or ""),
+        connectivity_smiles=str(properties.get("ConnectivitySMILES") or ""),
+        inchikey=str(properties.get("InChIKey") or ""),
+        iupac_name=str(properties.get("IUPACName") or ""),
         description=description,
         properties={key: properties[key] for key in COMPOUND_PROPERTIES if key in properties},
     )
@@ -576,6 +598,11 @@ def get_compound(identifier: str, namespace: str = "name") -> Compound:
             f'Unknown namespace "{namespace}". Use one of: {", ".join(COMPOUND_NAMESPACES)}.'
         )
 
+    # Checked here rather than left to encode_segment, which only sees the namespaces whose value
+    # goes in the path. A blank SMILES would otherwise be sent as a parameter and asked about.
+    if not identifier.strip():
+        raise ValueError(f"Give a {namespace} to look up")
+
     wanted = ",".join(COMPOUND_PROPERTIES)
 
     if namespace in QUERY_NAMESPACES:
@@ -604,7 +631,7 @@ def get_compound(identifier: str, namespace: str = "name") -> Compound:
         raise RecordNotFoundError(f'PubChem returned no properties for {namespace} "{identifier}".')
 
     row = rows[0]
-    cid = int(row.get("CID", 0))
+    cid = int(row.get("CID") or 0)
 
     # PubChem answers a structure it has never seen with 200 and CID 0 rather than an error, so
     # the only sign that nothing was found is the identifier itself
@@ -629,7 +656,7 @@ def molecule_from(record: dict[str, Any], mechanisms: tuple[tuple[str, str, str]
     )
 
     return Drug(
-        chembl_id=str(record.get("molecule_chembl_id", "")),
+        chembl_id=str(record.get("molecule_chembl_id") or ""),
         name=str(record.get("pref_name") or ""),
         max_phase=number_or_none(record.get("max_phase")),
         molecule_type=str(record.get("molecule_type") or ""),
@@ -644,7 +671,12 @@ def molecule_from(record: dict[str, Any], mechanisms: tuple[tuple[str, str, str]
 
 
 def mechanisms_of(chembl_id: str) -> tuple[tuple[str, str, str], ...]:
-    """Fetches how a molecule acts, which is a separate endpoint from the molecule itself."""
+    """Fetches how a molecule acts, which is a separate endpoint from the molecule itself.
+
+    :param chembl_id: The molecule to ask about.
+    :raises WebRequestError: If the endpoint could not be reached.
+    :return: Each mechanism as action, description, and target; empty if none are recorded.
+    """
     try:
         response = request_json(
             f"{CHEMBL_BASE}/mechanism",
@@ -654,8 +686,15 @@ def mechanisms_of(chembl_id: str) -> tuple[tuple[str, str, str], ...]:
                 "only": "action_type,mechanism_of_action,target_chembl_id",
             },
         )
-    except WebRequestError:
-        return ()
+    except WebRequestError as error:
+        # Only a refusal is an answer. Most molecules have no recorded mechanism, so an empty
+        # result is ordinary and not worth failing a lookup over; returning that same empty
+        # result when the endpoint could not be reached tells an agent that a drug whose
+        # mechanism is well known acts on nothing, which it will not go back and check.
+        if error.status_code in NOT_FOUND_STATUSES:
+            return ()
+
+        raise
 
     return tuple(
         (
@@ -716,7 +755,7 @@ def search_drugs(query: str, limit: int = 10) -> SearchHits:
     records = (response or {}).get("molecules") or []
     hits = tuple(
         DrugHit(
-            chembl_id=str(record.get("molecule_chembl_id", "")),
+            chembl_id=str(record.get("molecule_chembl_id") or ""),
             name=str(record.get("pref_name") or ""),
             max_phase=number_or_none(record.get("max_phase")),
             molecule_type=str(record.get("molecule_type") or ""),
@@ -773,7 +812,7 @@ def search_targets(
     records = (response or {}).get("targets") or []
     hits = tuple(
         Target(
-            chembl_id=str(record.get("target_chembl_id", "")),
+            chembl_id=str(record.get("target_chembl_id") or ""),
             name=str(record.get("pref_name") or ""),
             target_type=str(record.get("target_type") or ""),
             organism=str(record.get("organism") or ""),
@@ -792,7 +831,7 @@ def search_targets(
 def activity_from(record: dict[str, Any]) -> Activity:
     """Builds a measurement from a ChEMBL activity record."""
     return Activity(
-        molecule_chembl_id=str(record.get("molecule_chembl_id", "")),
+        molecule_chembl_id=str(record.get("molecule_chembl_id") or ""),
         target_chembl_id=str(record.get("target_chembl_id") or ""),
         target_name=str(record.get("target_pref_name") or ""),
         organism=str(record.get("target_organism") or ""),
@@ -833,6 +872,12 @@ def get_activities(
     :raises WebRequestError: If ChEMBL could not be reached.
     :return: The measurements, most potent first.
     """
+    # Stripped before the check, not after it. An identifier of one space is not falsy, so it
+    # would pass the check and then be sent as the empty string, which ChEMBL treats as no filter
+    # at all and answers with the most potent measurements in the database.
+    target_chembl_id = target_chembl_id.strip().upper()
+    molecule_chembl_id = molecule_chembl_id.strip().upper()
+
     if not target_chembl_id and not molecule_chembl_id:
         raise ValueError("Give either a target_chembl_id or a molecule_chembl_id")
 
@@ -848,10 +893,10 @@ def get_activities(
     }
 
     if target_chembl_id:
-        params["target_chembl_id"] = target_chembl_id.strip().upper()
+        params["target_chembl_id"] = target_chembl_id
 
     if molecule_chembl_id:
-        params["molecule_chembl_id"] = molecule_chembl_id.strip().upper()
+        params["molecule_chembl_id"] = molecule_chembl_id
 
     if activity_type:
         params["standard_type"] = activity_type.strip()
