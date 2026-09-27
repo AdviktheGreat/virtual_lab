@@ -21,13 +21,12 @@ from virtual_lab.constants import (
     MAX_SEARCH_RESULTS,
     MAX_SEQUENCE_RESIDUES_REPORTED,
 )
+from virtual_lab.records import DatabaseError, RecordNotFoundError
 from virtual_lab.databases import (
     Chain,
-    DatabaseError,
     PredictedStructure,
     Protein,
     Structure,
-    RecordNotFoundError,
     bounded,
     download_structure,
     get_chain,
@@ -405,7 +404,7 @@ class TestWhatTheReviewFound:
         assert len(report) < 3_000
 
     def test_a_long_annotation_says_how_much_it_left_out(self) -> None:
-        assert "400 of 1,400 characters not shown" in truncate_text("x" * 1_400, limit=1_000)
+        assert "400 of 1,400 characters not shown" in truncate_text("x" * 1_400, 1_000)
 
     def test_the_annotations_shown_are_capped_by_count(self) -> None:
         # A curated entry carries many comments of one type rather than one of each, and there

@@ -5,11 +5,9 @@ from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile, UnsafeFilenameError, save_artifacts
 from virtual_lab.databases import (
     Chain,
-    DatabaseError,
     DownloadedFile,
     PredictedStructure,
     Protein,
-    RecordNotFoundError,
     SearchResults,
     Structure,
     download_structure,
@@ -27,6 +25,7 @@ from virtual_lab.execution import (
     UnsupportedLanguageError,
     run_files,
 )
+from virtual_lab.records import DatabaseError, RecordNotFoundError
 from virtual_lab.repair import (
     RepairAttempt,
     RepairOutcome,
