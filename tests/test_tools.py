@@ -6,9 +6,18 @@ import openai
 import pytest
 
 from virtual_lab.agent import Agent
-from virtual_lab.constants import MAX_TOOL_ITERATIONS
+from virtual_lab.constants import MAX_TOOL_ITERATIONS, STRUCTURE_DIR_NAME
 from virtual_lab.run_meeting import run_meeting
-from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
+from virtual_lab.tools import (
+    DATABASE_TOOLS,
+    PUBMED_TOOL,
+    TOOL_REGISTRY,
+    Tool,
+    all_tools,
+    run_tool_calls,
+    structure_file_tool,
+    tools_for,
+)
 
 from conftest import FakeClient, text_response, tool_call_response
 
@@ -270,3 +279,114 @@ class TestToolRegistration:
                 tools=(lookup_tool, lookup_tool),
                 num_rounds=0,
             )
+
+
+class TestTheSuppliedTools:
+    """The database tools, as a model sees them."""
+
+    def test_every_registered_tool_has_a_valid_definition(self) -> None:
+        for tool in DATABASE_TOOLS:
+            definition = tool.definition
+
+            assert definition["type"] == "function"
+            assert definition["function"]["name"] == tool.name
+            assert definition["function"]["parameters"]["type"] == "object"
+            assert definition["function"]["description"]
+
+    def test_names_are_unique(self) -> None:
+        names = [tool.name for tool in DATABASE_TOOLS]
+
+        assert len(names) == len(set(names))
+
+    def test_the_registry_holds_every_tool(self) -> None:
+        assert set(TOOL_REGISTRY) == {tool.name for tool in DATABASE_TOOLS}
+
+    def test_tools_can_be_looked_up_in_the_order_asked_for(self) -> None:
+        selected = tools_for("pdb_lookup", "uniprot_lookup")
+
+        assert [tool.name for tool in selected] == ["pdb_lookup", "uniprot_lookup"]
+
+    def test_an_unknown_name_lists_what_is_available(self) -> None:
+        with pytest.raises(KeyError, match="uniprot_lookup"):
+            tools_for("protein_lookup")
+
+    def test_every_required_parameter_is_described(self) -> None:
+        # A required parameter with no description is one a model has to guess at
+        for tool in DATABASE_TOOLS:
+            properties = tool.parameters["properties"]
+
+            for name in tool.parameters.get("required", []):
+                assert properties[name].get("description"), f"{tool.name}.{name}"
+
+    def test_no_tool_requires_an_argument_it_did_not_declare(self) -> None:
+        for tool in DATABASE_TOOLS:
+            declared = set(tool.parameters["properties"])
+
+            assert set(tool.parameters.get("required", [])) <= declared, tool.name
+
+    def test_a_declared_parameter_is_one_the_function_accepts(self) -> None:
+        # A schema and a signature that disagree produce a TypeError only once a model calls it
+        from inspect import signature
+
+        for tool in DATABASE_TOOLS:
+            accepted = set(signature(tool.function).parameters)
+
+            assert set(tool.parameters["properties"]) <= accepted, tool.name
+
+
+class TestTheStructureDownloadTool:
+    def test_the_save_directory_is_not_something_a_model_chooses(self, tmp_path) -> None:
+        # Where files land is the lab's decision. Exposed in the schema, it would be an argument a
+        # model fills in, and the filename checks would be the only thing standing in the way.
+        tool = structure_file_tool(tmp_path)
+
+        assert "save_dir" not in tool.parameters["properties"]
+        assert "save_dir" not in json.dumps(tool.definition)
+
+    def test_the_bound_directory_is_the_one_written_to(self, web_transport, tmp_path) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(body=b"data_4HHB")]
+        tool = structure_file_tool(tmp_path / "somewhere")
+
+        output = tool.function(identifier="4HHB")
+
+        assert str(tmp_path / "somewhere") in output
+        assert (tmp_path / "somewhere" / "4HHB.cif").exists()
+
+    def test_it_is_left_out_when_there_is_nowhere_to_write(self) -> None:
+        # Rather than defaulting to the working directory, which is not a library's to write into
+        assert "fetch_structure_file" not in {tool.name for tool in all_tools()}
+
+    def test_it_is_included_when_a_directory_is_given(self, tmp_path) -> None:
+        names = {tool.name for tool in all_tools(save_dir=tmp_path)}
+
+        assert "fetch_structure_file" in names
+        assert names > {tool.name for tool in all_tools()}
+
+    def test_files_go_in_their_own_subdirectory(self, web_transport, tmp_path) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(body=b"data")]
+        tool = [t for t in all_tools(save_dir=tmp_path) if t.name == "fetch_structure_file"][0]
+
+        tool.function(identifier="4HHB")
+
+        assert (tmp_path / STRUCTURE_DIR_NAME / "4HHB.cif").exists()
+
+    def test_a_failed_download_reports_back_instead_of_ending_the_meeting(
+        self, web_transport, tmp_path
+    ) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [FakeResponse(status_code=404)]
+        tool = structure_file_tool(tmp_path)
+
+        class Call:
+            id = "call_1"
+            function = type("F", (), {"name": "fetch_structure_file", "arguments": '{"identifier": "ZZZZ"}'})()
+
+        outputs, messages = run_tool_calls([Call()], (tool,))
+
+        assert "Error running tool" in outputs[0]
+        assert messages[0]["role"] == "tool"

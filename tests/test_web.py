@@ -14,7 +14,7 @@ import urllib.parse
 
 import pytest
 import requests
-from requests.structures import CaseInsensitiveDict
+from conftest import FakeResponse
 
 import virtual_lab.web as web
 from virtual_lab.constants import MIN_SECONDS_BETWEEN_REQUESTS
@@ -47,46 +47,6 @@ UNIPROT = "https://rest.uniprot.org/uniprotkb/P01308.json"
 RCSB = "https://search.rcsb.org/rcsbsearch/v2/query"
 
 
-class FakeResponse:
-    """Stands in for a streaming requests.Response."""
-
-    def __init__(
-        self,
-        status_code: int = 200,
-        body: bytes = b"{}",
-        headers: dict[str, str] | None = None,
-        url: str = UNIPROT,
-    ) -> None:
-        self.status_code = status_code
-        self.body = body
-        # Case-insensitive, as real requests is. A plain dict would let production code read a
-        # header under the wrong case and still pass here.
-        self.headers = CaseInsensitiveDict(headers or {})
-        self.url = url
-
-    @property
-    def ok(self) -> bool:
-        return self.status_code < 400
-
-    @property
-    def is_redirect(self) -> bool:
-        return self.status_code in {301, 302, 303, 307, 308} and "Location" in self.headers
-
-    @property
-    def is_permanent_redirect(self) -> bool:
-        return self.status_code in {301, 308} and "Location" in self.headers
-
-    def iter_content(self, chunk_size: int = 8192):
-        for start in range(0, len(self.body), chunk_size):
-            yield self.body[start : start + chunk_size]
-
-    def __enter__(self) -> "FakeResponse":
-        return self
-
-    def __exit__(self, *args: object) -> None:
-        return None
-
-
 @pytest.fixture(autouse=True)
 def fast_and_isolated(monkeypatch: pytest.MonkeyPatch):
     """Clears the cache between tests and removes the deliberate delays."""
@@ -100,30 +60,9 @@ def fast_and_isolated(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def transport(monkeypatch: pytest.MonkeyPatch):
-    """Replaces the HTTP layer, recording requests and replaying queued responses."""
-
-    class Transport:
-        def __init__(self) -> None:
-            self.responses: list[FakeResponse] = []
-            self.requests: list[dict] = []
-
-        def get(self, url, **kwargs):
-            self.requests.append({"url": url, **kwargs})
-
-            if not self.responses:
-                return FakeResponse(url=url)
-
-            return self.responses.pop(0)
-
-        @property
-        def urls(self) -> list[str]:
-            return [request["url"] for request in self.requests]
-
-    fake = Transport()
-    monkeypatch.setattr(web.requests, "get", fake.get)
-
-    return fake
+def transport(web_transport):
+    """The shared fake transport, under the name these tests use for it."""
+    return web_transport
 
 
 class TestAllowedDestinations:

@@ -135,3 +135,49 @@ data = request_json("https://rest.uniprot.org/uniprotkb/P01308.json")
 Adding a database means adding its host to `ALLOWED_HOSTS`. This is a deliberate edit rather than a parameter, so that widening what agents can reach is a visible change to the library.
 
 The tests for this layer run offline against a faked transport, since redirects, rate limits, and oversized responses cannot be requested from a real service on demand. The handful that do query the real databases are skipped unless `VIRTUAL_LAB_LIVE_TESTS=1` is set.
+
+## Giving agents tools
+
+`all_tools` returns everything an agent can call. Pass a `save_dir` to include the structure download, which needs somewhere to write.
+
+```python
+from virtual_lab import all_tools, run_meeting
+
+run_meeting(
+    meeting_type="team",
+    agenda="Choose a target epitope for a nanobody against the spike protein.",
+    save_dir=Path("results"),
+    team_lead=principal_investigator,
+    team_members=(immunologist, computational_biologist),
+    tools=all_tools(save_dir=Path("results")),
+)
+```
+
+| Tool | What an agent uses it for |
+| --- | --- |
+| `uniprot_search` | Find proteins by name, gene, or organism and get their accessions |
+| `uniprot_lookup` | A protein's sequence, function, domains, disulfide bonds, and known structures |
+| `pdb_lookup` | An experimental structure's method, resolution, chains, ligands, and chain sequences |
+| `alphafold_lookup` | A predicted structure and its pLDDT confidence, where no experimental one exists |
+| `fetch_structure_file` | Download coordinates to disk for code to parse |
+| `pubmed_search` | Abstracts or full text from PubMed Central |
+
+Use `tools_for("uniprot_lookup", "pdb_lookup")` to give a particular agent only part of the set, and `TOOL_REGISTRY` to see what is available. Each underlying function can also be called directly, which is what tests and analysis scripts do:
+
+```python
+from virtual_lab import get_protein
+
+protein = get_protein("P01308")
+print(protein.length, protein.pdb_ids[:3])
+print(protein.report())
+```
+
+Three things about this are deliberate:
+
+**A record and its report are different things.** `get_protein` returns every field worth keeping, while `report()` returns what is worth paying for in a request. A sequence of 35,000 residues is on the record and not in the report, because it would be most of a context window spent on one field.
+
+**Queries are built from named arguments, not written by a model.** A model asked to compose a query payload writes a plausible one whose mistakes come back as an empty result rather than as an error, which is the hardest kind to notice. The cost is a function signature per database, which is also what makes these testable.
+
+**Coordinates go to disk, not into the conversation.** One moderate structure file is several hundred kilobytes, and code an agent writes runs in a sandbox with no network of its own. So `fetch_structure_file` fetches outside the sandbox and leaves the file in the directory mounted into it, reporting the name back. Where it writes is bound when the tool is built and is not a parameter a model fills in.
+
+A note on `uniprot_search`: `reviewed_only` is off by default. Curation covers a small fraction of UniProt, and for some classes of sequence it covers none of it, so a search for a nanobody with it on returns proteins whose reference titles mention one while filtering out every real camelid VHH.

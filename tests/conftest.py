@@ -1,10 +1,12 @@
-"""Shared fixtures for building fake OpenAI responses without hitting the API."""
+"""Shared fixtures for building fake OpenAI and HTTP responses without hitting either."""
 
 import json
+import time
 from importlib import import_module
 from typing import Any
 
 import pytest
+from requests.structures import CaseInsensitiveDict
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
@@ -198,6 +200,106 @@ def fake_client(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
     monkeypatch.setattr(import_module("virtual_lab.run_meeting"), "OpenAI", build_client)
 
     return client
+
+
+class FakeResponse:
+    """Stands in for a streaming requests.Response."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        body: bytes = b"{}",
+        headers: dict[str, str] | None = None,
+        url: str = "https://rest.uniprot.org/test",
+        json_body: Any = None,
+    ) -> None:
+        self.status_code = status_code
+        self.body = json.dumps(json_body).encode() if json_body is not None else body
+        # Case-insensitive, as real requests is. A plain dict would let production code read a
+        # header under the wrong case and still pass here.
+        self.headers = CaseInsensitiveDict(headers or {})
+        self.url = url
+
+    @property
+    def ok(self) -> bool:
+        return self.status_code < 400
+
+    @property
+    def is_redirect(self) -> bool:
+        return self.status_code in {301, 302, 303, 307, 308} and "Location" in self.headers
+
+    @property
+    def is_permanent_redirect(self) -> bool:
+        return self.status_code in {301, 308} and "Location" in self.headers
+
+    def iter_content(self, chunk_size: int = 8192):
+        for start in range(0, len(self.body), chunk_size):
+            yield self.body[start : start + chunk_size]
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+class FakeTransport:
+    """Records outbound requests and replays queued responses."""
+
+    def __init__(self) -> None:
+        self.responses: list[FakeResponse] = []
+        self.post_responses: list[FakeResponse] = []
+        self.requests: list[dict[str, Any]] = []
+        self.post_requests: list[dict[str, Any]] = []
+
+    def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.requests.append({"url": url, **kwargs})
+
+        if not self.responses:
+            return FakeResponse(url=url)
+
+        return self.responses.pop(0)
+
+    def post(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.post_requests.append({"url": url, **kwargs})
+
+        if not self.post_responses:
+            return FakeResponse(url=url)
+
+        return self.post_responses.pop(0)
+
+    def queue(self, *bodies: Any) -> None:
+        """Queues JSON bodies to be returned in order."""
+        self.responses.extend(FakeResponse(json_body=body) for body in bodies)
+
+    @property
+    def urls(self) -> list[str]:
+        return [request["url"] for request in self.requests]
+
+    @property
+    def params(self) -> list[Any]:
+        return [request.get("params") for request in self.requests]
+
+
+@pytest.fixture
+def web_transport(monkeypatch: pytest.MonkeyPatch) -> FakeTransport:
+    """Replaces the HTTP layer, and removes the cache and the deliberate delays with it.
+
+    Anything reaching the real network from a test would make the suite slow, flaky, and
+    dependent on someone else's uptime, so this is how every test that touches a database runs.
+    """
+    web = import_module("virtual_lab.web")
+    transport = FakeTransport()
+
+    monkeypatch.setattr(web.requests, "get", transport.get)
+    monkeypatch.setattr(web.requests, "post", transport.post)
+    monkeypatch.setattr(web.RATE_LIMITER, "min_interval", 0.0)
+    monkeypatch.setattr(web.time, "sleep", lambda seconds: None)
+    web.RESPONSE_CACHE.clear()
+
+    yield transport
+
+    web.RESPONSE_CACHE.clear()
 
 
 @pytest.fixture
