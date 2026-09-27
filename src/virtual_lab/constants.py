@@ -199,6 +199,23 @@ MAX_COMMENT_CHARACTERS = 600
 # tens of megabytes.
 MAX_STRUCTURE_FILE_BYTES = 30_000_000
 
+# Free text to show for a compound. PubChem's description of a well known drug runs to several
+# paragraphs, the same unbounded field problem a protein's comments were.
+MAX_DESCRIPTION_CHARACTERS = 600
+
+# Characters of an assay's description to show beside a measurement. Enough to tell a cell assay
+# from a biochemical one, which is what decides whether two numbers can be compared.
+MAX_ASSAY_DESCRIPTION_CHARACTERS = 200
+
+# Measurements to report for one bioactivity question. ChEMBL holds roughly 19,000 IC50 values
+# against a single well studied kinase, and the most potent handful is what answers the question.
+MAX_ACTIVITIES_REPORTED = 15
+
+# Smallest pChEMBL value worth reporting, on a scale where 6 is a micromolar affinity and 9 is
+# nanomolar. Below this a compound is not usefully a binder, and the rows are mostly the inactive
+# arm of a screen.
+MIN_PCHEMBL_REPORTED = 4.0
+
 # Subdirectory that downloaded structure files are written to. Code an agent writes runs with no
 # network, so anything it needs to read has to be fetched for it and left somewhere it can reach.
 STRUCTURE_DIR_NAME = "structures"

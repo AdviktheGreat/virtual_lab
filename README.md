@@ -162,6 +162,11 @@ run_meeting(
 | `pdb_lookup` | An experimental structure's method, resolution, chains, ligands, and chain sequences |
 | `alphafold_lookup` | A predicted structure and its pLDDT confidence, where no experimental one exists |
 | `fetch_structure_file` | Download coordinates to disk for code to parse |
+| `pubchem_lookup` | A small molecule's formula, weight, SMILES, and computed descriptors |
+| `chembl_search` | Find drugs and compounds by name and get their ChEMBL identifiers |
+| `chembl_lookup` | A drug's clinical status, route, mechanism of action, and drug-likeness |
+| `chembl_target_search` | Find a protein target and get the identifier bioactivity is keyed by |
+| `chembl_activities` | What binds a target, how tightly, and in what assay |
 | `pubmed_search` | Abstracts or full text from PubMed Central |
 
 Use `tools_for("uniprot_lookup", "pdb_lookup")` to give a particular agent only part of the set, and `TOOL_REGISTRY` to see what is available. `fetch_structure_file` is not in the registry, because it cannot exist until it has been told where to write; get it from `all_tools(save_dir=...)` or build one with `structure_file_tool(work_dir)`. Each underlying function can also be called directly, which is what tests and analysis scripts do:
@@ -181,5 +186,19 @@ Three things about this are deliberate:
 **Queries are built from named arguments, not written by a model.** A model asked to compose a query payload writes a plausible one whose mistakes come back as an empty result rather than as an error, which is the hardest kind to notice. The cost is a function signature per database, which is also what makes these testable.
 
 **Coordinates go to disk, not into the conversation.** One moderate structure file is several hundred kilobytes, and code an agent writes runs in a sandbox with no network of its own. So `fetch_structure_file` fetches outside the sandbox and writes into `artifacts/<save_name>/structures`, which is inside the one directory mounted into the container, and reports back the path to use from there. A file written anywhere else is invisible to the code that needs it. Where it writes is bound when the tool is built and is not a parameter a model fills in, which is why `all_tools` takes the same `save_dir` and `save_name` that `run_meeting` does.
+
+### What these services will tell you that is not true
+
+Each lookup refuses a particular confident wrong answer, because every one of these arrives as a successful response rather than as an error:
+
+- **PubChem renamed its properties in 2025.** A request for `CanonicalSMILES` is answered with a key called `ConnectivitySMILES`, so code that reads back the name it asked for raises `KeyError` on a perfectly good response. `SMILES` is now the one carrying stereochemistry.
+- **PubChem accepts a structure it has never seen**, answering 200 with `CID: 0` rather than an error. Only the identifier says nothing was found.
+- **A SMILES cannot go in the URL path.** It carries `/` and `\` for stereochemistry, and percent-encoded into a path segment PubChem answers 400. Since PubChem keeps 400 for a request it could not parse, treating it as "no such compound" would report a real compound as nonexistent whenever a URL was built wrongly, so only 404 means missing here.
+- **ChEMBL sends its numbers as strings**: `max_phase` arrives as `"4.0"` and molecular weight as `"180.16"`.
+- **`max_phase` is -1 for 2,499 molecules** whose clinical status ChEMBL does not know, which sorts below a compound that was never tested.
+- **Some ChEMBL measurements lost their units in standardisation.** The most potent IC50 against EGFR by raw value reads `5.012E-9 nM`, a hundred million times tighter than any real binding; its original value was 17.3 in units the record no longer names. Those rows are exactly the ones with no pChEMBL value, so `chembl_activities` requires one and orders by it.
+- **Searching a gene symbol ranks the wrong thing first.** `EGFR` returns two protein-protein interactions and mouse EGFR above human EGFR, and restricting the organism alone does not fix it, which is why `single_proteins_only` defaults to on.
+
+**PubChem needs a particular TLS handshake.** Its edge answers this library's ordinary handshake with 503 and a "server too busy" body, while reporting the service as healthy to `curl` from the same address in the same second. `web.HOST_CIPHERS` offers it a cipher list it accepts. The connection is still TLS 1.3 with certificate verification on; only the list offered in the handshake differs. No other service needs this.
 
 A note on `uniprot_search`: `reviewed_only` is off by default. Curation covers a small fraction of UniProt, and for some classes of sequence it covers none of it, so a search for a nanobody with it on returns proteins whose reference titles mention one while filtering out every real camelid VHH.

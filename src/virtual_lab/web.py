@@ -13,6 +13,7 @@ one document.
 
 import json
 import random
+import ssl
 import threading
 import time
 import urllib.parse
@@ -20,6 +21,7 @@ from collections import OrderedDict
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from virtual_lab.constants import (
     MAX_RESPONSE_BYTES,
@@ -59,6 +61,84 @@ ALLOWED_HOSTS = frozenset(
 # Statuses worth trying again. A rate limit and a gateway error are both temporary; a 404 means
 # the identifier was wrong and asking again will not change that.
 RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+
+# Hosts that refuse this client's ordinary TLS handshake, and the cipher list each will accept.
+#
+# PubChem's edge answers a handshake carrying Python's default cipher list with 503 and a body
+# reading "server too busy", but without the X-Throttling-Control header that a genuine refusal
+# carries, and while reporting the service as healthy to curl from the same address in the same
+# second. Every header combination gets the same 503, HTTP/1.1 and HTTP/2 alike; offering these
+# ciphers instead gets 200. No other allowed host is affected, including NCBI's own eutils.
+#
+# This does not weaken the connection. The list is a strict subset of what Python would have
+# offered anyway, the negotiated result is still TLS 1.3 with AES-256-GCM, certificate
+# verification and hostname checking are untouched, and an expired certificate is still rejected.
+# Only the set offered in the handshake differs. Appending DHE+AESGCM also works and was the
+# first thing that did, but it enables two DSS suites the default context deliberately excludes.
+HOST_CIPHERS = {
+    "pubchem.ncbi.nlm.nih.gov": "ECDHE+AESGCM:ECDHE+CHACHA20",
+}
+
+
+class CipherAdapter(HTTPAdapter):
+    """Makes connections offering a particular cipher list."""
+
+    def __init__(self, ciphers: str, **kwargs: Any) -> None:
+        self.ciphers = ciphers
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> Any:
+        """Builds the pool manager with a context offering this adapter's ciphers."""
+        # Built from the default context rather than a bare one, so that verification and
+        # hostname checking are on for the same reason they are on everywhere else
+        context = ssl.create_default_context()
+        context.set_ciphers(self.ciphers)
+        kwargs["ssl_context"] = context
+
+        return super().init_poolmanager(*args, **kwargs)
+
+
+# Kept between requests so the connection pool is reused, the same as requests.get does not
+SESSIONS: dict[str, requests.Session] = {}
+SESSIONS_LOCK = threading.Lock()
+
+
+def session_for(host: str) -> requests.Session | None:
+    """Returns the session to use for a host, or None if the ordinary client will do.
+
+    :param host: The hostname being requested.
+    :return: A session configured for that host, or None.
+    """
+    ciphers = HOST_CIPHERS.get(host.lower())
+
+    if ciphers is None:
+        return None
+
+    with SESSIONS_LOCK:
+        if host.lower() not in SESSIONS:
+            session = requests.Session()
+            session.mount("https://", CipherAdapter(ciphers))
+            SESSIONS[host.lower()] = session
+
+        return SESSIONS[host.lower()]
+
+
+def http_get(url: str, **kwargs: Any) -> requests.Response:
+    """Makes one GET request, through a host's own session where it needs one.
+
+    The single place a request leaves this library, so that a host needing particular treatment
+    is handled in one line rather than at every call site.
+
+    :param url: The URL to fetch, already checked.
+    :param kwargs: Passed through to requests.
+    :return: The response.
+    """
+    session = session_for(urllib.parse.urlsplit(url).hostname or "")
+
+    if session is None:
+        return requests.get(url, **kwargs)
+
+    return session.get(url, **kwargs)
 
 
 class WebRequestError(Exception):
@@ -514,7 +594,7 @@ def follow(
         current = check_host(current)
         RATE_LIMITER.wait(urllib.parse.urlsplit(current).hostname or "")
 
-        with requests.get(
+        with http_get(
             current,
             params=query,
             headers=headers,

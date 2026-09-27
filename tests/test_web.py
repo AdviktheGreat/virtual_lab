@@ -472,7 +472,7 @@ class TestRetries:
 
             return FakeResponse(body=b'{"ok": true}')
 
-        monkeypatch.setattr(web.requests, "get", flaky)
+        monkeypatch.setattr(web, "http_get", flaky)
 
         assert request_json(UNIPROT) == {"ok": True}
         assert attempts["count"] == 3
@@ -819,6 +819,102 @@ class TestPostedQueries:
 
         assert web.post_json(RCSB, payload={"q": "a"}) == {"n": 1}
         assert web.post_json(RCSB, payload={"q": "b"}) == {"n": 2}
+
+
+class TestHostsNeedingTheirOwnHandshake:
+    """PubChem refuses this client's ordinary TLS handshake, so it gets a configured session.
+
+    Worth testing offline because nothing else here would notice its loss: deleting the entry
+    leaves every other test passing and PubChem returning 503 to every request in production.
+    """
+
+    def test_pubchem_gets_a_session_of_its_own(self) -> None:
+        assert "pubchem.ncbi.nlm.nih.gov" in web.HOST_CIPHERS
+        assert web.session_for("pubchem.ncbi.nlm.nih.gov") is not None
+
+    def test_a_host_that_needs_nothing_uses_the_ordinary_client(self) -> None:
+        assert web.session_for("rest.uniprot.org") is None
+        assert web.session_for("data.rcsb.org") is None
+
+    def test_the_host_is_matched_whatever_its_case(self) -> None:
+        assert web.session_for("PubChem.NCBI.NLM.NIH.gov") is not None
+
+    def test_the_session_is_reused_rather_than_rebuilt(self) -> None:
+        # A new session per request would discard the connection pool
+        assert web.session_for("pubchem.ncbi.nlm.nih.gov") is web.session_for(
+            "pubchem.ncbi.nlm.nih.gov"
+        )
+
+    def test_the_session_offers_the_ciphers_that_host_accepts(self) -> None:
+        session = web.session_for("pubchem.ncbi.nlm.nih.gov")
+        adapter = session.get_adapter("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound")
+
+        assert isinstance(adapter, web.CipherAdapter)
+        assert adapter.ciphers == web.HOST_CIPHERS["pubchem.ncbi.nlm.nih.gov"]
+
+    def built_context(self, ciphers: str):
+        """Returns the SSL context an adapter hands to its pool manager."""
+        adapter = web.CipherAdapter(ciphers)
+        adapter.init_poolmanager(1, 1)
+
+        return adapter.poolmanager.connection_pool_kw["ssl_context"]
+
+    def test_the_adapter_applies_its_cipher_list(self) -> None:
+        # Asserted against the context the adapter builds, not one the test builds: the latter
+        # proves only that the standard library works
+        offered = self.built_context(web.HOST_CIPHERS["pubchem.ncbi.nlm.nih.gov"])
+        default = web.ssl.create_default_context()
+
+        chosen = {cipher["name"] for cipher in offered.get_ciphers()}
+        everything = {cipher["name"] for cipher in default.get_ciphers()}
+
+        assert chosen < everything
+        assert any(name.startswith("TLS_AES") for name in chosen)
+
+    def test_certificate_checking_is_not_what_was_changed(self) -> None:
+        # The point of the cipher list is to change the handshake fingerprint, not to weaken it
+        offered = self.built_context(web.HOST_CIPHERS["pubchem.ncbi.nlm.nih.gov"])
+
+        assert offered.verify_mode == web.ssl.CERT_REQUIRED
+        assert offered.check_hostname is True
+        assert offered.minimum_version >= web.ssl.TLSVersion.TLSv1_2
+
+    def test_every_host_given_ciphers_is_one_we_are_allowed_to_talk_to(self) -> None:
+        assert set(web.HOST_CIPHERS) <= set(web.ALLOWED_HOSTS)
+
+    def test_requests_go_through_the_configured_session(self, monkeypatch) -> None:
+        # The routing itself: without it the session exists and is never used
+        seen = {}
+
+        class Recorder:
+            def get(self, url, **kwargs):
+                seen["url"] = url
+                return FakeResponse(json_body={"ok": True})
+
+        monkeypatch.setitem(web.SESSIONS, "pubchem.ncbi.nlm.nih.gov", Recorder())
+
+        web.http_get("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/1/JSON")
+
+        assert seen["url"].startswith("https://pubchem.ncbi.nlm.nih.gov")
+
+    def test_a_host_without_a_session_does_not_go_through_one(self, monkeypatch) -> None:
+        used = {"session": False, "plain": False}
+
+        class Recorder:
+            def get(self, url, **kwargs):
+                used["session"] = True
+                return FakeResponse()
+
+        def plain_get(url, **kwargs):
+            used["plain"] = True
+            return FakeResponse()
+
+        monkeypatch.setitem(web.SESSIONS, "pubchem.ncbi.nlm.nih.gov", Recorder())
+        monkeypatch.setattr(web.requests, "get", plain_get)
+
+        web.http_get("https://rest.uniprot.org/uniprotkb/P01308.json")
+
+        assert used == {"session": False, "plain": True}
 
 
 class TestThePubmedToolUsesThisLayer:
