@@ -228,3 +228,41 @@ MIN_PCHEMBL_REPORTED = 4.0
 # Subdirectory that downloaded structure files are written to. Code an agent writes runs with no
 # network, so anything it needs to read has to be fetched for it and left somewhere it can reach.
 STRUCTURE_DIR_NAME = "structures"
+
+# Characters of an abstract to show. Long enough for a structured abstract with its Background,
+# Methods, Results, and Conclusions headings, which is where most of the length comes from.
+MAX_ABSTRACT_CHARACTERS = 2_500
+
+# Authors to name before saying how many more there are. A consortium genomics paper has several
+# hundred, and the first few are what identifies the work.
+MAX_AUTHORS_REPORTED = 8
+
+# Subject categories to name for a preprint. A paper cross-listed into eight of them is telling
+# you less with each one.
+MAX_CATEGORIES_REPORTED = 5
+
+# Characters of one section of a full text to show, and of the whole article. A research article
+# runs to 36,000 characters of body text, which is most of a context window spent on one paper
+# when the point of fetching it was to decide whether it is worth reading properly.
+MAX_SECTION_CHARACTERS = 4_000
+MAX_ARTICLE_CHARACTERS = 20_000
+
+# Sections of a full text that are not what anyone asked for. References alone are 28% of the
+# body text of a typical article and are a list of other papers' titles, which reads to a model
+# as though this article had discussed all of them.
+SKIPPED_SECTION_TITLES = (
+    "reference",
+    "bibliography",
+    "acknowledg",
+    "funding",
+    "conflict",
+    "competing interest",
+    "author contribution",
+    "author information",
+    "supplementary",
+    "supporting information",
+    "associated data",
+    "data availability",
+    "ethics",
+    "abbreviation",
+)

@@ -36,6 +36,12 @@ from virtual_lab.databases import (
     get_structure,
     search_proteins,
 )
+from virtual_lab.literature import (
+    get_article,
+    get_article_text,
+    search_articles,
+    search_preprints,
+)
 from virtual_lab.utils import run_pubmed_search
 
 
@@ -424,6 +430,174 @@ CHEMBL_ACTIVITIES_TOOL = Tool(
 )
 
 
+def find_articles(
+    query: str,
+    limit: int = 10,
+    sort: str = "relevance",
+    open_access_only: bool = False,
+    include_preprints: bool = True,
+) -> str:
+    """Runs a Europe PMC search and renders the results for a model."""
+    return search_articles(
+        query=query,
+        limit=limit,
+        sort=sort,
+        open_access_only=open_access_only,
+        include_preprints=include_preprints,
+    ).report()
+
+
+def look_up_article(identifier: str) -> str:
+    """Runs a Europe PMC article lookup and renders it for a model."""
+    return get_article(identifier=identifier).report()
+
+
+def read_article(pmcid: str) -> str:
+    """Fetches an open access full text and renders it for a model."""
+    return get_article_text(pmcid=pmcid).report()
+
+
+def find_preprints(
+    query: str,
+    limit: int = 10,
+    category: str = "",
+    sort: str = "relevance",
+) -> str:
+    """Runs an arXiv search and renders the results for a model."""
+    return search_preprints(query=query, limit=limit, category=category, sort=sort).report()
+
+
+EUROPE_PMC_SEARCH_TOOL = Tool(
+    name="europepmc_search",
+    description=(
+        "Search the published biomedical literature through Europe PMC, which covers PubMed, "
+        "PubMed Central, and the biology preprint servers. Returns titles, authors, journals, "
+        "citation counts, and which results have a full text you can then read. Unquoted words "
+        'must all appear, so quote a phrase to require the words together. Sort by "cited" when '
+        'you want what the field is built on and by "recent" when you want what is new; the '
+        "default ranking favours new papers, which have not been cited yet either way. Europe "
+        "PMC does not index arXiv, so use arxiv_search as well for anything computational."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "What to search for.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": f"How many results to return, at most {MAX_SEARCH_RESULTS}.",
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "cited", "recent"],
+                "description": "How to order the results. Defaults to relevance.",
+            },
+            "open_access_only": {
+                "type": "boolean",
+                "description": (
+                    "Only return articles whose full text can then be read with "
+                    "europepmc_fulltext. Defaults to false."
+                ),
+            },
+            "include_preprints": {
+                "type": "boolean",
+                "description": "Whether to include preprints. Defaults to true.",
+            },
+        },
+        "required": ["query"],
+    },
+    function=find_articles,
+)
+
+EUROPE_PMC_LOOKUP_TOOL = Tool(
+    name="europepmc_lookup",
+    description=(
+        "Get one article's abstract and details from Europe PMC by PMID, PMCID, or DOI. Use this "
+        "when you have an identifier and want to know what the paper actually says, rather than "
+        "inferring it from the title in a search result."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "identifier": {
+                "type": "string",
+                "description": (
+                    "A PubMed identifier such as 21937511, a PMCID such as PMC3258128, or a DOI."
+                ),
+            },
+        },
+        "required": ["identifier"],
+    },
+    function=look_up_article,
+)
+
+EUROPE_PMC_FULLTEXT_TOOL = Tool(
+    name="europepmc_fulltext",
+    description=(
+        "Read the full text of an open access article held by Europe PMC. Needs a PMCID, which "
+        "europepmc_search reports for the results that have one. References, funding, and "
+        "author contribution sections are left out, and long sections are cut. Only some "
+        "articles are open access; for the rest the abstract from europepmc_lookup is all there "
+        "is. Ask for this when the abstract is not enough to settle a question, not by default: "
+        "one article's text is a substantial part of what this meeting can hold."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "pmcid": {
+                "type": "string",
+                "description": "A PubMed Central identifier such as PMC3258128.",
+            },
+        },
+        "required": ["pmcid"],
+    },
+    function=read_article,
+)
+
+ARXIV_SEARCH_TOOL = Tool(
+    name="arxiv_search",
+    description=(
+        "Search arXiv for preprints, which is where most machine learning and computational "
+        "method work is published and much of it stays. Europe PMC does not index arXiv, so "
+        "this is the only way to reach it here. Returns titles, authors, abstracts' subject "
+        "categories, and any note saying the work was accepted somewhere. Everything returned "
+        "is a preprint: unless a journal reference says otherwise, it has not been peer "
+        "reviewed. Restrict with a category such as q-bio.BM or cs.LG when a term means "
+        "different things in different fields."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "What to search for. Quote a phrase to require the words together."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": f"How many results to return, at most {MAX_SEARCH_RESULTS}.",
+            },
+            "category": {
+                "type": "string",
+                "description": (
+                    "Restrict to one arXiv category, such as q-bio.BM, q-bio.QM, or cs.LG."
+                ),
+            },
+            "sort": {
+                "type": "string",
+                "enum": ["relevance", "recent", "updated"],
+                "description": "How to order the results. Defaults to relevance.",
+            },
+        },
+        "required": ["query"],
+    },
+    function=find_preprints,
+)
+
+
 def structure_file_tool(work_dir: Path) -> Tool:
     """Builds the structure download tool, bound to a directory.
 
@@ -483,6 +657,10 @@ DATABASE_TOOLS: tuple[Tool, ...] = (
     CHEMBL_SEARCH_TOOL,
     CHEMBL_TARGET_SEARCH_TOOL,
     CHEMBL_ACTIVITIES_TOOL,
+    EUROPE_PMC_SEARCH_TOOL,
+    EUROPE_PMC_LOOKUP_TOOL,
+    EUROPE_PMC_FULLTEXT_TOOL,
+    ARXIV_SEARCH_TOOL,
 )
 
 TOOL_REGISTRY: dict[str, Tool] = {tool.name: tool for tool in DATABASE_TOOLS}
