@@ -42,6 +42,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.tables import describe_table, list_data_files
 from virtual_lab.utils import run_pubmed_search
 
 
@@ -598,6 +599,75 @@ ARXIV_SEARCH_TOOL = Tool(
 )
 
 
+def show_data_files(work_dir: Path) -> str:
+    """Lists the working directory and renders it for a model."""
+    return list_data_files(work_dir).report()
+
+
+def inspect_data_file(work_dir: Path, filename: str, sheet: str | None = None) -> str:
+    """Describes one data file and renders it for a model."""
+    return describe_table(work_dir=work_dir, filename=filename, sheet=sheet).report()
+
+
+def data_file_tools(work_dir: Path) -> tuple[Tool, ...]:
+    """Builds the tools that read the project's own data, bound to a directory.
+
+    Bound rather than parameterised for the same reason the download is: which directory an
+    agent may read is the lab's decision, and a directory a model can name is a directory a
+    model can name /etc in.
+
+    :param work_dir: The directory the sandboxed code will run in, which is the only one these
+        tools can see.
+    :return: The tools.
+    """
+    listing = Tool(
+        name="data_files",
+        description=(
+            "List the data files in the project directory, with their sizes. Use this before "
+            "assuming a file exists or guessing what it is called. It shows the same directory "
+            "the code you write will run in, so the names it gives are the names to open."
+        ),
+        parameters={"type": "object", "properties": {}},
+        function=partial(show_data_files, work_dir),
+    )
+
+    inspection = Tool(
+        name="inspect_data_file",
+        description=(
+            "Look inside a CSV, TSV, or Excel file: how many rows and columns it has, what each "
+            "column holds, how much is missing, and the ways the file will be read wrongly. Use "
+            "this before writing any code that reads a data file, so the code is written "
+            "against the columns that are there rather than the ones you would expect. It "
+            "reports problems that raise nothing and change the answer, such as a column of "
+            "measurements holding one '<0.001', identifiers whose leading zeros a numeric read "
+            "would drop, and gene symbols a spreadsheet has turned into dates."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "The file, as data_files names it. It must be inside the project "
+                        "directory; a path leading out of it is refused."
+                    ),
+                },
+                "sheet": {
+                    "type": "string",
+                    "description": (
+                        "Which sheet of a workbook to read, by name. The first sheet is used "
+                        "when this is left out, and the report names the others."
+                    ),
+                },
+            },
+            "required": ["filename"],
+        },
+        function=partial(inspect_data_file, work_dir),
+    )
+
+    return (listing, inspection)
+
+
 def structure_file_tool(work_dir: Path) -> Tool:
     """Builds the structure download tool, bound to a directory.
 
@@ -692,9 +762,9 @@ def all_tools(save_dir: Path | None = None, save_name: str = "discussion") -> tu
     inside that directory rather than beside it, and takes the same two arguments that decide
     where a meeting's code is written.
 
-    :param save_dir: Where the meeting is being saved. Without it the download tool is left out
-        rather than given a default, since a library should not decide to write into a caller's
-        working directory.
+    :param save_dir: Where the meeting is being saved. Without it the tools that need a
+        directory are left out rather than given a default, since a library should not decide to
+        read or write in a caller's working directory.
     :param save_name: The name the meeting is saved under, which is the artifact subdirectory
         the code runs in.
     :return: The tools.
@@ -704,7 +774,7 @@ def all_tools(save_dir: Path | None = None, save_name: str = "discussion") -> tu
 
     work_dir = save_dir / ARTIFACT_DIR_NAME / save_name
 
-    return DATABASE_TOOLS + (structure_file_tool(work_dir),)
+    return DATABASE_TOOLS + (structure_file_tool(work_dir),) + data_file_tools(work_dir)
 
 
 def run_tool_calls(

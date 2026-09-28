@@ -30,6 +30,7 @@ from virtual_lab.constants import (
 from virtual_lab.records import (
     RecordNotFoundError,
     bounded,
+    parse_xml,
     truncate_text,
 )
 from virtual_lab.web import WebRequestError, build_url, request_json, request_text
@@ -89,28 +90,6 @@ def collapse(text: str) -> str:
     :return: The text with runs of whitespace reduced to single spaces.
     """
     return re.sub(r"\s+", " ", text or "").strip()
-
-
-def parse_xml(body: str) -> ElementTree.Element:
-    """Parses a response as XML, refusing a document that declares entities.
-
-    ElementTree resolves internal entities, and a document declaring a few nested ones expands to
-    whatever size its author chose while the parser holds the result in memory. It is not a
-    theoretical concern: the parser here does expand them, which was checked rather than assumed.
-    Neither service has any reason to send a DOCTYPE, so the declaration is refused outright
-    instead of the expansion being bounded.
-
-    :param body: The response body.
-    :raises WebRequestError: If the body declares a document type, or is not XML.
-    :return: The root element.
-    """
-    if re.search(r"<!DOCTYPE", body[:4096], re.IGNORECASE):
-        raise WebRequestError("Refusing to parse a response that declares a document type")
-
-    try:
-        return ElementTree.fromstring(body)
-    except ElementTree.ParseError as error:
-        raise WebRequestError(f"The response was not usable XML: {error}") from error
 
 
 @dataclass(frozen=True)
@@ -658,7 +637,7 @@ def get_article_text(pmcid: str) -> ArticleText:
         )
 
     url = build_url(f"{EUROPE_PMC_BASE}/{{pmcid}}/fullTextXML", pmcid=article.pmcid)
-    root = parse_xml(request_text(url))
+    root = parse_xml(request_text(url), WebRequestError)
 
     sections: list[tuple[str, str]] = []
     skipped: list[str] = []
@@ -798,7 +777,7 @@ def search_preprints(
             "sortOrder": "descending",
         },
     )
-    root = parse_xml(body)
+    root = parse_xml(body, WebRequestError)
 
     total = collapse(root.findtext("opensearch:totalResults", "", ATOM))
     entries = root.findall("atom:entry", ATOM)[:size]

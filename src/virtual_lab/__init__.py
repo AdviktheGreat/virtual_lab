@@ -60,6 +60,15 @@ from virtual_lab.repair import (
 from virtual_lab.run_meeting import run_meeting
 from virtual_lab.schemas import AgentSpec, ComponentAssignment, ImplementationPlan, TeamRoster
 from virtual_lab.structured import StructuredOutputError
+from virtual_lab.tables import (
+    Column,
+    DataFile,
+    DataFiles,
+    Table,
+    TableError,
+    describe_table,
+    list_data_files,
+)
 from virtual_lab.tools import (
     ALPHAFOLD_LOOKUP_TOOL,
     ARXIV_SEARCH_TOOL,
@@ -79,6 +88,7 @@ from virtual_lab.tools import (
     UNIPROT_SEARCH_TOOL,
     Tool,
     all_tools,
+    data_file_tools,
     structure_file_tool,
     tools_for,
 )
@@ -111,9 +121,12 @@ __all__ = [
     "Chain",
     "CodeArtifacts",
     "CodeFile",
+    "Column",
     "ComponentAssignment",
     "Compound",
     "DATABASE_TOOLS",
+    "DataFile",
+    "DataFiles",
     "DatabaseError",
     "DisallowedHostError",
     "DockerExecutor",
@@ -144,6 +157,8 @@ __all__ = [
     "Structure",
     "StructuredOutputError",
     "TOOL_REGISTRY",
+    "Table",
+    "TableError",
     "Target",
     "TeamRoster",
     "Tool",
@@ -153,6 +168,8 @@ __all__ = [
     "UnsupportedLanguageError",
     "WebRequestError",
     "all_tools",
+    "data_file_tools",
+    "describe_table",
     "download_structure",
     "get_activities",
     "get_article",
@@ -162,6 +179,7 @@ __all__ = [
     "get_predicted_structure",
     "get_protein",
     "get_structure",
+    "list_data_files",
     "request_json",
     "request_text",
     "run_files",
