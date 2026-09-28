@@ -312,6 +312,10 @@ class TestTheSuppliedTools:
             "chembl_search",
             "chembl_target_search",
             "chembl_activities",
+            "europepmc_search",
+            "europepmc_lookup",
+            "europepmc_fulltext",
+            "arxiv_search",
         }
         assert set(TOOL_REGISTRY) == {tool.name for tool in DATABASE_TOOLS}
 

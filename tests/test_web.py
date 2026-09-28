@@ -821,6 +821,47 @@ class TestPostedQueries:
         assert web.post_json(RCSB, payload={"q": "b"}) == {"n": 2}
 
 
+class TestHostsAskingForMoreRoom:
+    """arXiv asks for one request every three seconds, and blocks clients that ignore it.
+
+    Worth testing offline for the same reason the cipher list is: deleting the entry leaves
+    every other test passing, and the only sign in production is being blocked.
+    """
+
+    def test_arxiv_gets_the_gap_it_asks_for(self) -> None:
+        assert web.HOST_MIN_INTERVALS["export.arxiv.org"] == 3.0
+        assert web.RateLimiter().interval_for("export.arxiv.org") >= 3.0
+
+    def test_a_host_that_asks_for_nothing_gets_the_general_limit(self) -> None:
+        limiter = web.RateLimiter()
+
+        assert limiter.interval_for("rest.uniprot.org") == limiter.min_interval
+        assert limiter.interval_for("export.arxiv.org") > limiter.interval_for("rest.uniprot.org")
+
+    def test_the_host_is_matched_whatever_its_case(self) -> None:
+        assert web.RateLimiter().interval_for("Export.ArXiv.org") >= 3.0
+
+    def test_a_host_asking_for_less_does_not_lower_it_for_everyone(self, monkeypatch) -> None:
+        # The larger of the two is taken, so an entry can only ever add room
+        monkeypatch.setitem(web.HOST_MIN_INTERVALS, "rest.uniprot.org", 0.0)
+        limiter = web.RateLimiter(min_interval=0.5)
+
+        assert limiter.interval_for("rest.uniprot.org") == 0.5
+
+    def test_every_host_given_an_interval_is_one_we_are_allowed_to_talk_to(self) -> None:
+        assert set(web.HOST_MIN_INTERVALS) <= set(web.ALLOWED_HOSTS)
+
+    def test_the_wait_actually_uses_it(self, monkeypatch) -> None:
+        slept: list[float] = []
+        monkeypatch.setattr(web.time, "sleep", slept.append)
+        limiter = web.RateLimiter(min_interval=0.0)
+
+        limiter.wait("export.arxiv.org")
+        limiter.wait("export.arxiv.org")
+
+        assert slept and slept[-1] > 2.0
+
+
 class TestHostsNeedingTheirOwnHandshake:
     """PubChem refuses this client's ordinary TLS handshake, so it gets a configured session.
 

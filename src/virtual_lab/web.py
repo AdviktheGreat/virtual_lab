@@ -295,6 +295,14 @@ def build_url(template: str, **segments: str) -> str:
     )
 
 
+# Hosts that ask for more room than the general limit gives them. arXiv's terms of use ask for
+# one request every three seconds, nine times the interval used elsewhere, and the penalty for
+# ignoring it is being blocked rather than being told to slow down.
+HOST_MIN_INTERVALS = {
+    "export.arxiv.org": 3.0,
+}
+
+
 class RateLimiter:
     """Keeps requests to each host to a polite rate.
 
@@ -308,6 +316,17 @@ class RateLimiter:
         self._next_allowed: dict[str, float] = {}
         self._lock = threading.Lock()
 
+    def interval_for(self, host: str) -> float:
+        """Returns the smallest gap allowed between two requests to a host.
+
+        Taken as the larger of the two, so that a host asking for room gets it and a host asking
+        for less than the general limit does not quietly lower it for everyone.
+
+        :param host: The host about to be contacted.
+        :return: Seconds.
+        """
+        return max(HOST_MIN_INTERVALS.get(host.lower(), 0.0), self.min_interval)
+
     def wait(self, host: str) -> None:
         """Sleeps if the last request to this host was too recent.
 
@@ -320,7 +339,7 @@ class RateLimiter:
         with self._lock:
             now = time.monotonic()
             scheduled = max(now, self._next_allowed.get(host, now))
-            self._next_allowed[host] = scheduled + self.min_interval
+            self._next_allowed[host] = scheduled + self.interval_for(host)
 
         delay = scheduled - time.monotonic()
 
