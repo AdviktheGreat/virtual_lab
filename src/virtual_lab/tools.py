@@ -16,7 +16,19 @@ from typing import Any
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
 
-from virtual_lab.constants import ARTIFACT_DIR_NAME, MAX_SEARCH_RESULTS, STRUCTURE_DIR_NAME
+from virtual_lab.chemistry import (
+    get_activities,
+    get_compound,
+    get_drug,
+    search_drugs,
+    search_targets,
+)
+from virtual_lab.constants import (
+    ARTIFACT_DIR_NAME,
+    MAX_ACTIVITIES_REPORTED,
+    MAX_SEARCH_RESULTS,
+    STRUCTURE_DIR_NAME,
+)
 from virtual_lab.databases import (
     download_structure,
     get_predicted_structure,
@@ -224,6 +236,194 @@ ALPHAFOLD_LOOKUP_TOOL = Tool(
 )
 
 
+def look_up_compound(identifier: str, namespace: str = "name") -> str:
+    """Runs a PubChem lookup and renders it for a model."""
+    return get_compound(identifier=identifier, namespace=namespace).report()
+
+
+def look_up_drug(chembl_id: str) -> str:
+    """Runs a ChEMBL molecule lookup and renders it for a model."""
+    return get_drug(chembl_id=chembl_id).report()
+
+
+def find_drugs(query: str, limit: int = 10) -> str:
+    """Runs a ChEMBL molecule search and renders the results for a model."""
+    return search_drugs(query=query, limit=limit).report()
+
+
+def find_targets(
+    query: str,
+    organism: str = "",
+    single_proteins_only: bool = True,
+    limit: int = 10,
+) -> str:
+    """Runs a ChEMBL target search and renders the results for a model."""
+    return search_targets(
+        query=query,
+        organism=organism,
+        single_proteins_only=single_proteins_only,
+        limit=limit,
+    ).report()
+
+
+def find_activities(
+    target_chembl_id: str = "",
+    molecule_chembl_id: str = "",
+    activity_type: str = "",
+    limit: int = MAX_ACTIVITIES_REPORTED,
+) -> str:
+    """Runs a ChEMBL bioactivity lookup and renders the results for a model."""
+    return get_activities(
+        target_chembl_id=target_chembl_id,
+        molecule_chembl_id=molecule_chembl_id,
+        activity_type=activity_type,
+        limit=limit,
+    ).report()
+
+
+PUBCHEM_LOOKUP_TOOL = Tool(
+    name="pubchem_lookup",
+    description=(
+        "Get a small molecule's formula, weight, SMILES, InChIKey, and computed descriptors from "
+        "PubChem. Accepts a common name, a PubChem CID, a SMILES string, or an InChIKey; say "
+        "which in the namespace argument. This is for chemical structure and properties. For "
+        "whether a compound is a drug, what it acts on, or how potent it is, use chembl_lookup "
+        "or chembl_activities instead."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "identifier": {
+                "type": "string",
+                "description": "The name, CID, SMILES, or InChIKey of the compound.",
+            },
+            "namespace": {
+                "type": "string",
+                "enum": ["name", "cid", "smiles", "inchikey"],
+                "description": "Which kind of identifier was given. Defaults to name.",
+            },
+        },
+        "required": ["identifier"],
+    },
+    function=look_up_compound,
+)
+
+CHEMBL_LOOKUP_TOOL = Tool(
+    name="chembl_lookup",
+    description=(
+        "Get a drug's clinical status, route of administration, mechanism of action, and "
+        "drug-likeness properties from ChEMBL. Requires a ChEMBL identifier such as CHEMBL25; "
+        "use chembl_search first if you only have a name. Reports whether a molecule was "
+        "approved, how far it got, and whether it was withdrawn, which a structure database "
+        "cannot tell you."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "chembl_id": {
+                "type": "string",
+                "description": "A ChEMBL molecule identifier, such as CHEMBL25.",
+            },
+        },
+        "required": ["chembl_id"],
+    },
+    function=look_up_drug,
+)
+
+CHEMBL_SEARCH_TOOL = Tool(
+    name="chembl_search",
+    description=(
+        "Find drugs and compounds in ChEMBL by name, and get the identifiers to look up. Use "
+        "this to turn a drug name into a ChEMBL identifier."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "A drug or compound name."},
+            "limit": {
+                "type": "integer",
+                "description": f"How many results to return, at most {MAX_SEARCH_RESULTS}.",
+            },
+        },
+        "required": ["query"],
+    },
+    function=find_drugs,
+)
+
+CHEMBL_TARGET_SEARCH_TOOL = Tool(
+    name="chembl_target_search",
+    description=(
+        "Find a protein target in ChEMBL by name or gene symbol, and get the identifier needed "
+        "by chembl_activities. Searching a gene symbol unfiltered ranks protein complexes and "
+        "other species above the protein itself, so give the organism and leave "
+        "single_proteins_only on unless you specifically want complexes or cell lines."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "A target name or gene symbol, such as EGFR.",
+            },
+            "organism": {
+                "type": "string",
+                "description": 'The organism, such as "Homo sapiens". Strongly recommended.',
+            },
+            "single_proteins_only": {
+                "type": "boolean",
+                "description": (
+                    "Exclude complexes, cell lines, and protein-protein interactions. "
+                    "Defaults to true."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": f"How many results to return, at most {MAX_SEARCH_RESULTS}.",
+            },
+        },
+        "required": ["query"],
+    },
+    function=find_targets,
+)
+
+CHEMBL_ACTIVITIES_TOOL = Tool(
+    name="chembl_activities",
+    description=(
+        "Get the most potent measured interactions for a target or for a molecule from ChEMBL: "
+        "what binds it, how tightly, and in what assay. Give a target identifier to find what "
+        "acts on it, or a molecule identifier to find what it acts on; identifiers come from "
+        "chembl_target_search and chembl_search. Results are ordered by pChEMBL, the negative "
+        "log of the molar potency, and measurements from different assays are not directly "
+        "comparable."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target_chembl_id": {
+                "type": "string",
+                "description": "A ChEMBL target identifier, such as CHEMBL203.",
+            },
+            "molecule_chembl_id": {
+                "type": "string",
+                "description": "A ChEMBL molecule identifier, such as CHEMBL25.",
+            },
+            "activity_type": {
+                "type": "string",
+                "description": 'Restrict to one kind of measurement, such as "IC50" or "Ki".',
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    f"How many measurements to return, at most {MAX_ACTIVITIES_REPORTED}."
+                ),
+            },
+        },
+        "required": [],
+    },
+    function=find_activities,
+)
+
+
 def structure_file_tool(work_dir: Path) -> Tool:
     """Builds the structure download tool, bound to a directory.
 
@@ -278,6 +478,11 @@ DATABASE_TOOLS: tuple[Tool, ...] = (
     UNIPROT_SEARCH_TOOL,
     PDB_LOOKUP_TOOL,
     ALPHAFOLD_LOOKUP_TOOL,
+    PUBCHEM_LOOKUP_TOOL,
+    CHEMBL_LOOKUP_TOOL,
+    CHEMBL_SEARCH_TOOL,
+    CHEMBL_TARGET_SEARCH_TOOL,
+    CHEMBL_ACTIVITIES_TOOL,
 )
 
 TOOL_REGISTRY: dict[str, Tool] = {tool.name: tool for tool in DATABASE_TOOLS}

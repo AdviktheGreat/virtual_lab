@@ -300,7 +300,9 @@ def web_transport(monkeypatch: pytest.MonkeyPatch) -> FakeTransport:
     web = import_module("virtual_lab.web")
     transport = FakeTransport()
 
-    monkeypatch.setattr(web.requests, "get", transport.get)
+    # Patched at http_get rather than at requests.get, because a host configured with its own
+    # session would otherwise slip past the fake and reach the real service from a test
+    monkeypatch.setattr(web, "http_get", transport.get)
     monkeypatch.setattr(web.requests, "post", transport.post)
     monkeypatch.setattr(web.RATE_LIMITER, "min_interval", 0.0)
     monkeypatch.setattr(web.time, "sleep", lambda seconds: None)

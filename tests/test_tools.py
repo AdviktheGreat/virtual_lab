@@ -307,6 +307,11 @@ class TestTheSuppliedTools:
             "uniprot_search",
             "pdb_lookup",
             "alphafold_lookup",
+            "pubchem_lookup",
+            "chembl_lookup",
+            "chembl_search",
+            "chembl_target_search",
+            "chembl_activities",
         }
         assert set(TOOL_REGISTRY) == {tool.name for tool in DATABASE_TOOLS}
 
@@ -352,28 +357,56 @@ class TestTheSuppliedTools:
             "uniprot_lookup": (
                 "rest.uniprot.org/uniprotkb/P01308",
                 {"accession": "P01308"},
-                {},
+                [{}],
             ),
             "uniprot_search": (
                 "rest.uniprot.org/uniprotkb/search",
                 {"query": "insulin"},
-                {"results": []},
+                [{"results": []}],
             ),
             "pdb_lookup": (
                 "data.rcsb.org/rest/v1/core/entry/4HHB",
                 {"pdb_id": "4HHB"},
-                {},
+                [{}],
             ),
             "alphafold_lookup": (
                 "alphafold.ebi.ac.uk/api/prediction/P01308",
                 {"accession": "P01308"},
-                [{"uniprotAccession": "P01308"}],
+                [[{"uniprotAccession": "P01308"}]],
+            ),
+            "pubchem_lookup": (
+                "pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/aspirin",
+                {"identifier": "aspirin"},
+                [{"PropertyTable": {"Properties": [{"CID": 2244}]}},
+                 {"InformationList": {"Information": [{"Title": "Aspirin"}]}}],
+            ),
+            "chembl_lookup": (
+                "www.ebi.ac.uk/chembl/api/data/molecule/CHEMBL25.json",
+                {"chembl_id": "CHEMBL25"},
+                [{"molecule_chembl_id": "CHEMBL25"}, {"mechanisms": []}],
+            ),
+            "chembl_search": (
+                "www.ebi.ac.uk/chembl/api/data/molecule/search",
+                {"query": "aspirin"},
+                [{"molecules": [], "page_meta": {"total_count": 0}}],
+            ),
+            "chembl_target_search": (
+                "www.ebi.ac.uk/chembl/api/data/target/search",
+                {"query": "EGFR"},
+                [{"targets": [], "page_meta": {"total_count": 0}}],
+            ),
+            "chembl_activities": (
+                "www.ebi.ac.uk/chembl/api/data/activity",
+                {"target_chembl_id": "CHEMBL203"},
+                [{"activities": [], "page_meta": {"total_count": 0}}],
             ),
         }
 
-        for name, (fragment, arguments, body) in expected.items():
+        for name, (fragment, arguments, bodies) in expected.items():
             web_transport.requests.clear()
-            web_transport.responses = [FakeResponse(json_body=body)]
+            # A list, because a tool may make more than one request: the PubChem lookup fetches
+            # the properties and then the description
+            web_transport.responses = [FakeResponse(json_body=body) for body in bodies]
 
             TOOL_REGISTRY[name].function(**arguments)
 

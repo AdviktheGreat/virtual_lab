@@ -28,6 +28,12 @@ from virtual_lab.constants import (
     MAX_SEQUENCE_RESIDUES_REPORTED,
     MAX_STRUCTURE_FILE_BYTES,
 )
+from virtual_lab.records import (
+    NO_SUCH_RECORD_STATUSES,
+    RecordNotFoundError,
+    bounded,
+    truncate_text,
+)
 from virtual_lab.web import WebRequestError, build_url, request_json, request_text
 
 
@@ -62,21 +68,6 @@ REPORTED_COMMENT_TYPES = (
 )
 
 
-# Statuses that mean "there is no such record", as opposed to "the service could not answer".
-# Only these become a RecordNotFoundError: telling an agent a protein does not exist because the
-# service returned 503 is worse than telling it nothing, since it will stop looking. UniProt
-# answers an unknown accession with 400 rather than 404.
-NO_SUCH_RECORD_STATUSES = frozenset({400, 404})
-
-
-class DatabaseError(Exception):
-    """Raised when a database cannot answer a question about an identifier."""
-
-
-class RecordNotFoundError(DatabaseError):
-    """Raised when an identifier is well formed but names nothing."""
-
-
 def truncate_sequence(sequence: str, limit: int = MAX_SEQUENCE_RESIDUES_REPORTED) -> str:
     """Shortens a sequence for display, saying so rather than trailing off silently.
 
@@ -93,37 +84,6 @@ def truncate_sequence(sequence: str, limit: int = MAX_SEQUENCE_RESIDUES_REPORTED
 def wrap_sequence(sequence: str, width: int = 60) -> str:
     """Breaks a sequence into lines, as every sequence format does, so it stays readable."""
     return "\n".join(sequence[start : start + width] for start in range(0, len(sequence), width))
-
-
-def bounded(value: int, most: int, name: str) -> int:
-    """Holds a count a model chose within what is worth requesting.
-
-    :param value: The requested count.
-    :param most: The largest value allowed.
-    :param name: What is being counted, for the error message.
-    :raises ValueError: If the value is below one.
-    :return: The count, reduced to the limit if it was over it.
-    """
-    if value < 1:
-        raise ValueError(f"{name} must be at least 1")
-
-    return min(value, most)
-
-
-def truncate_text(text: str, limit: int = MAX_COMMENT_CHARACTERS) -> str:
-    """Shortens a free text annotation for display, saying how much it left out.
-
-    A curated protein carries kilobytes of prose. Capping the sequence and then spending the
-    saving on a disease description is no saving at all.
-
-    :param text: The full text.
-    :param limit: The most characters to show.
-    :return: The text, or its start with a note of how much was left out.
-    """
-    if len(text) <= limit:
-        return text
-
-    return f"{text[:limit]}... ({len(text) - limit:,} of {len(text):,} characters not shown)"
 
 
 def first_text(comment: dict[str, Any]) -> str:
@@ -247,7 +207,9 @@ class Protein:
             )
 
         for comment_type, text in self.comments[:MAX_COMMENTS_REPORTED]:
-            lines.append(f"\n{comment_type.title()}: {truncate_text(text)}")
+            lines.append(
+                f"\n{comment_type.title()}: {truncate_text(text, MAX_COMMENT_CHARACTERS)}"
+            )
 
         remaining_comments = len(self.comments) - MAX_COMMENTS_REPORTED
 
