@@ -148,7 +148,6 @@ class TestFlagsSentAsLetters:
     def test_the_letter_n_is_not_true(self) -> None:
         # "N" is a non-empty string, so every one of these fields is true when tested directly
         assert yes("N") is False
-        assert bool("N") is True
 
     @pytest.mark.parametrize("value, expected", [("Y", True), ("y", True), ("N", False),
                                                  ("", False), (None, False)])
@@ -468,11 +467,19 @@ class TestReadingAFullText:
         assert results == "Affinity purification. The first thing measured. Binding. The second thing measured."
 
     def test_a_long_article_is_cut_to_what_a_meeting_can_hold(self, web_transport) -> None:
-        big = JATS.replace("What the paper found.", "word " * 20_000)
+        # Enough sections, each long enough, that the whole-article budget runs out before the
+        # sections do. Inflating one section only reaches the per-section cap, which is a
+        # different limit: the article budget would go untested and its loss unnoticed.
+        sections = "".join(
+            f"<sec><title>Section {index}</title><p>{'word ' * 2_000}</p></sec>"
+            for index in range(20)
+        )
+        big = JATS.replace("<sec><title>INTRODUCTION</title>", sections + "<sec><title>X</title>")
         report = self.read(web_transport, xml=big).report()
 
         assert len(report) < MAX_ARTICLE_CHARACTERS + 2_000
-        assert "characters not shown" in report
+        assert "The rest of the article is not shown" in report
+        assert "Section 19" not in report
 
     def test_one_long_section_does_not_use_the_whole_budget(self, web_transport) -> None:
         big = JATS.replace("Why this matters, as shown before ", "word " * 20_000)
@@ -482,7 +489,13 @@ class TestReadingAFullText:
         # The section is cut to its own limit, so what comes after it still appears
         assert "RESULTS" in report
         assert report.index("## INTRODUCTION") < report.index("## RESULTS")
-        assert len(report) < MAX_SECTION_CHARACTERS + MAX_ARTICLE_CHARACTERS
+
+        introduction = dict(text.sections)["INTRODUCTION"]
+
+        # Bounded against the section limit rather than against the article one, which is five
+        # times larger and would hold whatever this section grew to
+        assert len(introduction) > MAX_SECTION_CHARACTERS
+        assert report.index("## RESULTS") < MAX_SECTION_CHARACTERS + 1_000
 
 
 class TestRefusingAnUnsafeDocument:
@@ -597,6 +610,21 @@ class TestSearchingArxiv:
             search_preprints("  ")
 
         assert web_transport.requests == []
+
+    @pytest.mark.parametrize(
+        "sort, expected",
+        [
+            ("relevance", "relevance"),
+            ("recent", "submittedDate"),
+            ("updated", "lastUpdatedDate"),
+        ],
+    )
+    def test_each_ordering_is_passed_through(self, web_transport, sort, expected) -> None:
+        queue_text(web_transport, ARXIV_FEED)
+        search_preprints("nanobody", sort=sort)
+
+        assert web_transport.params[0]["sortBy"] == expected
+        assert web_transport.params[0]["sortOrder"] == "descending"
 
     def test_an_unknown_ordering_is_refused_before_any_request(self, web_transport) -> None:
         with pytest.raises(ValueError, match="Unknown sort"):
