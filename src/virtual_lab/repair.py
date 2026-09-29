@@ -12,6 +12,7 @@ the number of them is capped and recorded rather than left to run until somethin
 
 import json
 import platform
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from openai import OpenAI
 
 from virtual_lab.__about__ import __version__
 from virtual_lab.agent import Agent
-from virtual_lab.artifacts import CodeArtifacts, CodeFile, save_artifacts
+from virtual_lab.artifacts import CodeArtifacts, CodeFile, filename_key, save_artifacts
 from virtual_lab.constants import (
     ARTIFACT_DIR_NAME,
     CONSISTENT_TEMPERATURE,
@@ -38,19 +39,34 @@ from virtual_lab.provenance import describe_agent, utc_timestamp
 from virtual_lab.structured import request_structured_output
 from virtual_lab.utils import MeetingUsage
 
+# Parts of an error message that change between two runs of the same code. Kept to forms that
+# cannot be mistaken for content: a hexadecimal address, and a date and time together.
+VOLATILE_PATTERNS = (
+    (re.compile(r"\b0x[0-9a-fA-F]+\b"), "0x?"),
+    (
+        re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?"),
+        "<time>",
+    ),
+)
+
 
 def error_signature(result: ExecutionResult) -> str:
     """Summarizes a failure closely enough to tell two of them apart.
 
     The last line of standard error is used because that is where an exception type and message
-    land.
+    land. Memory addresses and timestamps in it are replaced first, since they differ on every
+    run and would make the same failure look new each time.
 
     :param result: The failed execution.
     :return: A short string identifying the failure.
     """
     lines = [line.strip() for line in result.stderr.strip().splitlines() if line.strip()]
+    last = lines[-1] if lines else ""
 
-    return f"{result.exit_code}|{result.timed_out}|{lines[-1] if lines else ''}"
+    for pattern, replacement in VOLATILE_PATTERNS:
+        last = pattern.sub(replacement, last)
+
+    return f"{result.exit_code}|{result.timed_out}|{last}"
 
 
 def failure_signature(failure: tuple[CodeFile, ExecutionResult]) -> str:
@@ -72,21 +88,24 @@ def merge_artifacts(previous: CodeArtifacts, repaired: CodeArtifacts) -> CodeArt
     """Applies a repair to a set of files, keeping files the repair did not mention.
 
     The prompt asks for every file back, but a model that returns only the file it changed
-    should not thereby delete the rest of the work.
+    should not thereby delete the rest of the work. Files are matched by the file they would
+    name on disk, so a repair returning "./a.py" or "A.py" replaces "a.py" rather than being
+    refused as a second file at the same path.
 
     :param previous: The files as they stood before the repair.
     :param repaired: The files the agent returned.
     :return: The merged files, in their original order, with new files appended.
     """
-    by_filename = {file.filename: file for file in previous.files}
-    order = list(by_filename)
+    by_key = {filename_key(file.filename): file for file in previous.files}
+    order = list(by_key)
 
     for file in repaired.files:
-        if file.filename not in by_filename:
-            order.append(file.filename)
-        by_filename[file.filename] = file
+        key = filename_key(file.filename)
+        if key not in by_key:
+            order.append(key)
+        by_key[key] = file
 
-    return CodeArtifacts(files=[by_filename[filename] for filename in order])
+    return CodeArtifacts(files=[by_key[key] for key in order])
 
 
 @dataclass(frozen=True)
@@ -428,7 +447,15 @@ def describe_executor(executor: Executor) -> dict[str, Any]:
     """
     description: dict[str, Any] = {"type": type(executor).__name__}
 
-    for attribute in ("image", "allow_network", "timeout", "memory_limit", "cpu_limit", "pids_limit"):
+    for attribute in (
+        "image",
+        "allow_network",
+        "timeout",
+        "memory_limit",
+        "cpu_limit",
+        "pids_limit",
+        "max_file_bytes",
+    ):
         if hasattr(executor, attribute):
             description[attribute] = getattr(executor, attribute)
 
