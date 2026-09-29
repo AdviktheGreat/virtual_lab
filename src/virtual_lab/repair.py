@@ -35,7 +35,7 @@ from virtual_lab.constants import (
 from virtual_lab.execution import ExecutionResult, Executor, run_files
 from virtual_lab.prompts import code_repair_prompt
 from virtual_lab.provenance import describe_agent, utc_timestamp
-from virtual_lab.structured import request_structured_output
+from virtual_lab.structured import StructuredOutputError, request_structured_output
 from virtual_lab.utils import MeetingUsage
 
 
@@ -362,26 +362,31 @@ def request_repair(
     :raises StructuredOutputError: If the agent does not return usable corrected files.
     :return: The files the agent returned, which may not include every original file.
     """
-    repaired, response = request_structured_output(
-        client=client,
-        model=model,
-        messages=[
-            {"role": "system", "content": author.prompt},
-            {
-                "role": "user",
-                "content": code_repair_prompt(
-                    agent=author,
-                    files=files,
-                    filename=filename,
-                    report=report,
-                    attempt=attempt,
-                    max_attempts=max_attempts,
-                ),
-            },
-        ],
-        schema=CodeArtifacts,
-        temperature=temperature,
-    )
+    try:
+        repaired, response = request_structured_output(
+            client=client,
+            model=model,
+            messages=[
+                {"role": "system", "content": author.prompt},
+                {
+                    "role": "user",
+                    "content": code_repair_prompt(
+                        agent=author,
+                        files=files,
+                        filename=filename,
+                        report=report,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    ),
+                },
+            ],
+            schema=CodeArtifacts,
+            temperature=temperature,
+        )
+    except StructuredOutputError as error:
+        usage.add(model=model, usage=error.usage)
+        raise
+
     usage.add(model=model, usage=response.usage)
 
     return repaired

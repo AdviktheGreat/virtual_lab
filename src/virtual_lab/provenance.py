@@ -56,8 +56,9 @@ class TurnRecord:
     :param name: The agent's author name, or None for prompts and tool output.
     :param model: The model that produced the turn, or None for prompts and tool output.
     :param num_api_calls: The number of API calls the turn took, above one if tools were used.
-    :param tool_calls: The names of the tools called while producing the turn.
+    :param tool_calls: Each tool called while producing the turn, by name, with its arguments.
     :param system_fingerprint: The backend configuration the API reported, when it reports one.
+    :param finish_reason: Why the model stopped, which is "length" if it ran out of tokens.
     """
 
     index: int
@@ -71,8 +72,9 @@ class TurnRecord:
     output_tokens: int = 0
     reasoning_tokens: int = 0
     num_api_calls: int = 0
-    tool_calls: list[str] = field(default_factory=list)
+    tool_calls: list[dict[str, str]] = field(default_factory=list)
     system_fingerprint: str | None = None
+    finish_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Returns the record as a JSON-serializable dictionary."""
@@ -86,6 +88,12 @@ class MeetingRecord:
     :param meeting_type: Either "team" or "individual".
     :param save_name: The name the transcript was saved under.
     :param status: "completed" if the meeting finished, "failed" if it raised partway through.
+    :param summaries_sha256: A hash of each summary passed in, so that a meeting can be matched
+        to the meetings it was given without copying their text into every record.
+    :param models_at_default_temperature: Models that refused the temperature asked for and ran
+        at their own default instead.
+    :param prices: What each model used was priced at, in USD per million tokens, since the
+        price tables change and a cost is only comparable at the prices it was computed with.
     """
 
     meeting_type: str
@@ -96,6 +104,17 @@ class MeetingRecord:
     team: list[dict[str, str]]
     critic: dict[str, str] | None = None
     tools: list[str] = field(default_factory=list)
+    agenda: str = ""
+    agenda_questions: list[str] = field(default_factory=list)
+    agenda_rules: list[str] = field(default_factory=list)
+    summaries_sha256: list[str] = field(default_factory=list)
+    contexts_sha256: list[str] = field(default_factory=list)
+    output_schema: str | None = None
+    max_tool_iterations: int | None = None
+    max_completion_tokens: int | None = None
+    max_cost: float | None = None
+    models_at_default_temperature: list[str] = field(default_factory=list)
+    prices: dict[str, dict[str, float] | None] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_timestamp)
     ended_at: str | None = None
     elapsed_seconds: float | None = None
@@ -146,11 +165,22 @@ class MeetingRecord:
             "elapsed_seconds": self.elapsed_seconds,
             "num_rounds": self.num_rounds,
             "temperature": self.temperature,
+            "models_at_default_temperature": self.models_at_default_temperature,
             "max_retries": self.max_retries,
+            "max_tool_iterations": self.max_tool_iterations,
+            "max_completion_tokens": self.max_completion_tokens,
+            "max_cost": self.max_cost,
+            "agenda": self.agenda,
+            "agenda_questions": self.agenda_questions,
+            "agenda_rules": self.agenda_rules,
+            "summaries_sha256": self.summaries_sha256,
+            "contexts_sha256": self.contexts_sha256,
+            "output_schema": self.output_schema,
             "team": self.team,
             "critic": self.critic,
             "tools": self.tools,
             "usage": self.usage,
+            "prices": self.prices,
             "turns": [turn.to_dict() for turn in self.turns],
         }
 

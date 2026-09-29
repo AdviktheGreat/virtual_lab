@@ -254,7 +254,9 @@ class TestTurnLevelFields:
 
         response = next(turn for turn in record["turns"] if turn["kind"] == "response")
 
-        assert response["tool_calls"] == ["uniprot_lookup"]
+        assert response["tool_calls"] == [
+            {"name": "uniprot_lookup", "arguments": '{"accession": "P0DTC2"}'}
+        ]
         # One call requested the tool, the second produced the answer
         assert response["num_api_calls"] == 2
 
