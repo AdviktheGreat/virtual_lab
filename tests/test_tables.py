@@ -29,6 +29,7 @@ from virtual_lab.constants import (
     MAX_SAMPLE_COLUMNS,
     MAX_SAMPLE_ROWS,
     MAX_SHEET_BYTES,
+    MAX_SPREADSHEET_COLUMNS,
     MAX_TABLE_ROWS_SCANNED,
 )
 from virtual_lab.tables import (
@@ -133,6 +134,19 @@ def workbook(
 
         for index in range(padding):
             archive.writestr(f"xl/filler{index}.xml", "<a />")
+
+    return buffer.getvalue()
+
+
+def rebuild(raw: bytes, name: str, change) -> bytes:
+    """Rewrites one member of a workbook, for a fixture a plain writer cannot produce."""
+    source = zipfile.ZipFile(io.BytesIO(raw))
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for member in source.namelist():
+            text = source.read(member).decode("utf-8")
+            archive.writestr(member, change(text) if member == name else text)
 
     return buffer.getvalue()
 
@@ -353,6 +367,37 @@ class TestTheHeaderRow:
         assert any("Repeated column names: value" in warning for warning in warnings)
         assert any("keep only the last" in warning for warning in warnings)
 
+    def test_a_warning_about_a_wide_header_lists_only_the_first_few(self) -> None:
+        # A matrix of samples runs to tens of thousands of columns, and a warning listing each
+        # blank one was measured at 129 KB, which is a context window spent on commas
+        names, warnings = name_columns([""] * 20 + ["x"] * 12 + [f"{n}.5" for n in range(9)])
+        blank = next(warning for warning in warnings if "no name" in warning)
+        repeated = next(warning for warning in warnings if "Repeated" in warning)
+        numeric = next(warning for warning in warnings if "no header" in warning)
+
+        assert "at position 1, 2, 3, 4, 5 and 15 more." in blank
+        assert "column 20" not in repeated
+        assert "x" in repeated
+        assert "0.5, 1.5, 2.5, 3.5, 4.5 and 4 more" in numeric
+        assert len(names) == 41
+
+    def test_a_list_that_fits_is_not_said_to_have_more(self) -> None:
+        names, warnings = name_columns([""] * 5 + ["gene"])
+
+        assert any("at position 1, 2, 3, 4, 5." in warning for warning in warnings)
+        assert not any("more" in warning for warning in warnings)
+
+    def test_a_long_name_is_shortened_but_not_taken_for_a_repeat(self) -> None:
+        # Shortening first would make two names that differ only past the cut look the same
+        first, second = "x" * 500 + "a", "x" * 500 + "b"
+        names, warnings = name_columns([first, second, " " + "y" * 5_000, "z" * 5_000, "z" * 5_000])
+
+        assert any("Repeated" in warning for warning in warnings)
+        assert not any("x" * 100 in warning for warning in warnings)
+        assert all(len(name) < MAX_CELL_CHARACTERS + 60 for name in names)
+        assert "characters not shown" in names[0]
+        assert all(len(warning) < 1_000 for warning in warnings)
+
     def test_a_header_of_numbers_is_probably_not_a_header(self) -> None:
         names, warnings = name_columns(["TP53", "1.23", "0.001"])
 
@@ -384,6 +429,15 @@ class TestRowsThatDoNotFitTheHeader:
 
         assert "1 shorter" in warning
         assert "1 longer" in warning
+
+    def test_rows_that_are_only_too_long_are_not_also_called_short(self, tmp_path) -> None:
+        write(tmp_path, "ragged.csv", "a,b\n1,2\n3,4,5\n")
+        table = describe_table(tmp_path, "ragged.csv")
+
+        warning = next(w for w in table.warnings if "not all the same width" in w)
+
+        assert "1 longer" in warning
+        assert "shorter" not in warning
 
     def test_a_missing_cell_counts_as_missing_rather_than_as_nothing(self, tmp_path) -> None:
         write(tmp_path, "ragged.csv", "a,b,c\n1,2,3\n4,5\n")
@@ -849,6 +903,58 @@ class TestCellsThatAreNotWhereTheyLook:
         assert column_number("123") == 0
         assert column_number("") == 0
 
+    def test_a_letter_outside_the_alphabet_is_not_a_column(self) -> None:
+        # str.isalpha takes both. "é" came out as column 137, and "ß" upper-cases to "SS",
+        # which made ord() raise a TypeError out of a function that only raises TableError
+        assert column_number("\u00e91") == 0
+        assert column_number("\u00df1") == 0
+
+    def test_the_last_column_a_spreadsheet_can_have_is_xfd(self) -> None:
+        assert column_number("XFD1") == MAX_SPREADSHEET_COLUMNS
+
+        with pytest.raises(TableError, match="past the last column"):
+            column_number("XFE1")
+
+    def test_a_reference_of_any_length_is_refused_without_being_counted_out(self) -> None:
+        with pytest.raises(TableError, match="past the last column"):
+            column_number("A" * 1_000_000 + "1")
+
+    def test_a_cell_past_the_last_column_is_refused_as_damage(self, tmp_path) -> None:
+        body = sheet(row(1, inline("A1", "gene") + inline("ZZZZ1", "far")))
+        write(tmp_path, "book.xlsx", workbook({"Results": body}))
+
+        with pytest.raises(TableError, match="past the last column"):
+            describe_table(tmp_path, "book.xlsx")
+
+    def test_a_stray_value_far_to_the_right_stops_the_read_and_says_why(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Every row is padded to the widest, so one cell in column AD makes each row thirty
+        # cells, and it is the padded total that the limit is on
+        monkeypatch.setattr("virtual_lab.tables.MAX_TABLE_CELLS", 100)
+        cells = "".join(row(index, inline(f"A{index}", f"g{index}")) for index in range(1, 5))
+        body = sheet(cells + row(5, inline("A5", "g5") + inline("AD5", "stray")))
+        write(tmp_path, "book.xlsx", workbook({"Results": body}))
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert table.rows == 3
+        assert table.complete is False
+        assert any("30 columns wide" in warning for warning in table.warnings)
+        assert any("first 4 rows" in warning for warning in table.warnings)
+        assert "longer than" not in table.report()
+
+    def test_the_cell_limit_counts_the_widest_row_so_far_not_the_one_in_hand(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("virtual_lab.tables.MAX_TABLE_CELLS", 100)
+        header = row(1, inline("A1", "gene") + inline("AD1", "note"))
+        cells = "".join(row(index, inline(f"A{index}", f"g{index}")) for index in range(2, 10))
+        write(tmp_path, "book.xlsx", workbook({"Results": sheet(header + cells)}))
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert table.rows == 2
+        assert table.complete is False
+
     def test_a_far_right_column_is_placed_rather_than_counted(self, tmp_path) -> None:
         body = sheet(row(1, inline("A1", "first") + inline("AA1", "far")))
         write(tmp_path, "book.xlsx", workbook({"Results": body}))
@@ -1057,6 +1163,61 @@ class TestRefusingAnUnsafeWorkbook:
             describe_table(tmp_path, "hollow.xlsx")
 
 
+    def test_a_chart_sheet_is_not_taken_for_a_sheet_of_data(self, tmp_path) -> None:
+        # A chart sheet sits in the workbook's list of sheets like any other, and Excel puts it
+        # first when a chart is moved to its own tab. Only its relationship's type says it holds
+        # no cells; read as a worksheet, it would become the default sheet and have no rows.
+        body = sheet(row(1, inline("A1", "gene")) + row(2, inline("A2", "TP53")))
+        raw = workbook({"Results": body})
+        raw = rebuild(raw, "xl/workbook.xml", lambda text: text.replace(
+            "<sheets>", '<sheets><sheet name="Chart1" sheetId="9" r:id="rId9" />'
+        ))
+        raw = rebuild(raw, "xl/_rels/workbook.xml.rels", lambda text: text.replace(
+            "</Relationships>",
+            f'<Relationship Id="rId9" Target="chartsheets/sheet1.xml" '
+            f'Type="{DOCUMENT}/chartsheet" />'
+            f'<Relationship Id="rId8" Target="styles.xml" Type="{DOCUMENT}/styles" />'
+            "</Relationships>",
+        ))
+        write(tmp_path, "book.xlsx", raw)
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert table.sheet == "Results"
+        assert table.other_sheets == ()
+        assert table.columns[0].name == "gene"
+
+    def test_cells_without_a_reference_are_placed_after_the_one_before(self, tmp_path) -> None:
+        # The r attribute on a cell is optional in the format, and writers that stream cells
+        # out in order leave it off. Dropping those cells reads a full sheet as an empty one.
+        body = sheet(
+            '<row><c t="inlineStr"><is><t>gene</t></is></c>'
+            '<c t="inlineStr"><is><t>logFC</t></is></c></row>'
+            '<row><c t="inlineStr"><is><t>TP53</t></is></c><c><v>1.5</v></c></row>'
+            # A referenced cell moves the position on, and the next unreferenced one follows it
+            f'<row>{inline("A3", "BRCA1")}<c><v>2.5</v></c></row>'
+        )
+        write(tmp_path, "streamed.xlsx", workbook({"Results": body}))
+        table = describe_table(tmp_path, "streamed.xlsx")
+
+        assert [column.name for column in table.columns] == ["gene", "logFC"]
+        assert table.rows == 2
+        assert table.columns[0].examples == ("TP53", "BRCA1")
+        assert table.columns[1].examples == ("1.5", "2.5")
+
+    def test_a_row_with_nothing_in_it_does_not_become_a_row(self, tmp_path) -> None:
+        # A spreadsheet writes <row/> for a row that has been emptied but not deleted
+        body = sheet(
+            row(1, inline("A1", "gene"))
+            + row(2, inline("A2", "TP53"))
+            + '<row r="3" />'
+            + row(4, inline("A4", "BRCA1"))
+        )
+        write(tmp_path, "book.xlsx", workbook({"Results": body}))
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert table.rows == 2
+        assert table.columns[0].examples == ("TP53", "BRCA1")
+
     def test_a_member_that_will_not_unpack_is_reported_as_a_table_problem(self, tmp_path) -> None:
         # zipfile.BadZipFile derives straight from Exception, so catching OSError misses the
         # commonest way a workbook fails: a member whose bytes no longer match their checksum
@@ -1086,6 +1247,29 @@ class TestWhatAReportCosts:
         assert len(table.columns) == MAX_COLUMNS_REPORTED
         assert f"{width - MAX_COLUMNS_REPORTED:,} more not described" in table.report()
 
+    def test_columns_past_those_described_are_never_scanned(self, tmp_path, monkeypatch) -> None:
+        # A scan per column costs a pass over every row each, so a wide header over short rows
+        # costs the product of the two; only the described columns are worth it
+        import virtual_lab.tables as tables
+
+        made = []
+        original = tables.ColumnScan.__init__
+
+        def counted(self, *args) -> None:
+            made.append(args)
+            original(self, *args)
+
+        monkeypatch.setattr(tables.ColumnScan, "__init__", counted)
+        width = MAX_COLUMNS_REPORTED + 30
+        header = ",".join(f"c{index}" for index in range(width))
+        write(tmp_path, "wide.csv", f"{header}\n1,2\n3,4\n")
+        table = describe_table(tmp_path, "wide.csv")
+
+        assert len(made) == MAX_COLUMNS_REPORTED
+        assert table.total_columns == width
+        assert table.columns[0].missing == 0
+        assert table.columns[-1].missing == 2
+
     def test_a_long_file_stops_and_says_where(self, tmp_path) -> None:
         rows = "\n".join(f"g{index},{index}" for index in range(MAX_TABLE_ROWS_SCANNED + 50))
         write(tmp_path, "long.csv", f"gene,n\n{rows}\n")
@@ -1094,6 +1278,16 @@ class TestWhatAReportCosts:
         assert table.rows == MAX_TABLE_ROWS_SCANNED
         assert table.complete is False
         assert "Everything below describes the rows that were read" in table.report()
+        assert any(f"longer than {MAX_TABLE_ROWS_SCANNED:,} rows" in w for w in table.warnings)
+
+    def test_a_file_of_exactly_the_row_limit_is_read_to_the_end(self, tmp_path) -> None:
+        rows = "\n".join(f"g{index},{index}" for index in range(MAX_TABLE_ROWS_SCANNED))
+        write(tmp_path, "full.csv", f"gene,n\n{rows}\n")
+        table = describe_table(tmp_path, "full.csv")
+
+        assert table.rows == MAX_TABLE_ROWS_SCANNED
+        assert table.complete is True
+        assert not any("longer than" in warning for warning in table.warnings)
 
     def test_a_short_file_is_not_said_to_be_cut_short(self, tmp_path) -> None:
         write(tmp_path, "short.csv", "gene,n\nTP53,1\n")
@@ -1112,6 +1306,7 @@ class TestWhatAReportCosts:
 
         assert table.rows == MAX_TABLE_ROWS_SCANNED
         assert table.complete is False
+        assert any(f"longer than {MAX_TABLE_ROWS_SCANNED:,} rows" in w for w in table.warnings)
 
     def test_a_paragraph_in_a_cell_is_cut(self, tmp_path) -> None:
         write(tmp_path, "notes.csv", f"gene,note\nTP53,{'word ' * 400}\n")
@@ -1150,6 +1345,9 @@ class TestWhatAReportCosts:
         assert "cp1252" not in table.reading
         assert not any("cp1252" in warning for warning in table.warnings)
         assert any("larger than" in warning for warning in table.warnings)
+        # The read stopped at the byte limit a few rows in, and the report used to put that
+        # down to the file being longer than the row limit
+        assert "longer than" not in table.report()
 
     def test_a_wide_sample_row_says_it_was_cut(self, tmp_path) -> None:
         width = MAX_SAMPLE_COLUMNS + 3
@@ -1188,6 +1386,26 @@ class TestWhatAReportCosts:
         assert column.distinct == 2
         assert column.counted_all is True
         assert "over" not in column.describe()
+
+    def test_a_value_seen_before_the_limit_does_not_count_as_going_over_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The limit is on how many values are remembered, so a column that fills it and then
+        # repeats only what it has already shown still has an exact count
+        monkeypatch.setattr("virtual_lab.tables.MAX_DISTINCT_TRACKED", 3)
+        write(tmp_path, "ids.csv", "id\na\nb\nc\na\nc\n")
+        column = describe_table(tmp_path, "ids.csv").columns[0]
+
+        assert column.distinct == 3
+        assert column.counted_all is True
+
+    def test_a_file_of_nothing_but_separators_says_there_is_nothing_in_it(
+        self, tmp_path
+    ) -> None:
+        write(tmp_path, "blank.csv", ",,\n,,\n")
+
+        with pytest.raises(TableError, match="no rows with anything in them"):
+            describe_table(tmp_path, "blank.csv")
 
     def test_a_file_too_long_with_no_line_ending_in_it_says_so(
         self, tmp_path, monkeypatch
@@ -1233,6 +1451,17 @@ class TestWhatTheReportSays:
 
         assert "1 row, 1 column." in report
         assert "1 value," in report
+
+    def test_a_column_with_gaps_in_it_says_how_many(self, tmp_path) -> None:
+        write(tmp_path, "assay.csv", "gene,logFC\nTP53,1.2\nBRCA1,\nEGFR,\n")
+        report = describe_table(tmp_path, "assay.csv").report()
+
+        assert "2 missing" in report
+
+    def test_a_column_with_no_gaps_in_it_says_nothing_about_missing(self, tmp_path) -> None:
+        write(tmp_path, "assay.csv", "gene,logFC\nTP53,1.2\n")
+
+        assert "missing" not in describe_table(tmp_path, "assay.csv").report()
 
     def test_the_rows_are_shown_under_the_columns(self, tmp_path) -> None:
         write(tmp_path, "assay.csv", "gene,logFC\nTP53,1.2\n")

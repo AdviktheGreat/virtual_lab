@@ -37,10 +37,13 @@ from virtual_lab.constants import (
     MAX_COLUMNS_REPORTED,
     MAX_DATA_FILES_LISTED,
     MAX_DISTINCT_TRACKED,
+    MAX_NAMES_LISTED,
     MAX_SAMPLE_COLUMNS,
     MAX_SAMPLE_ROWS,
     MAX_SHEET_BYTES,
+    MAX_SPREADSHEET_COLUMNS,
     MAX_TABLE_BYTES,
+    MAX_TABLE_CELLS,
     MAX_TABLE_ROWS_SCANNED,
     SPREADSHEET_SUFFIXES,
 )
@@ -131,10 +134,26 @@ BUILTIN_DATE_FORMATS = frozenset({14, 15, 16, 17, 18, 19, 20, 21, 22, 45, 46, 47
 # worth special casing; a 1900 date in a data file is a corrupted value, not a measurement.
 EXCEL_DAY_ZERO = datetime.date(1899, 12, 30)
 
+TOO_MANY_ROWS = (
+    f"The file is longer than {MAX_TABLE_ROWS_SCANNED:,} rows, and only those were read. "
+    f"Counts of missing values and of distinct values are of the rows read, not of the file."
+)
+
 
 def count(number: int, thing: str) -> str:
     """A number and what it counts, made plural when it needs to be."""
     return f"{number:,} {thing}" if number == 1 else f"{number:,} {thing}s"
+
+
+def listed(items: list[str]) -> str:
+    """The first few of a list, each shortened, joined, and how many more there are."""
+    shown = ", ".join(
+        truncate_text(item, MAX_CELL_CHARACTERS) for item in items[:MAX_NAMES_LISTED]
+    )
+
+    return shown if len(items) <= MAX_NAMES_LISTED else (
+        f"{shown} and {len(items) - MAX_NAMES_LISTED:,} more"
+    )
 
 
 def looks_like(pattern: re.Pattern[str], value: str) -> bool:
@@ -156,15 +175,24 @@ def column_number(reference: str) -> int:
     stay plausible.
 
     :param reference: The cell reference, such as A1 or AB12.
+    :raises TableError: If the column is past the last one a spreadsheet can have.
     :return: The column number, or 0 if the reference does not start with letters.
     """
+    # ASCII only: str.isalpha takes "é", which becomes column 137, and "ß", which upper-cases to
+    # two characters and makes ord() raise
+    letters = re.match(r"[A-Za-z]*", reference).group()  # type: ignore[union-attr]
     number = 0
 
-    for character in reference:
-        if not character.isalpha():
-            break
+    # Checked as the letters go rather than at the end, since a reference is only as long as
+    # the file makes it, and the number grows by a factor of 26 with each letter
+    for character in letters.upper():
+        number = number * 26 + (ord(character) - ord("A") + 1)
 
-        number = number * 26 + (ord(character.upper()) - ord("A") + 1)
+        if number > MAX_SPREADSHEET_COLUMNS:
+            raise TableError(
+                f"This spreadsheet has a cell at {reference[:20]}, past the last column a "
+                f"spreadsheet can have. The file is damaged or was not written by a spreadsheet."
+            )
 
     return number
 
@@ -256,10 +284,12 @@ class Table:
             f"{self.reading}"
         ]
 
+        # The reason is left to the warnings, since there are three limits that stop a read and
+        # naming one here would be wrong about the other two
         if not self.complete:
             lines.append(
-                f"The file is longer than {MAX_TABLE_ROWS_SCANNED:,} rows. Everything below "
-                f"describes the rows that were read, not the whole file."
+                "Reading stopped before the end of the file, for the reason given at the end. "
+                "Everything below describes the rows that were read, not the whole file."
             )
 
         if self.other_sheets:
@@ -632,9 +662,9 @@ def name_columns(header: list[str]) -> tuple[list[str], list[str]]:
     spaced = [name for name in header if name != name.strip() and name.strip()]
 
     if spaced:
-        listed = ", ".join(f'"{name}"' for name in spaced)
+        quoted = listed([f'"{name}"' for name in spaced])
         warnings.append(
-            f"Column names with spaces around them: {listed}. They are shown trimmed below, but "
+            f"Column names with spaces around them: {quoted}. They are shown trimmed below, but "
             f"a lookup by the name as it reads in the file will not find them."
         )
 
@@ -645,17 +675,19 @@ def name_columns(header: list[str]) -> tuple[list[str], list[str]]:
         names[position - 1] = f"column {position}"
 
     if blank:
-        listed = ", ".join(str(position) for position in blank)
         warnings.append(
-            f"Columns with no name, at position {listed}. They are called "
-            f'"column {blank[0]}" and so on below; nothing in the file calls them that.'
+            f"Columns with no name, at position {listed([str(place) for place in blank])}. They "
+            f'are called "column {blank[0]}" and so on below; nothing in the file calls them that.'
         )
 
-    repeated = sorted({name for name in names if names.count(name) > 1})
+    # Counted once rather than with names.count per name, which is quadratic, and a matrix with
+    # a column per sample is wide enough for that to take minutes
+    tally = Counter(names)
+    repeated = sorted(name for name, seen in tally.items() if seen > 1)
 
     if repeated:
         warnings.append(
-            f"Repeated column names: {', '.join(repeated)}. Readers that key rows by name keep "
+            f"Repeated column names: {listed(repeated)}. Readers that key rows by name keep "
             f"only the last of each, so the earlier ones are dropped without a word."
         )
 
@@ -666,11 +698,12 @@ def name_columns(header: list[str]) -> tuple[list[str], list[str]]:
     if numeric:
         warnings.append(
             f"The first row was used as the header, but {len(numeric)} of its {len(names)} "
-            f"cells are numbers ({', '.join(numeric[:3])}). This file probably has no header "
+            f"cells are numbers ({listed(numeric)}). This file probably has no header "
             f"row, in which case the first row of data is missing from everything below."
         )
 
-    return names, warnings
+    # Shortened only now, since two long names that differ past the cut are not repeats
+    return [truncate_text(name, MAX_CELL_CHARACTERS) for name in names], warnings
 
 
 def scan(
@@ -685,7 +718,11 @@ def scan(
     :param kinds: The kind of each cell, where the file declares one. Delimited files do not.
     :return: The columns, limited to what is worth listing, and the warnings.
     """
-    scans = [ColumnScan(name, position) for position, name in enumerate(names, start=1)]
+    # Only the columns that will be described are scanned. The rest would cost a pass over every
+    # row each for nothing, and a wide header over short rows makes that the product of the two:
+    # a ten megabyte header above fifty thousand one-cell rows is hours of counting blanks.
+    tracked = min(len(names), MAX_COLUMNS_REPORTED)
+    scans = [ColumnScan(name, position) for position, name in enumerate(names[:tracked], start=1)]
     short = 0
     long = 0
 
@@ -697,12 +734,12 @@ def scan(
 
         declared = kinds[index] if kinds is not None else None
 
-        for position, value in enumerate(row[: len(names)]):
+        for position, value in enumerate(row[:tracked]):
             scans[position].add(value, declared[position] if declared is not None else None)
 
         # A row that stops early is not a row of empty cells; the cells are absent. Counting
         # them as missing is what makes the missing count match what a reader will see.
-        for position in range(len(row), len(names)):
+        for position in range(len(row), tracked):
             scans[position].add("", "blank" if kinds is not None else None)
 
     warnings = []
@@ -722,7 +759,7 @@ def scan(
             f"the extra fields of long rows are dropped, here and by most other readers."
         )
 
-    return tuple(entry.finish() for entry in scans[:MAX_COLUMNS_REPORTED]), warnings
+    return tuple(entry.finish() for entry in scans), warnings
 
 
 def read_delimited(path: Path, name: str) -> Table:
@@ -808,6 +845,9 @@ def read_delimited(path: Path, name: str) -> Table:
             f"The file is larger than {MAX_TABLE_BYTES:,} bytes. Reading stopped at the last "
             f"whole line before that, so there is more of it than is described here."
         )
+
+    if len(rows) - 1 > MAX_TABLE_ROWS_SCANNED:
+        warnings.append(TOO_MANY_ROWS)
 
     # A single column file is where "the first row is the header" is least likely to be true and
     # least likely to be noticed, since there is no second column to look odd
@@ -1080,7 +1120,7 @@ def read_spreadsheet(path: Path, name: str, sheet: str | None = None) -> Table:
         strings = shared_strings(archive)
         dated = date_styles(archive)
         root = parse_xml(entry_text(archive, chosen[1]), TableError, "spreadsheet")
-        rows, kinds, capped = sheet_rows(root, strings, dated)
+        rows, kinds, stopped = sheet_rows(root, strings, dated)
 
     if not rows:
         raise TableError(f'Sheet "{chosen[0]}" of "{name}" has nothing in it')
@@ -1090,10 +1130,13 @@ def read_spreadsheet(path: Path, name: str, sheet: str | None = None) -> Table:
     columns, more = scan(body, names, body_kinds)
     warnings.extend(more)
 
+    if stopped:
+        warnings.append(stopped)
+
     return Table(
         name=name,
         rows=len(body),
-        complete=not capped,
+        complete=not stopped,
         columns=columns,
         total_columns=len(names),
         sample=sample_of(body, len(names)),
@@ -1122,7 +1165,7 @@ def sheet_rows(
     root,  # type: ignore[no-untyped-def]
     strings: list[str],
     dated: set[int],
-) -> tuple[list[list[str]], list[list[str]], bool]:
+) -> tuple[list[list[str]], list[list[str]], str]:
     """Turns a sheet's XML into rows of text and rows of kinds.
 
     Cells are placed by their reference rather than taken in order, because a row holds only the
@@ -1133,34 +1176,49 @@ def sheet_rows(
     :param root: The worksheet element.
     :param strings: The shared strings.
     :param dated: Style indices that mean a date.
-    :return: The values, the kinds, and whether the scan stopped early.
+    :raises TableError: If a cell is placed past the last column a spreadsheet can have.
+    :return: The values, the kinds, and why the scan stopped early, or "" if it did not.
     """
     rows: list[list[str]] = []
     kinds: list[list[str]] = []
-    capped = False
+    stopped = ""
+    widest = 0
 
     for row in root.iter(f"{SHEET_NS}row"):
         if len(rows) > MAX_TABLE_ROWS_SCANNED:
-            capped = True
+            stopped = TOO_MANY_ROWS
             break
 
         placed: dict[int, tuple[str, str]] = {}
+        position = 0
 
         for cell in row.iter(f"{SHEET_NS}c"):
-            position = column_number(cell.get("r", ""))
-
-            if position:
-                placed[position] = cell_value(cell, strings, dated)
+            # The reference is optional, and writers that stream cells out in order omit it; a
+            # cell without one goes in the column after the previous cell, as Excel reads it
+            position = column_number(cell.get("r", "")) or position + 1
+            placed[position] = cell_value(cell, strings, dated)
 
         if not placed:
             continue
 
         width = max(placed)
+
+        # Every row ends up as wide as the widest, so this is what holding one more row costs
+        if (len(rows) + 1) * max(widest, width) > MAX_TABLE_CELLS:
+            stopped = (
+                f"The sheet is {count(max(widest, width), 'column')} wide, which is more than "
+                f"can be held for every row, so only the first {count(len(rows), 'row')} "
+                f"(counting the header) were read. A sheet this wide usually has a stray value "
+                f"far to the right of the table."
+            )
+            break
+
+        widest = max(widest, width)
         rows.append([placed.get(index, ("", "blank"))[0] for index in range(1, width + 1)])
         kinds.append([placed.get(index, ("", "blank"))[1] for index in range(1, width + 1)])
 
     if not rows:
-        return [], [], capped
+        return [], [], stopped
 
     # Every row is padded to the widest, because a header shorter than its data means the last
     # columns have no name rather than that the rows are ragged
@@ -1170,7 +1228,7 @@ def sheet_rows(
         row.extend([""] * (width - len(row)))
         kind.extend(["blank"] * (width - len(kind)))
 
-    return rows, kinds, capped
+    return rows, kinds, stopped
 
 
 def describe_table(work_dir: Path, filename: str, sheet: str | None = None) -> Table:
