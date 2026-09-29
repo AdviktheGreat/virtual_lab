@@ -1,10 +1,14 @@
 """Tests for getting a meeting's code out as files, safely."""
 
 import json
+import os
+import sys
+import unicodedata
 
 import pytest
 from pydantic import ValidationError
 
+import virtual_lab.artifacts as artifacts_module
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import (
     ARTIFACT_DIR_NAME,
@@ -87,6 +91,50 @@ class TestFilenameSafety:
         with pytest.raises(ValidationError, match="unique"):
             CodeArtifacts(files=[code_file("a.py"), code_file("a.py")])
 
+    @pytest.mark.parametrize(
+        "first,second",
+        [
+            ("A.py", "a.py"),
+            ("caf\u00e9.py", "cafe\u0301.py"),
+            ("./a.py", "a.py"),
+            ("src//a.py", "src/a.py"),
+            ("src/a.py/", "src/a.py"),
+            ("Stra\u00dfe.py", "strasse.py"),
+            ("A\u0345\u0301.py", "a\u0301\u0345.py"),
+        ],
+        ids=["case", "unicode normalization", "dot segment", "double slash", "trailing slash",
+             "case folding", "combining marks in another order"],
+    )
+    def test_names_for_the_same_file_on_disk_are_rejected(self, first: str, second: str) -> None:
+        # On macOS each pair names one file, so saving both would silently keep only the second
+        with pytest.raises(ValidationError, match="unique"):
+            CodeArtifacts(files=[code_file(first), code_file(second)])
+
+    def test_folding_a_normalized_name_leaves_it_normalized(self) -> None:
+        # filename_key relies on this to skip the second normalization of the caseless match
+        unnormalized = []
+
+        for code_point in range(sys.maxunicode + 1):
+            if 0xD800 <= code_point <= 0xDFFF:
+                continue
+            folded = unicodedata.normalize("NFD", chr(code_point)).casefold()
+            if unicodedata.normalize("NFD", folded) != folded:
+                unnormalized.append(f"U+{code_point:04X}")
+
+        assert unnormalized == []
+
+    @pytest.mark.parametrize(
+        "names", [("sub", "sub/x.py"), ("deep/x.py", "DEEP"), ("a/b/c.py", "a/b")]
+    )
+    def test_a_file_that_is_another_files_directory_is_rejected(self, names) -> None:
+        with pytest.raises(ValidationError, match="cannot also be a directory"):
+            CodeArtifacts(files=[code_file(name) for name in names])
+
+    def test_a_file_beside_a_directory_of_a_similar_name_is_accepted(self) -> None:
+        artifacts = CodeArtifacts(files=[code_file("sub.py"), code_file("sub/x.py")])
+
+        assert len(artifacts.files) == 2
+
 
 class TestSaveArtifacts:
     def test_files_are_written_with_their_contents(self, tmp_path) -> None:
@@ -138,6 +186,137 @@ class TestSaveArtifacts:
 
         assert not (tmp_path / "escaped.py").exists()
         assert not (tmp_path / ARTIFACT_DIR_NAME / "escaped.py").exists()
+
+    def test_a_link_left_where_a_file_goes_is_replaced_not_followed(self, tmp_path) -> None:
+        # Code from an earlier attempt can leave a link behind in the directory it was run in
+        secret = tmp_path / "outside" / "secret"
+        secret.parent.mkdir()
+        secret.write_text("untouched")
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        (base / "data.py").symlink_to(secret)
+
+        paths = save_artifacts(
+            save_dir=tmp_path / "meeting",
+            save_name="discussion",
+            artifacts=CodeArtifacts(files=[code_file("data.py", "print('new')")]),
+        )
+
+        assert secret.read_text() == "untouched"
+        assert not paths[0].is_symlink()
+        assert paths[0].read_text() == "print('new')"
+
+    def test_a_link_that_appears_after_the_check_is_not_followed(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        secret = tmp_path / "outside" / "secret"
+        secret.parent.mkdir()
+        secret.write_text("untouched")
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        (base / "data.py").symlink_to(secret)
+        # Stands in for code that creates the link between the check and the open
+        monkeypatch.setattr(artifacts_module, "is_leftover", lambda path: False)
+
+        with pytest.raises(UnsafeFilenameError, match="Cannot write"):
+            save_artifacts(
+                save_dir=tmp_path / "meeting",
+                save_name="discussion",
+                artifacts=CodeArtifacts(files=[code_file("data.py")]),
+            )
+
+        assert secret.read_text() == "untouched"
+
+    def test_a_dangling_link_does_not_create_its_target(self, tmp_path) -> None:
+        target = tmp_path / "outside" / "planted.py"
+        target.parent.mkdir()
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        (base / "data.py").symlink_to(target)
+
+        save_artifacts(
+            save_dir=tmp_path / "meeting",
+            save_name="discussion",
+            artifacts=CodeArtifacts(files=[code_file("data.py")]),
+        )
+
+        assert not target.exists()
+        assert (base / "data.py").read_text() == "print('hello')"
+
+    def test_a_pipe_left_where_a_file_goes_is_replaced_rather_than_waited_on(
+        self, tmp_path
+    ) -> None:
+        # Opening a named pipe to write blocks until something reads it, so one left by code in
+        # the sandbox would hang the next repair attempt for good
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        (base / "src").mkdir(parents=True)
+        os.mkfifo(base / "data.py")
+        os.mkfifo(base / "pipe")
+
+        save_artifacts(
+            save_dir=tmp_path / "meeting",
+            save_name="discussion",
+            artifacts=CodeArtifacts(
+                files=[code_file("data.py"), code_file("pipe/module.py")]
+            ),
+        )
+
+        assert (base / "data.py").read_text() == "print('hello')"
+        assert (base / "pipe" / "module.py").read_text() == "print('hello')"
+
+    def test_a_pipe_that_appears_after_the_check_is_not_waited_on(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        os.mkfifo(base / "data.py")
+        monkeypatch.setattr(artifacts_module, "is_leftover", lambda path: False)
+
+        with pytest.raises(UnsafeFilenameError, match="Cannot write"):
+            save_artifacts(
+                save_dir=tmp_path / "meeting",
+                save_name="discussion",
+                artifacts=CodeArtifacts(files=[code_file("data.py")]),
+            )
+
+    def test_a_link_left_where_a_directory_goes_is_replaced_not_followed(self, tmp_path) -> None:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        (base / "src").symlink_to(outside, target_is_directory=True)
+
+        save_artifacts(
+            save_dir=tmp_path / "meeting",
+            save_name="discussion",
+            artifacts=CodeArtifacts(files=[code_file("src/module.py")]),
+        )
+
+        assert list(outside.iterdir()) == []
+        assert not (base / "src").is_symlink()
+        assert (base / "src" / "module.py").read_text() == "print('hello')"
+
+    def test_a_file_that_cannot_be_written_is_reported_as_unsafe(self, tmp_path) -> None:
+        # An earlier attempt's code wrote a file where this attempt needs a directory
+        base = tmp_path / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        (base / "sub").write_text("left by the code")
+
+        with pytest.raises(UnsafeFilenameError, match="Cannot write"):
+            save_artifacts(
+                save_dir=tmp_path,
+                save_name="discussion",
+                artifacts=CodeArtifacts(files=[code_file("sub/x.py")]),
+            )
+
+    def test_the_directory_itself_is_not_a_file(self, tmp_path) -> None:
+        artifacts = CodeArtifacts.model_construct(
+            files=[CodeFile.model_construct(filename="sub/..", contents="x", language="python",
+                                            description="d")]
+        )
+
+        with pytest.raises(UnsafeFilenameError, match="outside"):
+            save_artifacts(save_dir=tmp_path, save_name="discussion", artifacts=artifacts)
 
     def test_nothing_is_written_outside_the_save_dir(self, tmp_path) -> None:
         outside = tmp_path / "outside"

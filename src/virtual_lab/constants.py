@@ -140,13 +140,30 @@ DEFAULT_PIDS_LIMIT = 256
 # is read-only and many libraries expect somewhere to write
 DEFAULT_TMPFS_SIZE = "256m"
 
-# Most output that is kept from an execution, per stream. Untrusted code can print without
-# bound, so output is spooled to disk and only the tail of it is read back.
+# Most output that is kept from an execution, per stream, in bytes. Untrusted code can print
+# without bound, so output is read as it arrives and only this much of its tail is held; none of
+# it is written to disk, where a program printing in a loop would otherwise fill the host.
 MAX_CAPTURED_OUTPUT_CHARS = 50_000
+
+# Seconds to keep reading output after a run has ended and its processes have been killed. The
+# pipes close as soon as the last writer is gone, so this only matters when something outside
+# the process group still holds one open, and then the output read so far is used.
+OUTPUT_DRAIN_TIMEOUT = 5
+
+# Largest single file code may write, in bytes, enforced by the kernel as RLIMIT_FSIZE. A loop
+# writing to a file is otherwise stopped only by a full disk, and on the local backend or the
+# sandbox's mount that disk is the host's. A gigabyte is well past the tables and embeddings an
+# analysis writes. It is a limit per file, not in total.
+MAX_WRITTEN_FILE_BYTES = 1024**3
 
 # Most output shown to an agent when it is told how its code behaved. Far smaller than what is
 # captured, because this goes into a request and is paid for by the token.
 MAX_REPORTED_OUTPUT_CHARS = 4_000
+
+# Files listed by name when a run's report says what it wrote. A script writing one file per
+# item can write tens of thousands, and 20,000 names made a 2.26 MB report; the full list stays
+# in the execution record.
+MAX_REPORTED_FILES = 50
 
 # Times code may be run before giving up, counting the first run. Every attempt past the first
 # costs another round of code generation, so this is a budget and not a limit to raise freely:

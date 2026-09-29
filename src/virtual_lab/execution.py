@@ -12,15 +12,22 @@ exists for machines without Docker, offers none of that, and has to be asked for
 
 import os
 import shutil
+import signal
 import subprocess
-import tempfile
+import threading
 import time
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Protocol
+from typing import IO, Protocol
 from uuid import uuid4
+
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None  # type: ignore[assignment]
 
 from virtual_lab.artifacts import CodeFile
 from virtual_lab.constants import (
@@ -31,7 +38,10 @@ from virtual_lab.constants import (
     DEFAULT_SANDBOX_IMAGE,
     DEFAULT_TMPFS_SIZE,
     MAX_CAPTURED_OUTPUT_CHARS,
+    MAX_REPORTED_FILES,
     MAX_REPORTED_OUTPUT_CHARS,
+    MAX_WRITTEN_FILE_BYTES,
+    OUTPUT_DRAIN_TIMEOUT,
     SANDBOX_WORK_DIR,
 )
 
@@ -138,7 +148,10 @@ class ExecutionResult:
         sections = [f"Execution {status}."]
 
         if self.produced_files:
-            sections.append("Files written:\n" + "\n".join(self.produced_files))
+            listed = list(self.produced_files[:MAX_REPORTED_FILES])
+            if (unlisted := len(self.produced_files) - len(listed)) > 0:
+                listed.append(f"... and {unlisted:,} more")
+            sections.append("Files written:\n" + "\n".join(listed))
 
         for name, stream in (("Standard output", self.stdout), ("Standard error", self.stderr)):
             sections.append(
@@ -183,25 +196,99 @@ def list_files(directory: Path) -> set[str]:
     }
 
 
-def read_tail(stream, max_chars: int = MAX_CAPTURED_OUTPUT_CHARS) -> str:
-    """Reads the end of a spooled output file.
+class OutputTail:
+    """Reads a pipe to its end in the background, keeping only the last of what came through.
 
-    Output is spooled to a file rather than held in memory because untrusted code can print
-    without bound, and only the tail is read back so that doing so cannot exhaust memory either.
+    Untrusted code can print without bound, so output is neither held whole nor spooled to a
+    file, either of which it could fill. What is dropped from the front is counted so the reader
+    can be told.
 
-    :param stream: The file object to read, positioned anywhere.
-    :param max_chars: The most characters to return.
-    :return: The decoded tail, with undecodable bytes replaced.
+    :param stream: The pipe to read. It is closed once it reaches its end.
+    :param max_bytes: The most bytes to keep.
     """
-    size = stream.seek(0, os.SEEK_END)
-    dropped = max(0, size - max_chars)
-    stream.seek(dropped)
-    text = stream.read().decode("utf-8", errors="replace")
 
-    if dropped:
-        return f"[... {dropped:,} bytes truncated ...]\n{text}"
+    def __init__(self, stream: IO[bytes], max_bytes: int = MAX_CAPTURED_OUTPUT_CHARS) -> None:
+        self.max_bytes = max_bytes
+        self.dropped = 0
+        self._tail = bytearray()
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
+        self._thread.start()
 
-    return text
+    def _read(self, stream: IO[bytes]) -> None:
+        with stream:
+            while chunk := stream.read1(65536):  # type: ignore[attr-defined]
+                with self._lock:
+                    self._tail += chunk
+                    if (excess := len(self._tail) - self.max_bytes) > 0:
+                        del self._tail[:excess]
+                        self.dropped += excess
+
+    def text(self, wait: float = OUTPUT_DRAIN_TIMEOUT) -> str:
+        """Returns the tail of the output, once the pipe has closed or the wait has run out.
+
+        :param wait: The most seconds to wait for the pipe to close.
+        :return: The decoded tail, with undecodable bytes replaced.
+        """
+        self._thread.join(wait)
+
+        with self._lock:
+            tail = bytes(self._tail)
+            dropped = self.dropped
+
+        if dropped:
+            # The cut is at a byte count, so it can fall inside a character, whose remaining
+            # bytes would decode as a replacement character at the start of the output
+            start = 0
+            while start < min(3, len(tail)) and 0x80 <= tail[start] <= 0xBF:
+                start += 1
+            text = tail[start:].decode("utf-8", errors="replace")
+
+            return f"[... {dropped + start:,} bytes truncated ...]\n{text}"
+
+        text = tail.decode("utf-8", errors="replace")
+
+        return text
+
+
+def run_bounded(
+    arguments: Sequence[str],
+    timeout: float,
+    stop: Callable[[subprocess.Popen], None],
+    **options,
+) -> tuple[int | None, bool, str, str]:
+    """Runs a command, capturing the tail of its output, and stops it once it is over.
+
+    :param arguments: The command to run.
+    :param timeout: Seconds to allow it.
+    :param stop: Called once the command has exited or run out of time, to stop anything it
+        left running. The command itself is killed afterwards if it is still running.
+    :param options: Further arguments for subprocess.Popen.
+    :return: The exit code (None on a timeout), whether it timed out, and the tails of standard
+        output and standard error.
+    """
+    process = subprocess.Popen(
+        list(arguments), stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options
+    )
+    out, err = OutputTail(process.stdout), OutputTail(process.stderr)  # type: ignore[arg-type]
+    timed_out = False
+
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        stop(process)
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+
+    # One wait for both pipes, which a process that escaped the kill can hold open together
+    deadline = time.monotonic() + OUTPUT_DRAIN_TIMEOUT
+    stdout = out.text(wait=max(0.0, deadline - time.monotonic()))
+    stderr = err.text(wait=max(0.0, deadline - time.monotonic()))
+
+    return None if timed_out else process.returncode, timed_out, stdout, stderr
 
 
 @dataclass
@@ -225,6 +312,7 @@ class DockerExecutor:
     cpu_limit: str = DEFAULT_CPU_LIMIT
     pids_limit: int = DEFAULT_PIDS_LIMIT
     tmpfs_size: str = DEFAULT_TMPFS_SIZE
+    max_file_bytes: int = MAX_WRITTEN_FILE_BYTES
     docker_command: tuple[str, ...] = ("docker",)
     _checked: bool = field(default=False, init=False, repr=False)
 
@@ -236,8 +324,18 @@ class DockerExecutor:
         :param directory: The host directory to mount as the working directory.
         :param command: The command to run inside the container.
         :param container_name: The name to give the container, so a timeout can kill it.
+        :raises ExecutionError: If the directory's path cannot be passed to --mount intact.
         :return: The full command, as an argument list.
         """
+        # --mount is parsed as a line of CSV. A comma in the path starts another field that
+        # Docker reads as an option, and a line break ends the value early, which would mount
+        # whatever directory the path's first line names.
+        if any(character in str(directory) for character in ',"\n\r'):
+            raise ExecutionError(
+                f"Cannot run code in {directory!r}: Docker cannot mount a path containing a "
+                "comma, a quote, or a line break. Save the meeting under another directory."
+            )
+
         arguments = [
             *self.docker_command,
             "run",
@@ -265,6 +363,13 @@ class DockerExecutor:
             self.cpu_limit,
             "--pids-limit",
             str(self.pids_limit),
+            # The mount is on the host's disk, so a file written without bound would fill it
+            "--ulimit",
+            f"fsize={self.max_file_bytes}",
+            # The daemon otherwise keeps its own copy of everything printed, on the host's disk,
+            # until the container is removed. Attaching to the output does not depend on it.
+            "--log-driver",
+            "none",
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -355,6 +460,7 @@ class DockerExecutor:
         :param timeout: Seconds to allow, defaulting to this executor's timeout.
         :raises DockerUnavailableError: If Docker is missing or not running.
         :raises NotADirectoryError: If the directory does not exist.
+        :raises ExecutionError: If the directory's path cannot be mounted.
         :return: What happened, whether or not the code succeeded.
         """
         self.check_available()
@@ -370,24 +476,16 @@ class DockerExecutor:
             directory=directory, command=command, container_name=container_name
         )
 
-        before = list_files(directory)
-        start = time.monotonic()
-
-        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-            try:
-                completed = subprocess.run(
-                    arguments, stdout=out, stderr=err, timeout=limit, check=False
-                )
-                exit_code: int | None = completed.returncode
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                # Killing the docker client leaves the container running, so it has to be
-                # stopped by name. It is removed on exit by --rm.
-                exit_code, timed_out = None, True
+        def stop(process: subprocess.Popen) -> None:
+            # Killing the docker client leaves the container running, so it has to be stopped
+            # by name. It is removed on exit by --rm.
+            if process.poll() is None:
                 self.kill(container_name)
 
-            duration = time.monotonic() - start
-            stdout, stderr = read_tail(out), read_tail(err)
+        before = list_files(directory)
+        start = time.monotonic()
+        exit_code, timed_out, stdout, stderr = run_bounded(arguments, timeout=limit, stop=stop)
+        duration = time.monotonic() - start
 
         return ExecutionResult(
             command=arguments,
@@ -403,14 +501,20 @@ class DockerExecutor:
     def kill(self, container_name: str) -> None:
         """Stops a container, ignoring the case where it has already stopped.
 
+        A kill that fails or hangs is ignored as well. It is only ever attempted when a run has
+        already gone wrong, and raising here would lose the result of that run.
+
         :param container_name: The name of the container to stop.
         """
-        subprocess.run(
-            [*self.docker_command, "kill", container_name],
-            capture_output=True,
-            timeout=60,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                [*self.docker_command, "kill", container_name],
+                capture_output=True,
+                timeout=60,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 # Host variables a subprocess is allowed to inherit. Everything else is dropped, most
@@ -418,21 +522,43 @@ class DockerExecutor:
 INHERITED_ENVIRONMENT_VARIABLES = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
 
 
+def kill_process_group(process: subprocess.Popen) -> None:
+    """Kills every process in the group a command was started as the leader of.
+
+    This runs after a normal exit as well as after a timeout, because a child the code sent to
+    the background is still running either way. While any member is alive the group keeps the
+    leader's id, so it cannot have been handed to another group; once none is, there is nothing
+    for the kill to find.
+
+    :param process: The command, started in a new session.
+    """
+    if not hasattr(os, "killpg"):
+        return
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 @dataclass
 class LocalExecutor:
     """Runs code directly on this machine, with no isolation whatsoever.
 
-    This is not a sandbox. Code run through it can read and write anything the calling user can,
-    reach the network, and outlast the timeout by leaving children behind. It exists so that a
-    machine without Docker is not left with no option at all, and it has to be constructed by
-    name so that nothing chooses it on a caller's behalf.
+    This is not a sandbox. Code run through it can read and write anything the calling user can
+    and reach the network. It exists so that a machine without Docker is not left with no option
+    at all, and it has to be constructed by name so that nothing chooses it on a caller's behalf.
 
-    The two protections it does offer are a wall clock timeout and a scrubbed environment, so
-    that model-authored code does not inherit the API key of the process that started it.
+    The protections it does offer are a wall clock timeout, a cap on the size of any one file it
+    writes, and a scrubbed environment, so that model-authored code does not inherit the API key
+    of the process that started it. The code runs in its own process group, which is killed when
+    the run ends, so children it started in the background do not outlive it. A child that puts
+    itself in a new session escapes that, as it would escape any cleanup short of a container.
     """
 
     timeout: float = DEFAULT_EXECUTION_TIMEOUT
     warn: bool = True
+    max_file_bytes: int = MAX_WRITTEN_FILE_BYTES
 
     def __post_init__(self) -> None:
         if self.warn:
@@ -459,6 +585,24 @@ class LocalExecutor:
 
         return environment
 
+    def limit_file_size(self) -> Callable[[], None] | None:
+        """Builds what the child runs before the code starts to cap the size of files it writes.
+
+        The hard limit is lowered as well as the soft one, so the code cannot raise it again.
+
+        :return: The function to run in the child, or None where there are no resource limits.
+        """
+        if resource is None:
+            return None
+
+        _, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+        limit = self.max_file_bytes
+
+        if hard != resource.RLIM_INFINITY:
+            limit = min(limit, hard)
+
+        return partial(resource.setrlimit, resource.RLIMIT_FSIZE, (limit, limit))
+
     def run(
         self, directory: Path, command: Sequence[str], timeout: float | None = None
     ) -> ExecutionResult:
@@ -479,24 +623,23 @@ class LocalExecutor:
         before = list_files(directory)
         start = time.monotonic()
 
-        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-            try:
-                completed = subprocess.run(
-                    list(command),
-                    cwd=directory,
-                    env=self.build_environment(),
-                    stdout=out,
-                    stderr=err,
-                    timeout=limit,
-                    check=False,
-                )
-                exit_code: int | None = completed.returncode
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                exit_code, timed_out = None, True
+        try:
+            exit_code, timed_out, stdout, stderr = run_bounded(
+                command,
+                timeout=limit,
+                stop=kill_process_group,
+                cwd=directory,
+                env=self.build_environment(),
+                start_new_session=hasattr(os, "killpg"),
+                preexec_fn=self.limit_file_size(),
+            )
+        except FileNotFoundError as error:
+            # 127 is what a shell reports for a command it cannot find, and a file in a language
+            # whose interpreter is not installed is a failed run, not a reason to stop the meeting
+            exit_code, timed_out, stdout = 127, False, ""
+            stderr = f'Cannot run "{command[0]}": it is not installed on this machine ({error}).'
 
-            duration = time.monotonic() - start
-            stdout, stderr = read_tail(out), read_tail(err)
+        duration = time.monotonic() - start
 
         return ExecutionResult(
             command=tuple(command),

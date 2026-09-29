@@ -11,12 +11,19 @@ from pathlib import Path
 
 import pytest
 
+import io
+import subprocess
+import time
+
+import virtual_lab.execution as execution
 from virtual_lab.artifacts import CodeFile
 from virtual_lab.execution import (
     DockerExecutor,
     DockerUnavailableError,
+    ExecutionError,
     ExecutionResult,
     LocalExecutor,
+    OutputTail,
     UnsupportedLanguageError,
     command_for,
     list_files,
@@ -130,6 +137,24 @@ class TestSandboxCommand:
 
         assert arguments[arguments.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
 
+    def test_the_size_of_any_file_written_is_capped(self) -> None:
+        arguments = command_of()
+
+        assert arguments[arguments.index("--ulimit") + 1] == f"fsize={1024**3}"
+
+    def test_the_daemon_keeps_no_copy_of_the_output(self) -> None:
+        arguments = command_of()
+
+        assert arguments[arguments.index("--log-driver") + 1] == "none"
+
+    @pytest.mark.parametrize(
+        "directory", ["/meeting,readonly=false", '/meet"ing', "/meeting\n/elsewhere", "/a\rb"]
+    )
+    def test_a_path_that_would_change_the_mount_is_refused(self, directory: str) -> None:
+        # --mount is parsed as CSV, so a comma in a directory name would start another option
+        with pytest.raises(ExecutionError, match="cannot mount"):
+            command_of(directory=Path(directory))
+
 
 class TestCommandForFile:
     @pytest.mark.parametrize(
@@ -214,6 +239,28 @@ class TestExecutionResult:
 
         assert "results.csv" in result.report()
 
+    def test_the_report_names_at_most_fifty_files_and_counts_the_rest(self) -> None:
+        files = tuple(f"out/{index:05}.csv" for index in range(20_000))
+        result = ExecutionResult(
+            command=(), exit_code=0, stdout="", stderr="", duration=1.0, produced_files=files
+        )
+        report = result.report()
+
+        assert "out/00049.csv" in report
+        assert "out/00050.csv" not in report
+        assert "... and 19,950 more" in report
+        assert len(report) < 5_000
+        assert len(result.to_dict()["produced_files"]) == 20_000
+
+    def test_the_report_names_every_file_when_there_are_fifty(self) -> None:
+        files = tuple(f"{index}.csv" for index in range(50))
+        result = ExecutionResult(
+            command=(), exit_code=0, stdout="", stderr="", duration=1.0, produced_files=files
+        )
+
+        assert "49.csv" in result.report()
+        assert "more" not in result.report()
+
     def test_the_report_keeps_the_end_of_a_long_traceback(self) -> None:
         # The informative part of a traceback is its last lines
         stderr = "noise\n" * 5000 + "ValueError: the real problem"
@@ -270,6 +317,90 @@ class TestDockerUnavailable:
 
     def test_is_available_does_not_raise(self) -> None:
         assert DockerExecutor(docker_command=("definitely-not-docker-xyz",)).is_available() is False
+
+    @pytest.mark.parametrize(
+        "error", [PermissionError("not executable"), subprocess.TimeoutExpired("docker", 60)]
+    )
+    def test_a_daemon_that_cannot_be_asked_is_unavailable(
+        self, tmp_path, monkeypatch, error: Exception
+    ) -> None:
+        def fail(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(execution.shutil, "which", lambda name: "/usr/local/bin/docker")
+        monkeypatch.setattr(execution.subprocess, "run", fail)
+
+        with pytest.raises(DockerUnavailableError, match="Cannot reach the Docker daemon"):
+            DockerExecutor().run(directory=tmp_path, command=("python", "./a.py"))
+
+
+def fake_docker(tmp_path: Path) -> DockerExecutor:
+    """Builds a sandbox whose docker client is a script, so the client's handling runs offline.
+
+    The script's last argument says what to do: "hang", "flood", or anything else to exit. A
+    kill is recorded in "killed" beside the script.
+    """
+    client = tmp_path / "fake_docker.py"
+    client.write_text(
+        "import pathlib, sys, time\n"
+        "here = pathlib.Path(__file__).parent\n"
+        "if sys.argv[1] == 'kill':\n"
+        "    (here / 'killed').write_text(sys.argv[2])\n"
+        "elif sys.argv[-1] == 'hang':\n"
+        "    time.sleep(60)\n"
+        "elif sys.argv[-1] == 'flood':\n"
+        "    sys.stdout.write('x' * 3_000_000 + 'the end')\n"
+    )
+    executor = DockerExecutor(docker_command=(sys.executable, str(client)))
+    executor._checked = True
+
+    return executor
+
+
+class TestDockerClient:
+    def test_a_missing_directory_is_refused(self, tmp_path) -> None:
+        with pytest.raises(NotADirectoryError):
+            fake_docker(tmp_path).run(directory=tmp_path / "nope", command=("true",))
+
+    def test_a_timeout_kills_the_container_by_name(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+
+        result = fake_docker(tmp_path).run(directory=work, command=("hang",), timeout=1)
+
+        assert result.timed_out
+        assert result.exit_code is None
+        assert result.duration < 30
+        assert (tmp_path / "killed").read_text().startswith("virtual-lab-")
+
+    def test_a_container_that_exits_is_not_killed(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+
+        result = fake_docker(tmp_path).run(directory=work, command=("exit",))
+
+        assert result.succeeded
+        assert not (tmp_path / "killed").exists()
+
+    def test_the_output_kept_is_the_tail(self, tmp_path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+
+        result = fake_docker(tmp_path).run(directory=work, command=("flood",))
+
+        assert result.stdout.endswith("the end")
+        assert "bytes truncated" in result.stdout
+        assert len(result.stdout) < 60_000
+
+    @pytest.mark.parametrize("error", [OSError("gone"), subprocess.TimeoutExpired("docker", 60)])
+    def test_a_kill_that_fails_or_hangs_is_ignored(self, monkeypatch, error: Exception) -> None:
+        # The kill only happens once a run has gone wrong, and raising would lose its result
+        def fail(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(execution.subprocess, "run", fail)
+
+        assert DockerExecutor().kill("virtual-lab-probe") is None
 
 
 class TestLocalExecutor:
@@ -336,6 +467,74 @@ class TestLocalExecutor:
     def test_a_missing_directory_is_refused(self, tmp_path) -> None:
         with pytest.raises(NotADirectoryError):
             local().run(directory=tmp_path / "nope", command=("echo", "hi"))
+
+    @pytest.mark.skipif(not hasattr(os, "killpg"), reason="POSIX only")
+    @pytest.mark.parametrize(
+        "script,timeout",
+        [("(sleep 1; touch marker) & sleep 30", 0.5), ("(sleep 1; touch marker) &", 30)],
+        ids=["after a timeout", "after a normal exit"],
+    )
+    def test_a_child_left_in_the_background_does_not_outlive_the_run(
+        self, tmp_path, script: str, timeout: float
+    ) -> None:
+        local().run(directory=tmp_path, command=("sh", "-c", script), timeout=timeout)
+        time.sleep(2)
+
+        assert not (tmp_path / "marker").exists()
+
+    def test_a_missing_interpreter_is_a_failed_run(self, tmp_path) -> None:
+        result = local().run(directory=tmp_path, command=("not-an-interpreter-xyz", "./a.r"))
+
+        assert not result.succeeded
+        assert result.exit_code == 127
+        assert "not-an-interpreter-xyz" in result.stderr
+        assert "not installed" in result.stderr
+
+    @pytest.mark.skipif(execution.resource is None, reason="POSIX only")
+    def test_a_file_past_the_size_limit_cannot_be_written(self, tmp_path) -> None:
+        (tmp_path / "script.py").write_text("open('big.bin', 'wb').write(b'x' * 1_000_000)")
+
+        result = LocalExecutor(warn=False, max_file_bytes=100_000).run(
+            directory=tmp_path, command=(sys.executable, "script.py")
+        )
+
+        assert not result.succeeded
+        assert "File too large" in result.stderr
+        assert (tmp_path / "big.bin").stat().st_size <= 100_000
+
+    @pytest.mark.skipif(execution.resource is None, reason="POSIX only")
+    def test_the_code_cannot_raise_the_size_limit(self, tmp_path) -> None:
+        (tmp_path / "script.py").write_text(
+            "import resource\n"
+            "try:\n"
+            "    resource.setrlimit(resource.RLIMIT_FSIZE, (resource.RLIM_INFINITY,) * 2)\n"
+            "except (ValueError, OSError):\n"
+            "    pass\n"
+            "print(resource.getrlimit(resource.RLIMIT_FSIZE))"
+        )
+
+        result = LocalExecutor(warn=False, max_file_bytes=100_000).run(
+            directory=tmp_path, command=(sys.executable, "script.py")
+        )
+
+        assert result.stdout.strip() == "(100000, 100000)"
+
+    @pytest.mark.skipif(execution.resource is None, reason="POSIX only")
+    def test_a_lower_limit_already_in_place_is_kept(self, monkeypatch) -> None:
+        monkeypatch.setattr(execution.resource, "getrlimit", lambda kind: (5_000, 5_000))
+
+        limit = local().limit_file_size()
+
+        assert limit.args == (execution.resource.RLIMIT_FSIZE, (5_000, 5_000))
+
+    def test_a_missing_interpreter_does_not_stop_the_meeting(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setitem(execution.LANGUAGE_TO_INTERPRETER, "r", ("not-rscript-xyz",))
+        (tmp_path / "analysis.r").write_text("print(1)")
+        file = CodeFile(filename="analysis.r", language="r", description="d", contents="print(1)")
+
+        results = run_files(directory=tmp_path, files=[file], executor=local())
+
+        assert results[0][1].exit_code == 127
 
 
 class TestRunFiles:
@@ -483,6 +682,57 @@ class TestHelpers:
 
         assert result.endswith("a" * 100)
         assert "400 characters truncated" in result
+
+    def test_output_tail_keeps_the_end_and_counts_what_it_dropped(self) -> None:
+        tail = OutputTail(io.BytesIO(b"a" * 199_000 + b"b" * 1_000), max_bytes=1_000)
+
+        assert tail.text() == "[... 199,000 bytes truncated ...]\n" + "b" * 1_000
+
+    def test_output_tail_does_not_begin_partway_through_a_character(self) -> None:
+        # 600 two-byte characters cut to 1,001 bytes starts on the second byte of one
+        tail = OutputTail(io.BytesIO("é".encode() * 600), max_bytes=1_001)
+
+        assert tail.text() == "[... 200 bytes truncated ...]\n" + "é" * 500
+
+    def test_output_left_open_by_an_escaped_process_is_waited_on_once(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # A child that leaves the process group keeps both pipes open, and each pipe waiting
+        # out the full drain time doubled how long the run took to come back
+        monkeypatch.setattr(execution, "OUTPUT_DRAIN_TIMEOUT", 1.0)
+        pid_file = tmp_path / "pid"
+        child = tmp_path / "child.py"
+        child.write_text(
+            "import os, sys, time\n"
+            "os.setsid()\n"
+            "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+            "time.sleep(10)\n"
+        )
+        parent = tmp_path / "parent.py"
+        parent.write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+        )
+
+        started = time.monotonic()
+        try:
+            execution.run_bounded(
+                [sys.executable, str(parent), str(child), str(pid_file)],
+                timeout=5,
+                stop=lambda process: None,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            for _ in range(50):
+                if pid_file.exists() and pid_file.read_text():
+                    break
+                time.sleep(0.1)
+            os.kill(int(pid_file.read_text()), 9)
+
+        assert elapsed < 1.8
+
+    def test_output_tail_keeps_short_output_whole(self) -> None:
+        assert OutputTail(io.BytesIO(b"short \xff"), max_bytes=1_000).text() == "short \ufffd"
 
     def test_list_files_is_relative_and_recursive(self, tmp_path) -> None:
         (tmp_path / "src").mkdir()

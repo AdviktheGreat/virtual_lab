@@ -190,6 +190,35 @@ class TestCodeThatIsRepaired:
         assert fake_client.completions.parse_calls[0]["response_format"] is CodeArtifacts
 
 
+class TestClient:
+    def test_a_client_is_created_when_none_is_given(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path, monkeypatch
+    ) -> None:
+        import virtual_lab.repair as repair
+
+        created = []
+
+        def create(max_retries: int) -> FakeClient:
+            created.append(max_retries)
+            return fake_client
+
+        monkeypatch.setattr(repair, "OpenAI", create)
+        fake_client.completions.parsed_responses = [parsed_response(parsed=WORKING)]
+
+        outcome = run_with_repair(
+            artifacts=BROKEN,
+            author=team_member,
+            save_dir=tmp_path,
+            executor=local(),
+            max_attempts=2,
+            max_retries=7,
+        )
+
+        assert created == [7]
+        assert outcome.succeeded
+        assert len(fake_client.completions.parse_calls) == 1
+
+
 class TestGivingUp:
     def test_the_same_error_twice_stops_the_loop(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
@@ -441,6 +470,15 @@ class TestMergingARepair:
 
         assert [file.filename for file in merged.files] == ["a.py", "b.py", "c.py"]
 
+    @pytest.mark.parametrize("returned", ["./b.py", "B.py"])
+    def test_another_name_for_the_same_file_replaces_it(self, returned: str) -> None:
+        previous = CodeArtifacts(files=[*script("a", "a.py").files, *script("b", "b.py").files])
+
+        merged = merge_artifacts(previous=previous, repaired=script("fixed", returned))
+
+        assert [file.filename for file in merged.files] == ["a.py", returned]
+        assert merged.files[1].contents == "fixed"
+
 
 class TestErrorSignature:
     def test_the_same_exception_matches(self) -> None:
@@ -462,6 +500,48 @@ class TestErrorSignature:
         second = ExecutionResult(command=(), exit_code=1, stdout="", stderr="ValueError: b", duration=1)
 
         assert error_signature(first) != error_signature(second)
+
+    @pytest.mark.parametrize(
+        "first,second",
+        [
+            ("TypeError: <Model at 0x7f3a2c1d9e50>", "TypeError: <Model at 0x10b4f2a90>"),
+            ("Error at 2025-01-02 10:11:12.345: stalled", "Error at 2025-01-02T10:11:59Z: stalled"),
+        ],
+        ids=["memory address", "timestamp"],
+    )
+    def test_what_differs_on_every_run_is_ignored(self, first: str, second: str) -> None:
+        from virtual_lab.execution import ExecutionResult
+
+        results = [
+            ExecutionResult(command=(), exit_code=1, stdout="", stderr=stderr, duration=1)
+            for stderr in (first, second)
+        ]
+
+        assert error_signature(results[0]) == error_signature(results[1])
+
+    def test_a_different_number_is_still_a_different_failure(self) -> None:
+        from virtual_lab.execution import ExecutionResult
+
+        results = [
+            ExecutionResult(command=(), exit_code=1, stdout="", stderr=stderr, duration=1)
+            for stderr in ("IndexError: index 10 is too large", "IndexError: index 20 is too large")
+        ]
+
+        assert error_signature(results[0]) != error_signature(results[1])
+
+    def test_the_same_error_at_a_new_address_stops_the_loop(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        # The address printed in a repr changes every run, which kept the loop going to the end
+        at_new_address = script(
+            "import secrets\nraise TypeError('<Model at 0x' + secrets.token_hex(6) + '>')"
+        )
+        fake_client.completions.parsed_responses = [parsed_response(parsed=at_new_address)]
+
+        outcome = run(fake_client, at_new_address, team_member, tmp_path, max_attempts=5)
+
+        assert outcome.stopped_early
+        assert outcome.num_attempts == 2
 
 
 class TestExecutionRecord:
