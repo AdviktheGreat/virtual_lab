@@ -1120,6 +1120,29 @@ class TestThePubmedToolUsesThisLayer:
 
         assert transport.requests[0]["params"]["retmax"] == 2 * MAX_PUBMED_ARTICLES
 
+    def test_every_article_asked_for_fits_in_what_the_model_is_given(
+        self, transport, monkeypatch
+    ) -> None:
+        # The tool result is capped as a whole, so an article left at full length would push
+        # every article after it out of what the model sees
+        import virtual_lab.utils as utils
+        from virtual_lab.constants import MAX_TOOL_OUTPUT_CHARS
+
+        transport.responses = [
+            FakeResponse(body=b'{"esearchresult": {"idlist": ["1", "2", "3", "4", "5", "6"]}}')
+        ]
+        monkeypatch.setattr(
+            utils,
+            "get_pubmed_central_article",
+            lambda pmcid, abstract_only: (f"Article {pmcid}", ["word " * 20_000]),
+        )
+
+        text = utils.run_pubmed_search("spike", num_articles=3)
+
+        assert len(text) <= MAX_TOOL_OUTPUT_CHARS
+        assert all(f"PMCID = {pmcid}" in text for pmcid in ("1", "2", "3"))
+        assert "PMCID = 4" not in text
+
     @pytest.mark.parametrize("num_articles", ["3", 0, True, float("nan")])
     def test_a_number_of_articles_that_is_not_a_count_is_refused(
         self, transport, num_articles

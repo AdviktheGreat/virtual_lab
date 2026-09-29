@@ -676,7 +676,14 @@ class TestSearchingForProteins:
         assert bounded(5, 25, "limit") == 5
         assert bounded(99, 25, "limit") == 25
 
-    @pytest.mark.parametrize("limit", ["5", 5.0, float("nan"), True, None, [5]])
+    def test_a_whole_number_written_as_a_float_is_accepted(self) -> None:
+        # JSON has one number type, and a model asking for 5.0 is asking for five
+        assert bounded(5.0, 25, "limit") == 5
+        assert type(bounded(5.0, 25, "limit")) is int
+
+    @pytest.mark.parametrize(
+        "limit", ["5", 5.5, float("nan"), float("inf"), True, None, [5]]
+    )
     def test_a_limit_that_is_not_a_whole_number_is_refused_clearly(self, limit) -> None:
         # A string raised TypeError from the comparison, and NaN passed it, since every
         # comparison with NaN is false

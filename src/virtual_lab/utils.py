@@ -87,10 +87,14 @@ def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = F
     :raises ValueError: If the number of articles is not a whole number of at least one.
     :return: The full text of the top matching article.
     """
-    from virtual_lab.constants import MAX_PUBMED_ARTICLES
-    from virtual_lab.records import bounded
+    from virtual_lab.constants import MAX_PUBMED_ARTICLES, MAX_TOOL_OUTPUT_CHARS
+    from virtual_lab.records import bounded, truncate_text
 
     num_articles = bounded(num_articles, MAX_PUBMED_ARTICLES, "num_articles")
+
+    # The tool result is capped as a whole, which would keep the first article and cut the rest,
+    # so each article is given an equal share, less room for the headings around them
+    article_chars = (MAX_TOOL_OUTPUT_CHARS - 1_000) // num_articles
 
     # Print search query
     print(
@@ -133,7 +137,12 @@ def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = F
         if title is None:
             continue
 
-        texts.append(f"PMCID = {pmcid}\n\nTitle = {title}\n\n{'\n\n'.join(content or [])}")
+        texts.append(
+            truncate_text(
+                f"PMCID = {pmcid}\n\nTitle = {title}\n\n{'\n\n'.join(content or [])}",
+                article_chars,
+            )
+        )
         titles.append(title)
         pmcids.append(pmcid)
 

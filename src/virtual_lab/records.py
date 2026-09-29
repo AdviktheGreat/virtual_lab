@@ -47,7 +47,11 @@ def bounded(value: int, most: int, name: str) -> int:
     """
     # The value arrives from a model's JSON, so it can be a string, a float, or a boolean, which
     # Python counts as a whole number. A string failed the comparison below with TypeError, and
-    # NaN passed it, since every comparison with NaN is false.
+    # NaN passed it, since every comparison with NaN is false. JSON has one number type, so 5.0
+    # is a model asking for five.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be a whole number, not {truncate_text(repr(value), 40)}")
 
