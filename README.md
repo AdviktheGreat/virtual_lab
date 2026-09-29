@@ -56,6 +56,36 @@ pip install -e .
 The Virtual Lab currently uses GPT-5.2 from OpenAI by default. Save your OpenAI API key as the environment variable `OPENAI_API_KEY`. For example, add `export OPENAI_API_KEY=<your_key>` to your `.bashrc` or `.bash_profile`.
 
 
+## Holding a meeting and limiting what it spends
+
+`hold_meeting` takes the same arguments as `run_meeting` and returns everything the meeting produced: the summary, the structured output if a schema was given, the usage, the provenance record, and where each was saved. `run_meeting` is kept for existing notebooks and returns only one of these.
+
+```python
+from virtual_lab import BudgetExceededError, hold_meeting
+
+try:
+    result = hold_meeting(
+        meeting_type="individual",
+        agenda="Propose three candidate epitopes.",
+        save_dir=Path("results"),
+        team_member=immunologist,
+        num_rounds=2,
+        max_cost=0.50,
+        max_completion_tokens=4_000,
+    )
+    print(result.summary, result.cost)
+except BudgetExceededError as error:
+    print(f"Stopped at ${error.spent:.2f}; the turns so far are in results/partial/")
+```
+
+- `max_cost` is checked before every request, including each tool call and the structured output, so a meeting stops before the request it has no money left for. It can overrun by at most one request, which `max_completion_tokens` bounds.
+- A limit is refused outright if any model in the meeting has no price in `virtual_lab.constants`, and a response that reports no usage stops a limited meeting with `CostUnknownError`. Either would otherwise count as free. Without a limit, `result.cost` is `None` rather than a wrong number.
+- Prices are matched exactly or to a dated snapshot of a listed model (`gpt-4o-2024-08-06`). A name that merely starts with a listed one, such as `gpt-5-pro` or `gpt-5.4`, is unpriced rather than billed at the cheaper model's rate.
+- `on_usage` is called with the running usage after every response, for a caller keeping a total across meetings. An exception it raises stops the meeting like any other failure.
+- A failed or interrupted meeting, including one stopped by its limit or by Ctrl-C, saves its turns and its record, with the usage up to that point, under `save_dir/partial/`.
+- Several models (GPT-5 and its mini, nano, and pro versions among them) refuse any temperature but their default. When the API refuses the temperature, the request is sent again without it, the model is remembered for the rest of the process, and the record lists it under `models_at_default_temperature`.
+
+
 ## Running the code that agents write
 
 Agents can write code, and the Virtual Lab can run it. Because that code is written by a model and read by nobody before it runs, it is executed in a container rather than on your machine. Install [Docker](https://docs.docker.com/get-started/get-docker/) and make sure it is running.
