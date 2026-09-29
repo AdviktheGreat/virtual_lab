@@ -128,8 +128,8 @@ class FakeCompletions:
     """Stands in for client.chat.completions, replaying queued responses."""
 
     def __init__(self) -> None:
-        self.responses: list[ChatCompletion | Exception] = []
-        self.parsed_responses: list[ParsedChatCompletion | Exception] = []
+        self.responses: list[ChatCompletion | BaseException] = []
+        self.parsed_responses: list[ParsedChatCompletion | BaseException] = []
         self.calls: list[dict[str, Any]] = []
         self.parse_calls: list[dict[str, Any]] = []
 
@@ -141,7 +141,7 @@ class FakeCompletions:
 
         response = self.responses.pop(0)
 
-        if isinstance(response, Exception):
+        if isinstance(response, BaseException):
             raise response
 
         return response
@@ -164,7 +164,7 @@ class FakeCompletions:
 
         response = self.parsed_responses.pop(0)
 
-        if isinstance(response, Exception):
+        if isinstance(response, BaseException):
             raise response
 
         return response
@@ -180,6 +180,18 @@ class FakeClient:
     @property
     def completions(self) -> FakeCompletions:
         return self.chat.completions
+
+
+@pytest.fixture(autouse=True)
+def forget_models_without_temperature() -> Any:
+    """Keeps one test's temperature refusals from changing the requests another test sees."""
+    from virtual_lab.completions import MODELS_WITHOUT_TEMPERATURE
+
+    saved = set(MODELS_WITHOUT_TEMPERATURE)
+    MODELS_WITHOUT_TEMPERATURE.clear()
+    yield
+    MODELS_WITHOUT_TEMPERATURE.clear()
+    MODELS_WITHOUT_TEMPERATURE.update(saved)
 
 
 @pytest.fixture

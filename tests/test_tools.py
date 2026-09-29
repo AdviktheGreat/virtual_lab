@@ -1,12 +1,20 @@
 """Tests for the tool registry and the tool-calling loop."""
 
 import json
+from types import SimpleNamespace
 
 import openai
 import pytest
 
 from virtual_lab.agent import Agent
-from virtual_lab.constants import ARTIFACT_DIR_NAME, MAX_TOOL_ITERATIONS, STRUCTURE_DIR_NAME
+from virtual_lab.constants import (
+    ARTIFACT_DIR_NAME,
+    MAX_TOOL_ERROR_CHARACTERS,
+    MAX_TOOL_ITERATIONS,
+    MAX_TOOL_NAME_CHARACTERS,
+    MAX_TOOL_OUTPUT_CHARS,
+    STRUCTURE_DIR_NAME,
+)
 from virtual_lab.run_meeting import run_meeting
 from test_tables import inline, row, sheet, workbook
 from virtual_lab.tables import TableError, list_data_files
@@ -108,6 +116,73 @@ class TestRunToolCalls:
         outputs, _ = run_tool_calls(call.tool_calls, (lookup_tool,))
 
         assert "Error running tool" in outputs[0]
+
+    def test_a_result_longer_than_the_cap_is_shortened_and_says_so(self) -> None:
+        tool = Tool(
+            name="big",
+            description="Returns a lot.",
+            parameters={"type": "object", "properties": {}},
+            function=lambda: "x" * 1_000_000,
+        )
+        call = tool_call_response("big").choices[0].message
+        outputs, messages = run_tool_calls(call.tool_calls, (tool,))
+
+        assert len(outputs[0]) < MAX_TOOL_OUTPUT_CHARS + 100
+        assert outputs[0].startswith("x" * MAX_TOOL_OUTPUT_CHARS)
+        assert "not shown" in outputs[0]
+        assert messages[0]["content"] == outputs[0]
+
+    def test_a_result_within_the_cap_is_returned_unchanged(self) -> None:
+        tool = Tool(
+            name="exact",
+            description="Returns exactly the cap.",
+            parameters={"type": "object", "properties": {}},
+            function=lambda: "x" * MAX_TOOL_OUTPUT_CHARS,
+        )
+        call = tool_call_response("exact").choices[0].message
+        outputs, _ = run_tool_calls(call.tool_calls, (tool,))
+
+        assert outputs == ["x" * MAX_TOOL_OUTPUT_CHARS]
+
+    def test_an_unknown_tool_name_is_not_repeated_in_full(self, lookup_tool: Tool) -> None:
+        # A model can emit a name of any length, and it was echoed back whole: 100,000 characters
+        call = tool_call_response("n" * 100_000).choices[0].message
+        outputs, _ = run_tool_calls(call.tool_calls, (lookup_tool,))
+
+        assert "unknown tool" in outputs[0]
+        assert "n" * MAX_TOOL_NAME_CHARACTERS in outputs[0]
+        assert "n" * (MAX_TOOL_NAME_CHARACTERS + 1) not in outputs[0]
+        assert "uniprot_lookup" in outputs[0]
+
+    def test_an_error_message_is_not_repeated_in_full(self) -> None:
+        def fail() -> str:
+            raise RuntimeError("e" * 100_000)
+
+        tool = Tool(
+            name="noisy",
+            description="Fails at length.",
+            parameters={"type": "object", "properties": {}},
+            function=fail,
+        )
+        call = tool_call_response("noisy").choices[0].message
+        outputs, _ = run_tool_calls(call.tool_calls, (tool,))
+
+        assert outputs[0].startswith('Error running tool "noisy": RuntimeError: eee')
+        assert len(outputs[0]) < MAX_TOOL_ERROR_CHARACTERS + 100
+
+    def test_a_tool_call_without_a_function_is_reported_to_the_model(
+        self, lookup_tool: Tool, lookup_calls: list[str]
+    ) -> None:
+        # The API defines custom tool calls, which carry their input in another field and have
+        # no function to read a name from
+        custom = SimpleNamespace(
+            id="call_9", type="custom", custom=SimpleNamespace(name="uniprot_lookup", input="x")
+        )
+        outputs, messages = run_tool_calls([custom], (lookup_tool,))
+
+        assert 'type "custom" cannot be run' in outputs[0]
+        assert messages[0]["tool_call_id"] == "call_9"
+        assert lookup_calls == []
 
 
 class TestToolLoopInMeeting:

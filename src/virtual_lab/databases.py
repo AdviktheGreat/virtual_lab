@@ -14,6 +14,7 @@ Requests go through virtual_lab.web, so the host allowlist, the rate limits, the
 the retries apply to everything here.
 """
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -24,14 +25,22 @@ from virtual_lab.constants import (
     MAX_COMMENT_CHARACTERS,
     MAX_COMMENTS_REPORTED,
     MAX_FEATURES_REPORTED,
+    MAX_ITEMS_LISTED,
     MAX_SEARCH_RESULTS,
     MAX_SEQUENCE_RESIDUES_REPORTED,
     MAX_STRUCTURE_FILE_BYTES,
+    MAX_URL_CHARACTERS,
 )
 from virtual_lab.records import (
     NO_SUCH_RECORD_STATUSES,
     RecordNotFoundError,
+    as_dict,
+    as_int,
+    as_list,
+    as_text,
     bounded,
+    listing,
+    number_or_none,
     truncate_text,
 )
 from virtual_lab.web import WebRequestError, build_url, request_json, request_text
@@ -54,6 +63,12 @@ REPORTED_FEATURE_TYPES = (
     "Glycosylation",
     "Modified residue",
     "Mutagenesis",
+)
+
+# The shape of a UniProt accession, as UniProt documents it. A downloaded prediction is named
+# after one, so it is checked before it becomes part of a file name.
+UNIPROT_ACCESSION = re.compile(
+    r"[OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9](?:[A-Z][A-Z0-9]{2}[0-9]){1,2}"
 )
 
 # Comment types worth showing, in the order they are shown
@@ -88,12 +103,13 @@ def wrap_sequence(sequence: str, width: int = 60) -> str:
 
 def first_text(comment: dict[str, Any]) -> str:
     """Returns the text of a UniProt comment, which nests it two levels down."""
-    texts = comment.get("texts") or []
+    texts = as_list(comment.get("texts"))
 
     if not texts:
         return ""
 
-    return str(texts[0].get("value", ""))
+    # Kept whole, because the report shortens each comment and would otherwise shorten it twice
+    return as_text(as_dict(texts[0]).get("value"), limit=None)
 
 
 def features_from(raw: list[dict[str, Any]]) -> tuple[tuple[str, str, str], ...]:
@@ -110,13 +126,11 @@ def features_from(raw: list[dict[str, Any]]) -> tuple[tuple[str, str, str], ...]
     """
     by_type: dict[str, list[tuple[str, str, str]]] = {kind: [] for kind in REPORTED_FEATURE_TYPES}
 
-    for feature in raw:
-        kind = str(feature.get("type", ""))
+    for feature in (item for item in raw if isinstance(item, dict)):
+        kind = as_text(feature.get("type"))
 
         if kind in by_type:
-            by_type[kind].append(
-                (kind, position_of(feature), str(feature.get("description", "")))
-            )
+            by_type[kind].append((kind, position_of(feature), as_text(feature.get("description"))))
 
     deepest = max((len(found) for found in by_type.values()), default=0)
     selected = [
@@ -131,9 +145,9 @@ def features_from(raw: list[dict[str, Any]]) -> tuple[tuple[str, str, str], ...]
 
 def position_of(feature: dict[str, Any]) -> str:
     """Describes where a feature is, as a position or a range."""
-    location = feature.get("location") or {}
-    start = (location.get("start") or {}).get("value")
-    end = (location.get("end") or {}).get("value")
+    location = as_dict(feature.get("location"))
+    start = as_int(as_dict(location.get("start")).get("value"))
+    end = as_int(as_dict(location.get("end")).get("value"))
 
     if start is None and end is None:
         return "?"
@@ -191,7 +205,7 @@ class Protein:
         ]
 
         if self.genes:
-            lines.append(f"Genes: {', '.join(self.genes)}")
+            lines.append(f"Genes: {listing(self.genes, MAX_ITEMS_LISTED)}")
 
         lines.append(
             f"Length: {self.length:,} residues"
@@ -293,10 +307,15 @@ class Chain:
     sequence: str
     copies: int
 
+    @property
+    def label(self) -> str:
+        """Names the chain by its strand identifiers, which an assembly of copies has dozens of."""
+        return listing(self.chain_ids, MAX_ITEMS_LISTED, separator="/") or self.entity_id
+
     def summary(self) -> str:
         """Renders one line describing this chain."""
         return (
-            f"  Chain {'/'.join(self.chain_ids) or self.entity_id}: {self.description or 'unnamed'}"
+            f"  Chain {self.label}: {self.description or 'unnamed'}"
             f" ({len(self.sequence):,} aa"
             f"{f', {self.copies} copies' if self.copies > 1 else ''}"
             f"{f', {self.organism}' if self.organism else ''})"
@@ -362,16 +381,15 @@ class Structure:
                 lines.append(f"  and {self.chains_not_shown} more, not fetched")
 
         if self.ligand_ids:
-            lines.append(f"\nBound components: {', '.join(self.ligand_ids)}")
+            lines.append(f"\nBound components: {listing(self.ligand_ids, MAX_ITEMS_LISTED)}")
 
         if self.pubmed_id:
             lines.append(f"Described in PubMed {self.pubmed_id}")
 
         for chain in self.chains[:MAX_CHAINS_REPORTED]:
             if chain.sequence:
-                label = "/".join(chain.chain_ids) or chain.entity_id
                 lines.append(
-                    f"\nSequence of chain {label}:\n"
+                    f"\nSequence of chain {chain.label}:\n"
                     f"{wrap_sequence(truncate_sequence(chain.sequence))}"
                 )
 
@@ -502,16 +520,20 @@ def get_protein(accession: str) -> Protein:
             f"search by name if you do not have one."
         ) from error
 
+    entry = as_dict(entry)
+
     # A withdrawn accession comes back as 200 with a stub in place of the entry, which parses
     # into a plausible looking protein of zero residues. A model proposing an accession it
     # remembers from an older paper hits this, so it has to be an error rather than a record
     if entry.get("entryType") == "Inactive":
-        reason = entry.get("inactiveReason") or {}
-        merged_into = ", ".join(str(value) for value in reason.get("mergeDemergeTo") or [])
+        reason = as_dict(entry.get("inactiveReason"))
+        merged_into = listing(
+            [as_text(value) for value in as_list(reason.get("mergeDemergeTo"))], MAX_ITEMS_LISTED
+        )
 
         raise RecordNotFoundError(
             f'UniProt entry "{accession}" is no longer active '
-            f'({str(reason.get("inactiveReasonType", "withdrawn")).lower()})'
+            f'({(as_text(reason.get("inactiveReasonType")) or "withdrawn").lower()})'
             f"{f'; it became {merged_into}' if merged_into else ''}."
         )
 
@@ -527,51 +549,58 @@ def protein_from(entry: dict[str, Any]) -> Protein:
     :param entry: The entry as UniProt returns it.
     :return: The protein record.
     """
-    description = entry.get("proteinDescription") or {}
-    recommended = (description.get("recommendedName") or {}).get("fullName") or {}
-    submitted = description.get("submissionNames") or []
-    sequence = (entry.get("sequence") or {}).get("value", "")
-    organism = entry.get("organism") or {}
+    description = as_dict(entry.get("proteinDescription"))
+    recommended = as_dict(as_dict(description.get("recommendedName")).get("fullName"))
+    submitted = as_list(description.get("submissionNames"))
+    held = as_dict(entry.get("sequence"))
+    # Not shortened, unlike every other field: the whole sequence stays on the record for code,
+    # and the report cuts it to what is worth showing
+    sequence = held.get("value") if isinstance(held.get("value"), str) else ""
+    organism = as_dict(entry.get("organism"))
 
     if recommended.get("value"):
-        name = str(recommended["value"])
+        name = as_text(recommended["value"])
     elif submitted:
-        name = str((submitted[0].get("fullName") or {}).get("value", ""))
+        name = as_text(as_dict(as_dict(submitted[0]).get("fullName")).get("value"))
     else:
         name = ""
 
     comments = tuple(
         (comment_type, first_text(comment))
         for comment_type in REPORTED_COMMENT_TYPES
-        for comment in entry.get("comments") or []
-        if comment.get("commentType") == comment_type and first_text(comment)
+        for comment in as_list(entry.get("comments"))
+        if isinstance(comment, dict)
+        and comment.get("commentType") == comment_type
+        and first_text(comment)
     )
 
-    features = features_from(entry.get("features") or [])
+    features = features_from(as_list(entry.get("features")))
 
     pdb_ids = tuple(
-        str(reference.get("id", ""))
-        for reference in entry.get("uniProtKBCrossReferences") or []
-        if reference.get("database") == "PDB" and reference.get("id")
+        as_text(reference.get("id"))
+        for reference in as_list(entry.get("uniProtKBCrossReferences"))
+        if isinstance(reference, dict)
+        and reference.get("database") == "PDB"
+        and reference.get("id")
     )
 
     return Protein(
-        accession=str(entry.get("primaryAccession", "")),
-        entry_name=str(entry.get("uniProtkbId", "")),
+        accession=as_text(entry.get("primaryAccession")),
+        entry_name=as_text(entry.get("uniProtkbId")),
         name=name,
-        organism=str(organism.get("scientificName", "")),
-        taxon_id=organism.get("taxonId"),
+        organism=as_text(organism.get("scientificName")),
+        taxon_id=as_int(organism.get("taxonId")),
         genes=tuple(
-            str((gene.get("geneName") or {}).get("value", ""))
-            for gene in entry.get("genes") or []
-            if (gene.get("geneName") or {}).get("value")
+            as_text(as_dict(gene.get("geneName")).get("value"))
+            for gene in as_list(entry.get("genes"))
+            if isinstance(gene, dict) and as_dict(gene.get("geneName")).get("value")
         ),
         sequence=sequence,
-        length=(entry.get("sequence") or {}).get("length") or len(sequence),
-        mass=(entry.get("sequence") or {}).get("molWeight"),
+        length=as_int(held.get("length")) or len(sequence),
+        mass=number_or_none(held.get("molWeight")),
         # UniProtKB/Swiss-Prot is curated; TrEMBL is not, and the difference matters when an
         # agent is about to build on an annotation
-        reviewed=entry.get("entryType", "") == "UniProtKB reviewed (Swiss-Prot)",
+        reviewed=entry.get("entryType") == "UniProtKB reviewed (Swiss-Prot)",
         comments=comments,
         features=features,
         pdb_ids=pdb_ids,
@@ -620,7 +649,9 @@ def search_proteins(
             length=protein.length,
             reviewed=protein.reviewed,
         )
-        for protein in (protein_from(result) for result in response.get("results") or [])
+        for protein in (
+            protein_from(as_dict(result)) for result in as_list(as_dict(response).get("results"))
+        )
     )
 
     return SearchResults(query=query, hits=hits)
@@ -649,8 +680,9 @@ def get_structure(pdb_id: str, include_sequences: bool = True) -> Structure:
             f'No PDB entry for "{pdb_id}". Identifiers are four characters, such as 4HHB.'
         ) from error
 
-    identifiers = entry.get("rcsb_entry_container_identifiers") or {}
-    entity_ids = tuple(str(value) for value in identifiers.get("polymer_entity_ids") or [])
+    entry = as_dict(entry)
+    identifiers = as_dict(entry.get("rcsb_entry_container_identifiers"))
+    entity_ids = tuple(as_text(value) for value in as_list(identifiers.get("polymer_entity_ids")))
     chains: tuple[Chain, ...] = ()
 
     if include_sequences and entity_ids:
@@ -663,26 +695,27 @@ def get_structure(pdb_id: str, include_sequences: bool = True) -> Structure:
         )
 
     methods = tuple(
-        str(item.get("method", "")) for item in entry.get("exptl") or [] if item.get("method")
+        as_text(item.get("method"))
+        for item in as_list(entry.get("exptl"))
+        if isinstance(item, dict) and item.get("method")
     )
-    resolutions = (entry.get("rcsb_entry_info") or {}).get("resolution_combined") or []
-    released = str((entry.get("rcsb_accession_info") or {}).get("initial_release_date", ""))
+    information = as_dict(entry.get("rcsb_entry_info"))
+    resolutions = as_list(information.get("resolution_combined"))
+    released = as_text(as_dict(entry.get("rcsb_accession_info")).get("initial_release_date"))
 
     return Structure(
         pdb_id=identifier,
-        title=str((entry.get("struct") or {}).get("title", "")),
-        method=", ".join(methods),
-        resolution=resolutions[0] if resolutions else None,
+        title=as_text(as_dict(entry.get("struct")).get("title")),
+        method=listing(methods, MAX_ITEMS_LISTED),
+        resolution=number_or_none(resolutions[0]) if resolutions else None,
         # The date carries a time and a zone that nothing here needs
         released=released.split("T")[0],
         chains=chains,
         entity_count=len(entity_ids),
         ligand_ids=tuple(
-            str(value)
-            for value in (entry.get("rcsb_entry_info") or {}).get("nonpolymer_bound_components")
-            or []
+            as_text(value) for value in as_list(information.get("nonpolymer_bound_components"))
         ),
-        pubmed_id=identifiers.get("pubmed_id"),
+        pubmed_id=as_int(identifiers.get("pubmed_id")),
     )
 
 
@@ -705,20 +738,23 @@ def get_chain(pdb_id: str, entity_id: str) -> Chain | None:
     except WebRequestError:
         return None
 
-    polymer = entity.get("entity_poly") or {}
-    described = entity.get("rcsb_polymer_entity") or {}
-    sources = entity.get("rcsb_entity_source_organism") or []
-    strand_ids = str(polymer.get("pdbx_strand_id", ""))
+    entity = as_dict(entity)
+    polymer = as_dict(entity.get("entity_poly"))
+    described = as_dict(entity.get("rcsb_polymer_entity"))
+    sources = as_list(entity.get("rcsb_entity_source_organism"))
+    strand_ids = polymer.get("pdbx_strand_id")
+    strands = strand_ids.split(",") if isinstance(strand_ids, str) else []
+    sequence = polymer.get("pdbx_seq_one_letter_code_can")
 
     return Chain(
         entity_id=str(entity_id),
-        description=str(described.get("pdbx_description", "")),
-        chain_ids=tuple(part for part in strand_ids.split(",") if part),
-        organism=str(sources[0].get("scientific_name", "")) if sources else "",
+        description=as_text(described.get("pdbx_description")),
+        chain_ids=tuple(as_text(part) for part in strands if part),
+        organism=as_text(as_dict(sources[0]).get("scientific_name")) if sources else "",
         # The canonical form spells modified residues as their standard equivalents, which is
         # what anything downstream of this expects to align against
-        sequence=str(polymer.get("pdbx_seq_one_letter_code_can", "")),
-        copies=int(described.get("pdbx_number_of_molecules") or 1),
+        sequence=sequence if isinstance(sequence, str) else "",
+        copies=as_int(described.get("pdbx_number_of_molecules")) or 1,
     )
 
 
@@ -748,27 +784,28 @@ def get_predicted_structure(accession: str) -> PredictedStructure:
     if not isinstance(predictions, list) or not predictions:
         raise RecordNotFoundError(f'No AlphaFold prediction for "{accession}".')
 
-    prediction = predictions[0]
+    prediction = as_dict(predictions[0])
     # A prediction where nothing is confidently modelled reports 0.0 for both bands, which is a
     # fact worth stating rather than a missing field. Treating it as absent hides the disordered
     # protein, which is the case a confidence figure exists for
     bands = tuple(
-        prediction.get(key)
+        band
         for key in ("fractionPlddtConfident", "fractionPlddtVeryHigh")
-        if prediction.get(key) is not None
+        if (band := number_or_none(prediction.get(key))) is not None
     )
     confident = sum(bands) if bands else None
+    sequence = prediction.get("uniprotSequence")
 
     return PredictedStructure(
-        accession=str(prediction.get("uniprotAccession", accession)),
-        name=str(prediction.get("uniprotDescription", "")),
-        organism=str(prediction.get("organismScientificName", "")),
-        sequence=str(prediction.get("uniprotSequence", "")),
-        mean_plddt=prediction.get("globalMetricValue"),
-        version=prediction.get("latestVersion"),
+        accession=as_text(prediction.get("uniprotAccession")) or accession,
+        name=as_text(prediction.get("uniprotDescription")),
+        organism=as_text(prediction.get("organismScientificName")),
+        sequence=sequence if isinstance(sequence, str) else "",
+        mean_plddt=number_or_none(prediction.get("globalMetricValue")),
+        version=as_int(prediction.get("latestVersion")),
         fraction_confident=confident,
-        pdb_url=str(prediction.get("pdbUrl", "")),
-        cif_url=str(prediction.get("cifUrl", "")),
+        pdb_url=as_text(prediction.get("pdbUrl"), limit=MAX_URL_CHARACTERS),
+        cif_url=as_text(prediction.get("cifUrl"), limit=MAX_URL_CHARACTERS),
     )
 
 
@@ -804,16 +841,32 @@ def download_structure(
             "https://files.rcsb.org/download/{name}",
             name=f"{identifier.strip().upper()}.{file_format}",
         )
+        # Named from the built URL rather than from the argument, so the name on disk is the name
+        # of the thing that was actually fetched, encoded the same way
+        name = url.rsplit("/", 1)[-1]
     elif source == "alphafold":
+        accession = identifier.strip().upper()
+
+        if not UNIPROT_ACCESSION.fullmatch(accession):
+            raise ValueError(
+                f'"{truncate_text(identifier, 40)}" is not a UniProt accession, such as P01308'
+            )
+
         # Asked for rather than assembled: the file name carries a model version, and guessing it
         # produces a URL that looks right and 404s
-        prediction = get_predicted_structure(accession=identifier)
+        prediction = get_predicted_structure(accession=accession)
         url = prediction.cif_url if file_format == "cif" else prediction.pdb_url
 
         if not url:
             raise RecordNotFoundError(
                 f'AlphaFold has no {file_format} file for "{identifier}".'
             )
+
+        # Named after the accession that was asked for, in AlphaFold's own pattern, and not after
+        # the URL. The URL comes from the response, so a file name taken from it is chosen by the
+        # service: one ending in /solve.py would overwrite the code the meeting is about to run.
+        version = f"-model_v{prediction.version}" if prediction.version else ""
+        name = f"AF-{accession}-F1{version}.{file_format}"
     else:
         raise ValueError(f'source must be "pdb" or "alphafold", not "{source}"')
 
@@ -827,10 +880,9 @@ def download_structure(
     base_dir = save_dir.resolve()
     base_dir.mkdir(parents=True, exist_ok=True)
 
-    # Named from the checked URL rather than from the argument, so the name on disk is the name of
-    # the thing that was actually fetched. Checked and re-checked after resolution anyway, the
-    # same way a meeting's own files are, because the identifier in it came from a model.
-    path = (base_dir / check_filename(url.rsplit("/", 1)[-1])).resolve()
+    # Checked and re-checked after resolution, the same way a meeting's own files are, because
+    # the identifier in the name came from a model
+    path = (base_dir / check_filename(name)).resolve()
 
     if not path.is_relative_to(base_dir):
         raise UnsafeFilenameError(f"Refusing to write {path}, which is outside {base_dir}")

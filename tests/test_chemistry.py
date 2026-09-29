@@ -881,6 +881,160 @@ class TestWhatAReportCosts:
         assert len(results.report()) < 6_000
 
 
+class TestAResponseOfTheWrongShape:
+    """A field of the wrong type is read as absent, and a long one is shortened when it is read."""
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"CID": "2244x"},
+            {"CID": float("inf")},
+            {"MolecularWeight": "heavy", "XLogP": [1.2], "Charge": {"value": 0}},
+            {"MolecularFormula": None, "InChIKey": 12},
+        ],
+    )
+    def test_a_compound_of_the_wrong_shape_still_reports(self, overrides) -> None:
+        assert compound_from(ASPIRIN_PROPERTIES | overrides).report().startswith("PubChem CID")
+
+    def test_every_field_of_a_compound_report_is_bounded(self) -> None:
+        huge = "x" * 1_000_000
+        compound = compound_from(
+            ASPIRIN_PROPERTIES
+            | {"MolecularFormula": huge, "InChIKey": huge, "XLogP": huge, "TPSA": huge},
+            title=huge,
+            description=huge,
+        )
+
+        assert len(compound.report()) < 10_000
+
+    def test_a_description_response_of_the_wrong_shape_is_no_description(
+        self, web_transport
+    ) -> None:
+        queue(
+            web_transport,
+            ASPIRIN_PROPERTY_RESPONSE,
+            {"InformationList": {"Information": ["not an object", {"Title": ["Aspirin"]}]}},
+        )
+
+        compound = get_compound("aspirin")
+
+        assert (compound.cid, compound.title, compound.description) == (2244, "", "")
+
+    def test_a_property_table_of_the_wrong_shape_is_not_a_compound(self, web_transport) -> None:
+        queue(web_transport, {"PropertyTable": {"Properties": ["not a row"]}})
+
+        with pytest.raises(RecordNotFoundError):
+            get_compound("aspirin")
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"molecule_structures": ["not an object"], "molecule_properties": "none"},
+            {"first_approval": "\u00b2", "max_phase": "nan"},
+            {"first_approval": 1950.5, "pref_name": {"en": "ASPIRIN"}},
+        ],
+    )
+    def test_a_molecule_of_the_wrong_shape_still_reports(self, overrides) -> None:
+        drug = molecule_from(ASPIRIN_MOLECULE | overrides, mechanisms=())
+
+        assert drug.report().startswith("ChEMBL")
+        assert drug.first_approval is None or isinstance(drug.first_approval, int)
+
+    def test_a_phase_that_is_not_finite_is_not_a_phase(self) -> None:
+        drug = molecule_from(ASPIRIN_MOLECULE | {"max_phase": "inf"}, mechanisms=())
+
+        assert drug.development_stage == "clinical status not recorded"
+
+    def test_every_field_of_a_drug_report_is_bounded(self, web_transport) -> None:
+        # Smaller than elsewhere, so that four mechanisms of three such fields fit in one response
+        huge = "x" * 200_000
+        mechanism = {"action_type": huge, "mechanism_of_action": huge, "target_chembl_id": huge}
+        queue(
+            web_transport,
+            ASPIRIN_MOLECULE
+            | {
+                "pref_name": huge,
+                "molecule_type": huge,
+                "molecule_properties": {"full_mwt": huge, "alogp": huge},
+                "molecule_structures": {"standard_inchi_key": huge},
+            },
+            {"mechanisms": [mechanism] * 4},
+        )
+
+        assert len(get_drug("CHEMBL25").report()) < 20_000
+
+    def test_mechanisms_of_the_wrong_shape_are_skipped(self, web_transport) -> None:
+        queue(
+            web_transport,
+            ASPIRIN_MOLECULE,
+            {"mechanisms": ["not an object", {"action_type": "INHIBITOR", "target_chembl_id": 2}]},
+        )
+
+        assert get_drug("CHEMBL25").mechanisms == (("INHIBITOR", "", "2"),)
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"molecules": ["not an object"], "page_meta": {"total_count": "many"}},
+            {"molecules": "none", "page_meta": ["x"]},
+            ["not an object"],
+        ],
+    )
+    def test_a_drug_search_of_the_wrong_shape_still_reports(self, web_transport, response) -> None:
+        queue(web_transport, response)
+
+        assert search_drugs("aspirin").report()
+
+    def test_a_target_search_of_the_wrong_shape_still_reports(self, web_transport) -> None:
+        queue(
+            web_transport,
+            {"targets": ["x", {"pref_name": "x" * 1_000_000}], "page_meta": {"total_count": 1.5}},
+        )
+
+        results = search_targets("EGFR")
+
+        assert results.total == 2
+        assert len(results.report()) < 5_000
+
+    def test_activities_of_the_wrong_shape_still_report(self, web_transport) -> None:
+        queue(
+            web_transport,
+            {
+                "activities": [
+                    "not an object",
+                    EGFR_ACTIVITY
+                    | {"document_year": "1996a", "target_pref_name": "x" * 1_000_000},
+                ],
+                "page_meta": {"total_count": "\u00b2"},
+            },
+        )
+
+        results = get_activities(target_chembl_id="CHEMBL203")
+
+        assert results.total == 2
+        assert results.activities[1].year is None
+        assert len(results.report()) < 5_000
+
+    def test_both_a_target_and_a_molecule_are_named_in_the_subject(self, web_transport) -> None:
+        queue(web_transport, {"activities": [EGFR_ACTIVITY], "page_meta": {"total_count": 1}})
+
+        results = get_activities(target_chembl_id="chembl203", molecule_chembl_id="chembl176582")
+
+        assert results.subject == "CHEMBL176582 against CHEMBL203"
+        assert web_transport.params[0]["target_chembl_id"] == "CHEMBL203"
+        assert web_transport.params[0]["molecule_chembl_id"] == "CHEMBL176582"
+
+    @pytest.mark.parametrize(
+        "phase,expected", [(0.0, "not in development"), (2.5, "phase 2.5"), (4.0, "approved")]
+    )
+    def test_a_search_hit_describes_each_phase(self, phase, expected) -> None:
+        assert f", {expected})" in DrugHit("CHEMBL1", max_phase=phase).summary()
+
+    @pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e999", 10**400])
+    def test_a_number_that_is_not_finite_is_not_a_number(self, value) -> None:
+        assert number_or_none(value) is None
+
+
 class TestAgainstTheRealDatabases:
     """Checks that the fixtures above still describe what the services send."""
 

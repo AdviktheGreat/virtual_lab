@@ -26,7 +26,11 @@ from virtual_lab.chemistry import (
 from virtual_lab.constants import (
     ARTIFACT_DIR_NAME,
     MAX_ACTIVITIES_REPORTED,
+    MAX_PUBMED_ARTICLES,
     MAX_SEARCH_RESULTS,
+    MAX_TOOL_ERROR_CHARACTERS,
+    MAX_TOOL_NAME_CHARACTERS,
+    MAX_TOOL_OUTPUT_CHARS,
     STRUCTURE_DIR_NAME,
 )
 from virtual_lab.databases import (
@@ -42,6 +46,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.records import truncate_text
 from virtual_lab.tables import describe_table, list_data_files
 from virtual_lab.utils import run_pubmed_search
 
@@ -89,7 +94,10 @@ PUBMED_TOOL = Tool(
             },
             "num_articles": {
                 "type": "integer",
-                "description": "The number of articles to return from the search query.",
+                "description": (
+                    "The number of articles to return from the search query, "
+                    f"at most {MAX_PUBMED_ARTICLES}."
+                ),
             },
             "abstract_only": {
                 "type": "boolean",
@@ -797,20 +805,33 @@ def run_tool_calls(
     tool_messages: list[ChatCompletionMessageParam] = []
 
     for tool_call in tool_calls:
-        name = tool_call.function.name
+        function = getattr(tool_call, "function", None)
+        # Every tool here is a function, but the API also defines custom tool calls, which carry
+        # their input in a different field and have no function to read a name from
+        name = str(getattr(function, "name", ""))
+        shown = truncate_text(name, MAX_TOOL_NAME_CHARACTERS)
         tool = name_to_tool.get(name)
 
-        if tool is None:
+        if function is None:
+            kind = truncate_text(
+                str(getattr(tool_call, "type", "unknown")), MAX_TOOL_NAME_CHARACTERS
+            )
+            output = f'Error: a tool call of type "{kind}" cannot be run; only function calls can.'
+            print(output)
+        elif tool is None:
             available = ", ".join(sorted(name_to_tool)) or "none"
-            output = f'Error: unknown tool "{name}". Available tools: {available}.'
+            output = f'Error: unknown tool "{shown}". Available tools: {available}.'
             print(output)
         else:
             try:
-                arguments = json.loads(tool_call.function.arguments)
+                arguments = json.loads(function.arguments)
                 output = str(tool.function(**arguments))
             except Exception as e:
-                output = f'Error running tool "{name}": {type(e).__name__}: {e}'
+                problem = truncate_text(f"{type(e).__name__}: {e}", MAX_TOOL_ERROR_CHARACTERS)
+                output = f'Error running tool "{shown}": {problem}'
                 print(output)
+
+        output = truncate_text(output, MAX_TOOL_OUTPUT_CHARS)
 
         tool_outputs.append(output)
         tool_messages.append(
