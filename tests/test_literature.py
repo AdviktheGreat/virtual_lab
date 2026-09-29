@@ -33,13 +33,12 @@ from virtual_lab.literature import (
     collapse,
     get_article,
     get_article_text,
-    parse_xml,
     preprint_from,
     search_articles,
     search_preprints,
     yes,
 )
-from virtual_lab.records import RecordNotFoundError
+from virtual_lab.records import RecordNotFoundError, parse_xml
 from virtual_lab.web import WebRequestError
 
 live_only = pytest.mark.skipif(
@@ -509,19 +508,19 @@ class TestRefusingAnUnsafeDocument:
         )
 
         with pytest.raises(WebRequestError, match="document type"):
-            parse_xml(bomb)
+            parse_xml(bomb, WebRequestError)
 
     def test_the_check_does_not_depend_on_how_the_declaration_is_written(self) -> None:
         with pytest.raises(WebRequestError, match="document type"):
-            parse_xml('<?xml version="1.0"?>\n  <!doctype feed []>\n<feed/>')
+            parse_xml('<?xml version="1.0"?>\n  <!doctype feed []>\n<feed/>', WebRequestError)
 
     def test_an_ordinary_document_is_parsed(self) -> None:
-        assert parse_xml("<feed><entry/></feed>").tag == "feed"
+        assert parse_xml("<feed><entry/></feed>", WebRequestError).tag == "feed"
 
     def test_something_that_is_not_xml_is_a_request_error(self) -> None:
         # Not a ParseError escaping, which would bypass every caller's handling
         with pytest.raises(WebRequestError, match="not usable XML"):
-            parse_xml("<html>a service error page</html>>")
+            parse_xml("<html>a service error page</html>>", WebRequestError)
 
 
 class TestWhatArxivIsActuallyAsked:
@@ -660,7 +659,7 @@ class TestSearchingArxiv:
 class TestReadingAPreprintRecord:
     def entry(self, feed=ARXIV_FEED):
         """Parses the one entry in a feed."""
-        root = parse_xml(feed)
+        root = parse_xml(feed, WebRequestError)
 
         return preprint_from(root.find("{http://www.w3.org/2005/Atom}entry"))
 

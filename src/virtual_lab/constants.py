@@ -266,3 +266,51 @@ SKIPPED_SECTION_TITLES = (
     "ethics",
     "abbreviation",
 )
+
+# Most bytes to read from a data file. Large enough for the supplementary table of a genomics
+# paper and small enough that a file left in the working directory by mistake cannot exhaust
+# memory. Counted against what is actually read rather than the size on disk, because a
+# spreadsheet is a zip archive and what it claims to hold is written inside it.
+MAX_TABLE_BYTES = 50_000_000
+
+# Rows to read before answering with what has been seen. Reading every row of a million-row file
+# to report five example values is time spent for nothing, and the answer is the same. The report
+# says when it stopped early, since "20 missing values" means something different in a file that
+# was read to the end.
+MAX_TABLE_ROWS_SCANNED = 50_000
+
+# Columns to describe. A wide matrix of per-sample measurements runs to thousands, and a line
+# each would be the whole context window for a file whose shape is the same in every column.
+MAX_COLUMNS_REPORTED = 40
+
+# Whole rows to show under the column descriptions, and how many columns of each. A few aligned
+# rows show how the columns line up, which a per-column summary cannot, and are how a header on
+# the wrong row gets noticed. Wide enough to see that and no wider: the rows are shown on one
+# line each, and a hundred columns of them is a wall.
+MAX_SAMPLE_ROWS = 4
+MAX_SAMPLE_COLUMNS = 8
+
+# Distinct values of one column to show, and how much of any single cell. A free text notes
+# column holds paragraphs, and three of them would crowd out every other column in the file.
+MAX_COLUMN_EXAMPLES = 4
+MAX_CELL_CHARACTERS = 120
+
+# Distinct values to track per column. Only used to say whether a column is an identifier or a
+# handful of repeated categories, so the count stops mattering long before this.
+MAX_DISTINCT_TRACKED = 1_000
+
+# Files to list for one working directory, and how deep to look. A directory holding more than
+# this is not a project's data, and the point is to tell an agent what it can open.
+MAX_DATA_FILES_LISTED = 60
+
+# Suffixes read as delimited text, and as spreadsheets. Anything else is refused by name rather
+# than sniffed, since guessing at the format of a file that was not meant to be a table produces
+# a confident description of nothing.
+DELIMITED_SUFFIXES = (".csv", ".tsv", ".tab", ".txt")
+SPREADSHEET_SUFFIXES = (".xlsx", ".xlsm")
+
+# Entries to read from a spreadsheet archive, and the most bytes to unpack from any one of them.
+# A 204 KB zip can declare a 200 MB member, which was measured rather than supposed, so the cap
+# is on the bytes taken out rather than on the size the archive claims.
+MAX_ARCHIVE_ENTRIES = 256
+MAX_SHEET_BYTES = 30_000_000

@@ -8,12 +8,15 @@ import pytest
 from virtual_lab.agent import Agent
 from virtual_lab.constants import ARTIFACT_DIR_NAME, MAX_TOOL_ITERATIONS, STRUCTURE_DIR_NAME
 from virtual_lab.run_meeting import run_meeting
+from test_tables import inline, row, sheet, workbook
+from virtual_lab.tables import TableError, list_data_files
 from virtual_lab.tools import (
     DATABASE_TOOLS,
     PUBMED_TOOL,
     TOOL_REGISTRY,
     Tool,
     all_tools,
+    data_file_tools,
     run_tool_calls,
     structure_file_tool,
     tools_for,
@@ -506,3 +509,102 @@ class TestTheStructureDownloadTool:
 
         assert "Error running tool" in outputs[0]
         assert messages[0]["role"] == "tool"
+
+
+class TestTheDataFileTools:
+    def test_the_directory_is_not_something_a_model_chooses(self, tmp_path) -> None:
+        # A directory a model can name is a directory a model can name /etc in
+        for tool in data_file_tools(tmp_path):
+            assert "work_dir" not in tool.parameters["properties"]
+            assert "work_dir" not in json.dumps(tool.definition)
+
+    def test_the_listing_takes_no_arguments_at_all(self, tmp_path) -> None:
+        listing = data_file_tools(tmp_path)[0]
+
+        assert listing.name == "data_files"
+        assert listing.parameters["properties"] == {}
+        assert listing.function() == list_data_files(tmp_path).report()
+
+    def test_only_the_filename_is_required(self, tmp_path) -> None:
+        inspection = data_file_tools(tmp_path)[1]
+
+        assert inspection.name == "inspect_data_file"
+        assert inspection.parameters["required"] == ["filename"]
+        assert set(inspection.parameters["properties"]) == {"filename", "sheet"}
+
+    def test_the_bound_directory_is_the_one_read(self, tmp_path) -> None:
+        inside = tmp_path / "inside"
+        inside.mkdir()
+        (inside / "data.csv").write_text("gene,n\nTP53,1\n")
+        (tmp_path / "outside.csv").write_text("secret,n\nx,1\n")
+
+        listing, inspection = data_file_tools(inside)
+
+        assert "data.csv" in listing.function()
+        assert "outside.csv" not in listing.function()
+        assert "2 columns" in inspection.function(filename="data.csv")
+
+    def test_a_path_out_of_the_directory_comes_back_as_an_error_not_a_crash(
+        self, tmp_path
+    ) -> None:
+        inspection = data_file_tools(tmp_path)[1]
+
+        class Call:
+            id = "call_1"
+            function = type(
+                "F",
+                (),
+                {
+                    "name": "inspect_data_file",
+                    "arguments": '{"filename": "../../etc/passwd"}',
+                },
+            )()
+
+        outputs, messages = run_tool_calls([Call()], (inspection,))
+
+        assert "Error running tool" in outputs[0]
+        assert "UnsafeFilenameError" in outputs[0]
+        assert messages[0]["role"] == "tool"
+
+    def test_they_are_left_out_when_there_is_nowhere_to_read(self) -> None:
+        names = {tool.name for tool in all_tools()}
+
+        assert "data_files" not in names
+        assert "inspect_data_file" not in names
+
+    def test_they_read_the_directory_the_sandbox_runs_in(self, tmp_path) -> None:
+        work_dir = tmp_path / ARTIFACT_DIR_NAME / "meeting"
+        work_dir.mkdir(parents=True)
+        (work_dir / "results.csv").write_text("gene,n\nTP53,1\n")
+
+        listing = [
+            t for t in all_tools(save_dir=tmp_path, save_name="meeting") if t.name == "data_files"
+        ][0]
+
+        assert "results.csv" in listing.function()
+
+    def test_a_sheet_can_be_named_and_reaches_the_reader(self, tmp_path) -> None:
+        # Against a workbook that really opens, so that the argument has somewhere to arrive.
+        # A fixture that fails at the archive never reaches the point of choosing a sheet.
+        inspection = data_file_tools(tmp_path)[1]
+        (tmp_path / "book.xlsx").write_bytes(
+            workbook(
+                {
+                    "First": sheet(row(1, inline("A1", "one"))),
+                    "Second": sheet(row(1, inline("A1", "two"))),
+                }
+            )
+        )
+
+        # By the column headings, since both reports name both sheets either way
+        assert "1. two" in inspection.function(filename="book.xlsx", sheet="Second")
+        assert "1. one" in inspection.function(filename="book.xlsx")
+
+    def test_naming_a_sheet_that_is_not_there_says_which_ones_are(self, tmp_path) -> None:
+        inspection = data_file_tools(tmp_path)[1]
+        (tmp_path / "book.xlsx").write_bytes(
+            workbook({"First": sheet(row(1, inline("A1", "one")))})
+        )
+
+        with pytest.raises(TableError, match="First"):
+            inspection.function(filename="book.xlsx", sheet="Missing")

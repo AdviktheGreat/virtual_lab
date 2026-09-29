@@ -1,10 +1,14 @@
-"""What every database lookup needs, whatever it is looking up.
+"""What every lookup needs, whatever it is looking up.
 
-Each database gets its own module, because the shape of a protein record has nothing to do with
+Each source gets its own module, because the shape of a protein record has nothing to do with
 the shape of a compound record and combining them only makes both harder to read. What they do
-share is how a failure is classified and how a field too long to send is shortened, and those
-belong in one place so that a missing record means the same thing whichever service was asked.
+share is how a failure is classified, how a field too long to send is shortened, and how a
+document written elsewhere is parsed, and those belong in one place so that a missing record
+means the same thing whichever service was asked.
 """
+
+import re
+import xml.etree.ElementTree as ElementTree
 
 
 # Statuses that mean "there is no such record", as opposed to "the service could not answer".
@@ -52,3 +56,28 @@ def truncate_text(text: str, limit: int) -> str:
         return text
 
     return f"{text[:limit]}... ({len(text) - limit:,} of {len(text):,} characters not shown)"
+
+
+def parse_xml(body: str, error: type[Exception], subject: str = "response") -> ElementTree.Element:
+    """Parses XML from elsewhere, refusing a document that declares entities.
+
+    ElementTree resolves internal entities, and a document declaring a few nested ones expands to
+    whatever size its author chose while the parser holds the result in memory. It is not a
+    theoretical concern: the parser here does expand them, which was checked rather than assumed.
+    Nothing this library parses has any reason to carry a DOCTYPE, so the declaration is refused
+    outright instead of the expansion being bounded.
+
+    :param body: The document.
+    :param error: The exception to raise, so that a caller sees a failure of the kind it handles
+        rather than one belonging to another module.
+    :param subject: What the document is, for the message.
+    :raises error: If the body declares a document type, or is not XML.
+    :return: The root element.
+    """
+    if re.search(r"<!DOCTYPE", body[:4096], re.IGNORECASE):
+        raise error(f"Refusing to parse a {subject} that declares a document type")
+
+    try:
+        return ElementTree.fromstring(body)
+    except ElementTree.ParseError as problem:
+        raise error(f"The {subject} was not usable XML: {problem}") from problem
