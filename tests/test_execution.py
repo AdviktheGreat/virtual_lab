@@ -688,6 +688,49 @@ class TestHelpers:
 
         assert tail.text() == "[... 199,000 bytes truncated ...]\n" + "b" * 1_000
 
+    def test_output_tail_does_not_begin_partway_through_a_character(self) -> None:
+        # 600 two-byte characters cut to 1,001 bytes starts on the second byte of one
+        tail = OutputTail(io.BytesIO("é".encode() * 600), max_bytes=1_001)
+
+        assert tail.text() == "[... 200 bytes truncated ...]\n" + "é" * 500
+
+    def test_output_left_open_by_an_escaped_process_is_waited_on_once(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # A child that leaves the process group keeps both pipes open, and each pipe waiting
+        # out the full drain time doubled how long the run took to come back
+        monkeypatch.setattr(execution, "OUTPUT_DRAIN_TIMEOUT", 1.0)
+        pid_file = tmp_path / "pid"
+        child = tmp_path / "child.py"
+        child.write_text(
+            "import os, sys, time\n"
+            "os.setsid()\n"
+            "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+            "time.sleep(10)\n"
+        )
+        parent = tmp_path / "parent.py"
+        parent.write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+        )
+
+        started = time.monotonic()
+        try:
+            execution.run_bounded(
+                [sys.executable, str(parent), str(child), str(pid_file)],
+                timeout=5,
+                stop=lambda process: None,
+            )
+            elapsed = time.monotonic() - started
+        finally:
+            for _ in range(50):
+                if pid_file.exists() and pid_file.read_text():
+                    break
+                time.sleep(0.1)
+            os.kill(int(pid_file.read_text()), 9)
+
+        assert elapsed < 1.8
+
     def test_output_tail_keeps_short_output_whole(self) -> None:
         assert OutputTail(io.BytesIO(b"short \xff"), max_bytes=1_000).text() == "short \ufffd"
 

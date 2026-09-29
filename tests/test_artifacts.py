@@ -1,6 +1,7 @@
 """Tests for getting a meeting's code out as files, safely."""
 
 import json
+import os
 import sys
 import unicodedata
 
@@ -215,7 +216,7 @@ class TestSaveArtifacts:
         base.mkdir(parents=True)
         (base / "data.py").symlink_to(secret)
         # Stands in for code that creates the link between the check and the open
-        monkeypatch.setattr(artifacts_module.Path, "is_symlink", lambda self: False)
+        monkeypatch.setattr(artifacts_module, "is_leftover", lambda path: False)
 
         with pytest.raises(UnsafeFilenameError, match="Cannot write"):
             save_artifacts(
@@ -241,6 +242,42 @@ class TestSaveArtifacts:
 
         assert not target.exists()
         assert (base / "data.py").read_text() == "print('hello')"
+
+    def test_a_pipe_left_where_a_file_goes_is_replaced_rather_than_waited_on(
+        self, tmp_path
+    ) -> None:
+        # Opening a named pipe to write blocks until something reads it, so one left by code in
+        # the sandbox would hang the next repair attempt for good
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        (base / "src").mkdir(parents=True)
+        os.mkfifo(base / "data.py")
+        os.mkfifo(base / "pipe")
+
+        save_artifacts(
+            save_dir=tmp_path / "meeting",
+            save_name="discussion",
+            artifacts=CodeArtifacts(
+                files=[code_file("data.py"), code_file("pipe/module.py")]
+            ),
+        )
+
+        assert (base / "data.py").read_text() == "print('hello')"
+        assert (base / "pipe" / "module.py").read_text() == "print('hello')"
+
+    def test_a_pipe_that_appears_after_the_check_is_not_waited_on(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        base = tmp_path / "meeting" / ARTIFACT_DIR_NAME / "discussion"
+        base.mkdir(parents=True)
+        os.mkfifo(base / "data.py")
+        monkeypatch.setattr(artifacts_module, "is_leftover", lambda path: False)
+
+        with pytest.raises(UnsafeFilenameError, match="Cannot write"):
+            save_artifacts(
+                save_dir=tmp_path / "meeting",
+                save_name="discussion",
+                artifacts=CodeArtifacts(files=[code_file("data.py")]),
+            )
 
     def test_a_link_left_where_a_directory_goes_is_replaced_not_followed(self, tmp_path) -> None:
         outside = tmp_path / "outside"

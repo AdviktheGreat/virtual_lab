@@ -6,6 +6,7 @@ input. Everything here treats them that way.
 """
 
 import os
+import stat
 import unicodedata
 from collections import Counter
 from pathlib import Path, PurePosixPath
@@ -185,6 +186,24 @@ def save_artifacts(save_dir: Path, save_name: str, artifacts: CodeArtifacts) -> 
     return tuple(written)
 
 
+def is_leftover(path: Path) -> bool:
+    """Whether a path holds something other than a file or directory, such as a link or a pipe.
+
+    Code run in the directory can leave any of these behind. A link would be followed out of the
+    directory, and a named pipe blocks whoever opens it for writing until something reads it,
+    which nothing will.
+
+    :param path: The path to look at, without following it.
+    :return: Whether what is there should be removed before writing.
+    """
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return False
+
+    return not (stat.S_ISDIR(mode) or stat.S_ISREG(mode))
+
+
 def write_inside(base_dir: Path, path: Path, contents: str) -> None:
     """Writes a file under a directory without following any symbolic link on the way.
 
@@ -197,15 +216,22 @@ def write_inside(base_dir: Path, path: Path, contents: str) -> None:
 
     for part in path.relative_to(base_dir).parts[:-1]:
         current = current / part
-        if current.is_symlink():
+        if is_leftover(current):
             current.unlink()
         current.mkdir(exist_ok=True)
 
-    if path.is_symlink():
+    if is_leftover(path):
         path.unlink()
 
-    # O_NOFOLLOW makes the open fail rather than follow a link created since the check above
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    # O_NOFOLLOW makes the open fail rather than follow a link created since the check above, and
+    # O_NONBLOCK makes it fail rather than wait on a pipe; neither changes writing a plain file
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_TRUNC
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
 
     with open(os.open(path, flags, 0o666), "w") as f:
         f.write(contents)

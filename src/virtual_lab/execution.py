@@ -233,11 +233,20 @@ class OutputTail:
         self._thread.join(wait)
 
         with self._lock:
-            text = self._tail.decode("utf-8", errors="replace")
+            tail = bytes(self._tail)
             dropped = self.dropped
 
         if dropped:
-            return f"[... {dropped:,} bytes truncated ...]\n{text}"
+            # The cut is at a byte count, so it can fall inside a character, whose remaining
+            # bytes would decode as a replacement character at the start of the output
+            start = 0
+            while start < min(3, len(tail)) and 0x80 <= tail[start] <= 0xBF:
+                start += 1
+            text = tail[start:].decode("utf-8", errors="replace")
+
+            return f"[... {dropped + start:,} bytes truncated ...]\n{text}"
+
+        text = tail.decode("utf-8", errors="replace")
 
         return text
 
@@ -274,7 +283,12 @@ def run_bounded(
             process.kill()
         process.wait()
 
-    return None if timed_out else process.returncode, timed_out, out.text(), err.text()
+    # One wait for both pipes, which a process that escaped the kill can hold open together
+    deadline = time.monotonic() + OUTPUT_DRAIN_TIMEOUT
+    stdout = out.text(wait=max(0.0, deadline - time.monotonic()))
+    stderr = err.text(wait=max(0.0, deadline - time.monotonic()))
+
+    return None if timed_out else process.returncode, timed_out, stdout, stderr
 
 
 @dataclass
