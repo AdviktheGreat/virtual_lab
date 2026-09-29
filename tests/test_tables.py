@@ -25,6 +25,7 @@ from virtual_lab.constants import (
     MAX_COLUMN_EXAMPLES,
     MAX_COLUMNS_REPORTED,
     MAX_DATA_FILES_LISTED,
+    MAX_DISTINCT_TRACKED,
     MAX_SAMPLE_COLUMNS,
     MAX_SAMPLE_ROWS,
     MAX_SHEET_BYTES,
@@ -79,6 +80,7 @@ def workbook(
     formats: list[str] | None = None,
     custom: str = "",
     padding: int = 0,
+    compression: int = zipfile.ZIP_DEFLATED,
 ) -> bytes:
     """Assembles a spreadsheet.
 
@@ -87,11 +89,12 @@ def workbook(
     :param formats: A number format id per cell style, so a test can make a cell a date.
     :param custom: Extra <numFmt> entries, for a format the file has to define itself.
     :param padding: Extra members, for the archive size limit.
+    :param compression: Stored rather than deflated when a test needs to edit a member's bytes.
     :return: The file's bytes.
     """
     buffer = io.BytesIO()
 
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(buffer, "w", compression) as archive:
         entries = []
         relationships = []
 
@@ -615,6 +618,17 @@ class TestListingWhatIsThere:
 
         assert list_data_files(tmp_path).files == ()
 
+    def test_what_is_inside_a_hidden_directory_is_left_out_too(self, tmp_path) -> None:
+        # Checking the filename alone lists .git and .venv, which are not the project's data
+        write(tmp_path, ".git/config", "[core]\n")
+        write(tmp_path, ".venv/lib/packages.csv", "name,version\nrequests,2\n")
+        write(tmp_path, "results/deep/.cache/notes.csv", "a,b\n1,2\n")
+        write(tmp_path, "results/real.csv", "gene,n\nTP53,1\n")
+
+        assert [found.name for found in list_data_files(tmp_path).files] == [
+            str(Path("results/real.csv"))
+        ]
+
     def test_a_link_pointing_out_of_the_directory_is_not_listed(self, tmp_path) -> None:
         outside = tmp_path.parent / "outside.csv"
         outside.write_text("secret,value\na,1\n")
@@ -1043,6 +1057,19 @@ class TestRefusingAnUnsafeWorkbook:
             describe_table(tmp_path, "hollow.xlsx")
 
 
+    def test_a_member_that_will_not_unpack_is_reported_as_a_table_problem(self, tmp_path) -> None:
+        # zipfile.BadZipFile derives straight from Exception, so catching OSError misses the
+        # commonest way a workbook fails: a member whose bytes no longer match their checksum
+        body = sheet(row(1, inline("A1", "gene")))
+        raw = bytearray(workbook({"Results": body}, compression=zipfile.ZIP_STORED))
+        at = raw.find(b"<worksheet")
+        raw[at + 1] = ord("X")
+        write(tmp_path, "book.xlsx", bytes(raw))
+
+        with pytest.raises(TableError, match="could not be read"):
+            describe_table(tmp_path, "book.xlsx")
+
+
 class TestWhatAReportCosts:
     """Every part of the report is bounded, because a data file has no size limit."""
 
@@ -1139,6 +1166,39 @@ class TestWhatAReportCosts:
         write(tmp_path, "narrow.csv", "a,b\n1,2\n")
 
         assert describe_table(tmp_path, "narrow.csv").sample[0] == ("1", "2")
+
+    def test_a_column_with_too_many_different_values_says_the_count_is_a_floor(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("virtual_lab.tables.MAX_DISTINCT_TRACKED", 3)
+        write(tmp_path, "ids.csv", "id\na\nb\nc\nd\ne\n")
+        column = describe_table(tmp_path, "ids.csv").columns[0]
+
+        assert column.distinct == 3
+        assert column.counted_all is False
+        assert "over 3" in column.describe()
+
+    def test_a_column_inside_the_limit_says_the_count_is_exact(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("virtual_lab.tables.MAX_DISTINCT_TRACKED", 3)
+        write(tmp_path, "ids.csv", "id\na\nb\na\n")
+        column = describe_table(tmp_path, "ids.csv").columns[0]
+
+        assert column.distinct == 2
+        assert column.counted_all is True
+        assert "over" not in column.describe()
+
+    def test_a_file_too_long_with_no_line_ending_in_it_says_so(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Cutting back to a line ending when there is none leaves nothing, and the file would
+        # otherwise be reported as a preamble of comments with no table under it
+        monkeypatch.setattr("virtual_lab.tables.MAX_TABLE_BYTES", 40)
+        write(tmp_path, "one.csv", "a," * 200)
+
+        with pytest.raises(TableError, match="no line ending"):
+            describe_table(tmp_path, "one.csv")
 
     def test_only_a_few_whole_rows_are_shown(self, tmp_path) -> None:
         rows = "\n".join(f"g{index},{index}" for index in range(50))

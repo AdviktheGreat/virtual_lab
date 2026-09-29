@@ -8,6 +8,7 @@ import pytest
 from virtual_lab.agent import Agent
 from virtual_lab.constants import ARTIFACT_DIR_NAME, MAX_TOOL_ITERATIONS, STRUCTURE_DIR_NAME
 from virtual_lab.run_meeting import run_meeting
+from test_tables import inline, row, sheet, workbook
 from virtual_lab.tables import TableError, list_data_files
 from virtual_lab.tools import (
     DATABASE_TOOLS,
@@ -583,8 +584,27 @@ class TestTheDataFileTools:
         assert "results.csv" in listing.function()
 
     def test_a_sheet_can_be_named_and_reaches_the_reader(self, tmp_path) -> None:
+        # Against a workbook that really opens, so that the argument has somewhere to arrive.
+        # A fixture that fails at the archive never reaches the point of choosing a sheet.
         inspection = data_file_tools(tmp_path)[1]
-        (tmp_path / "book.xlsx").write_bytes(b"not a spreadsheet")
+        (tmp_path / "book.xlsx").write_bytes(
+            workbook(
+                {
+                    "First": sheet(row(1, inline("A1", "one"))),
+                    "Second": sheet(row(1, inline("A1", "two"))),
+                }
+            )
+        )
 
-        with pytest.raises(TableError, match="not a readable spreadsheet"):
-            inspection.function(filename="book.xlsx", sheet="Results")
+        # By the column headings, since both reports name both sheets either way
+        assert "1. two" in inspection.function(filename="book.xlsx", sheet="Second")
+        assert "1. one" in inspection.function(filename="book.xlsx")
+
+    def test_naming_a_sheet_that_is_not_there_says_which_ones_are(self, tmp_path) -> None:
+        inspection = data_file_tools(tmp_path)[1]
+        (tmp_path / "book.xlsx").write_bytes(
+            workbook({"First": sheet(row(1, inline("A1", "one")))})
+        )
+
+        with pytest.raises(TableError, match="First"):
+            inspection.function(filename="book.xlsx", sheet="Missing")

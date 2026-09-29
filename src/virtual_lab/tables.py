@@ -745,7 +745,15 @@ def read_delimited(path: Path, name: str) -> Table:
         # Cut back to a line ending rather than to the byte. A multi-byte character split down
         # the middle is not valid UTF-8, and the file would be reported as cp1252 on the
         # strength of one truncated character that was never in it.
-        raw = raw[: raw[:MAX_TABLE_BYTES].rfind(b"\n") + 1]
+        ended = raw[:MAX_TABLE_BYTES].rfind(b"\n")
+
+        if ended < 0:
+            raise TableError(
+                f'The first {MAX_TABLE_BYTES:,} bytes of "{name}" hold no line ending, so '
+                f"there is no row in it to read. Whatever this file is, it is not a table."
+            )
+
+        raw = raw[: ended + 1]
 
     text, encoding, mark = decode(raw)
     text, commented = skip_preamble(text)
@@ -865,6 +873,12 @@ def entry_text(archive: zipfile.ZipFile, name: str) -> str:
             raw = member.read(MAX_SHEET_BYTES + 1)
     except KeyError as problem:
         raise TableError(f"This spreadsheet is missing {name}") from problem
+    except (zipfile.BadZipFile, EOFError, OSError, ValueError, NotImplementedError) as problem:
+        # A bad checksum, a truncated member, or a compression method this build of Python does
+        # not have. All of them mean the same thing to a caller, and none of them should arrive
+        # as a zipfile exception from a function that promises a TableError. BadZipFile is named
+        # on its own because it derives straight from Exception rather than from OSError.
+        raise TableError(f"{name} in this spreadsheet could not be read: {problem}") from problem
 
     if len(raw) > MAX_SHEET_BYTES:
         raise TableError(
@@ -1249,7 +1263,13 @@ def list_data_files(work_dir: Path) -> DataFiles:
     found = []
 
     for path in sorted(base.rglob("*")):
-        if not path.is_file() or path.name.startswith("."):
+        if not path.is_file():
+            continue
+
+        # Every part of the path, not only the filename. Checking the name alone lists the
+        # contents of .git and .venv, which are not the project's data and whose paths and
+        # sizes are nobody's business but the machine's.
+        if any(part.startswith(".") for part in path.relative_to(base).parts):
             continue
 
         # Resolved and re-checked so that a symbolic link left in the directory is not listed as
