@@ -2,8 +2,14 @@
 
 import pytest
 
-from virtual_lab.constants import DEFAULT_ENCODING, MODEL_TO_INPUT_PRICE_PER_TOKEN
+from virtual_lab.constants import (
+    DEFAULT_ENCODING,
+    FINETUNING_MODEL_TO_INPUT_PRICE_PER_TOKEN,
+    FINETUNING_MODEL_TO_OUTPUT_PRICE_PER_TOKEN,
+    MODEL_TO_INPUT_PRICE_PER_TOKEN,
+)
 from virtual_lab.utils import (
+    CostUnknownError,
     MeetingUsage,
     count_discussion_tokens,
     count_tokens,
@@ -108,12 +114,20 @@ class TestMeetingUsage:
         assert usage.output_tokens == 100
         assert usage.reasoning_tokens == 70
 
-    def test_missing_usage_is_ignored(self) -> None:
+    def test_a_call_that_reports_no_usage_makes_the_cost_unknown(self) -> None:
+        # Skipping it made the call free, which a spending limit reads as room to spend more
         usage = MeetingUsage()
+        usage.add(TEST_MODEL, make_usage())
         usage.add(TEST_MODEL, None)
 
-        assert usage.num_calls == 0
-        assert usage.compute_cost() == 0.0
+        assert usage.num_calls == 2
+        assert usage.unreported_calls == 1
+
+        with pytest.raises(CostUnknownError, match="did not report usage for 1 of the calls"):
+            usage.compute_cost()
+
+        assert usage.to_dict()["cost"] is None
+        assert usage.to_dict()["unreported_calls"] == 1
 
     def test_unknown_model_cost_is_an_error(self) -> None:
         usage = MeetingUsage()
@@ -137,16 +151,30 @@ class TestMeetingUsage:
         assert "123" in output
         assert "Warning" in output
 
-    def test_model_prefixes_are_matched(self) -> None:
-        usage = MeetingUsage()
-        usage.add(
-            "gpt-4o-2024-08-06-ft-personal-abc123",
-            make_usage(prompt_tokens=1000, completion_tokens=0),
+    def test_a_dated_snapshot_is_priced_as_its_model(self) -> None:
+        assert compute_token_cost("gpt-5.2-2025-12-11", 1000, 0) == pytest.approx(
+            1000 * MODEL_TO_INPUT_PRICE_PER_TOKEN["gpt-5.2"]
         )
 
-        assert usage.compute_cost() == pytest.approx(
-            1000 * MODEL_TO_INPUT_PRICE_PER_TOKEN[TEST_MODEL]
+    @pytest.mark.parametrize("model", ["gpt-5-pro", "gpt-5.4", "gpt-5-codex", "gpt-5.2-2025"])
+    def test_a_model_that_only_starts_like_a_priced_one_is_not_priced_as_it(self, model) -> None:
+        # Matched as prefixes these all cost what gpt-5 or gpt-5.2 does, and gpt-5-pro is about
+        # twelve times that
+        with pytest.raises(CostUnknownError, match=model):
+            compute_token_cost(model, 1000, 0)
+
+    def test_a_fine_tuned_model_is_priced_at_the_fine_tuned_rate(self) -> None:
+        model = "ft:gpt-4o-2024-08-06:lab::abc123"
+
+        assert compute_token_cost(model, 1000, 1000) == pytest.approx(
+            1000 * FINETUNING_MODEL_TO_INPUT_PRICE_PER_TOKEN[TEST_MODEL]
+            + 1000 * FINETUNING_MODEL_TO_OUTPUT_PRICE_PER_TOKEN[TEST_MODEL]
         )
+        assert compute_token_cost(model, 1000, 0) > compute_token_cost(TEST_MODEL, 1000, 0)
+
+    def test_a_fine_tuned_model_of_an_unpriced_base_is_not_priced(self) -> None:
+        with pytest.raises(CostUnknownError):
+            compute_token_cost("ft:gpt-5-pro:lab::abc123", 1000, 0)
 
     def test_summary_reports_every_model(self, capsys: pytest.CaptureFixture) -> None:
         usage = MeetingUsage()

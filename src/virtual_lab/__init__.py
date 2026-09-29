@@ -57,7 +57,12 @@ from virtual_lab.repair import (
     run_with_repair,
     save_execution_record,
 )
-from virtual_lab.run_meeting import run_meeting
+from virtual_lab.run_meeting import (
+    MeetingResult,
+    TruncatedResponseError,
+    hold_meeting,
+    run_meeting,
+)
 from virtual_lab.schemas import AgentSpec, ComponentAssignment, ImplementationPlan, TeamRoster
 from virtual_lab.structured import StructuredOutputError
 from virtual_lab.tables import (
@@ -92,6 +97,7 @@ from virtual_lab.tools import (
     structure_file_tool,
     tools_for,
 )
+from virtual_lab.utils import BudgetExceededError, CostUnknownError
 from virtual_lab.web import (
     ALLOWED_HOSTS,
     DisallowedHostError,
@@ -114,6 +120,7 @@ __all__ = [
     "Article",
     "ArticleResults",
     "ArticleText",
+    "BudgetExceededError",
     "CHEMBL_ACTIVITIES_TOOL",
     "CHEMBL_LOOKUP_TOOL",
     "CHEMBL_SEARCH_TOOL",
@@ -124,6 +131,7 @@ __all__ = [
     "Column",
     "ComponentAssignment",
     "Compound",
+    "CostUnknownError",
     "DATABASE_TOOLS",
     "DataFile",
     "DataFiles",
@@ -141,6 +149,7 @@ __all__ = [
     "ExecutionResult",
     "ImplementationPlan",
     "LocalExecutor",
+    "MeetingResult",
     "PDB_LOOKUP_TOOL",
     "PUBCHEM_LOOKUP_TOOL",
     "PUBMED_TOOL",
@@ -162,6 +171,7 @@ __all__ = [
     "Target",
     "TeamRoster",
     "Tool",
+    "TruncatedResponseError",
     "UNIPROT_LOOKUP_TOOL",
     "UNIPROT_SEARCH_TOOL",
     "UnsafeFilenameError",
@@ -179,6 +189,7 @@ __all__ = [
     "get_predicted_structure",
     "get_protein",
     "get_structure",
+    "hold_meeting",
     "list_data_files",
     "request_json",
     "request_text",

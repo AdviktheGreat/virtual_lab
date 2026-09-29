@@ -1,6 +1,7 @@
 """Contains useful utility functions."""
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,8 @@ from virtual_lab.constants import (
     CONTEXT_WARNING_THRESHOLD,
     DEFAULT_ENCODING,
     DEFAULT_FINETUNING_EPOCHS,
+    FINETUNING_MODEL_TO_INPUT_PRICE_PER_TOKEN,
+    FINETUNING_MODEL_TO_OUTPUT_PRICE_PER_TOKEN,
     FINETUNING_MODEL_TO_TRAINING_PRICE_PER_TOKEN,
     MODEL_TO_INPUT_PRICE_PER_TOKEN,
     MODEL_TO_MAX_INPUT_TOKENS,
@@ -243,24 +246,88 @@ def _find_model_key[T](model: str, model_dict: dict[str, T]) -> str | None:
     return None
 
 
+class CostUnknownError(ValueError):
+    """Raised when what a meeting has cost cannot be worked out."""
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised before a request that a meeting's spending limit does not leave room for.
+
+    :param spent: What the meeting had cost when it stopped, in USD.
+    :param limit: The limit it was given, in USD.
+    """
+
+    def __init__(self, spent: float, limit: float) -> None:
+        super().__init__(
+            f"The meeting has cost ${spent:.4f}, which reaches its limit of ${limit:.4f}, so it "
+            f"was stopped before the next request"
+        )
+        self.spent = spent
+        self.limit = limit
+
+
+def price_key(model: str, prices: dict[str, float]) -> str | None:
+    """Finds the entry in a price table for a model, matching only the model itself.
+
+    A dated snapshot such as gpt-5.2-2025-12-11 is priced as the model it is a snapshot of. Any
+    other suffix is a different model: matching gpt-5-pro to gpt-5 as a prefix priced it at a
+    twelfth of what it costs, which is the one error a spending limit cannot survive.
+
+    :param model: The name of the model.
+    :param prices: A model-keyed price table.
+    :return: The matching key, or None if the model is not in the table.
+    """
+    if model in prices:
+        return model
+
+    undated = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
+
+    return undated if undated in prices else None
+
+
 def compute_token_cost(model: str, input_token_count: int, output_token_count: int) -> float:
     """Computes the token cost of a model given input and output token counts.
 
     :param model: The name of the model.
     :param input_token_count: The number of tokens in the input.
     :param output_token_count: The number of tokens in the output.
+    :raises CostUnknownError: If the model is not in the price tables.
     :return: The token cost of the model.
     """
-    input_key = _find_model_key(model, MODEL_TO_INPUT_PRICE_PER_TOKEN)
-    output_key = _find_model_key(model, MODEL_TO_OUTPUT_PRICE_PER_TOKEN)
+    input_prices, output_prices = MODEL_TO_INPUT_PRICE_PER_TOKEN, MODEL_TO_OUTPUT_PRICE_PER_TOKEN
+    base = model
+
+    # A fine-tuned model is named ft:<base>:<org>::<id> and is billed at its own, higher rate
+    if model.startswith("ft:"):
+        input_prices = FINETUNING_MODEL_TO_INPUT_PRICE_PER_TOKEN
+        output_prices = FINETUNING_MODEL_TO_OUTPUT_PRICE_PER_TOKEN
+        base = model.split(":")[1]
+
+    input_key = price_key(base, input_prices)
+    output_key = price_key(base, output_prices)
 
     if input_key is None or output_key is None:
-        raise ValueError(f'Cost of model "{model}" not known')
+        raise CostUnknownError(f'Cost of model "{model}" not known')
 
     return (
-        input_token_count * MODEL_TO_INPUT_PRICE_PER_TOKEN[input_key]
-        + output_token_count * MODEL_TO_OUTPUT_PRICE_PER_TOKEN[output_key]
+        input_token_count * input_prices[input_key]
+        + output_token_count * output_prices[output_key]
     )
+
+
+def price_per_million(model: str) -> dict[str, float] | None:
+    """What a model is priced at, for the record of a meeting that used it.
+
+    :param model: The name of the model.
+    :return: USD per million input and output tokens, or None if the model is not priced.
+    """
+    try:
+        return {
+            "input": compute_token_cost(model, 10**6, 0),
+            "output": compute_token_cost(model, 0, 10**6),
+        }
+    except CostUnknownError:
+        return None
 
 
 class ContextLengthExceededError(ValueError):
@@ -386,6 +453,7 @@ class ModelUsage:
     reasoning_tokens: int = 0
     max_input_tokens: int = 0
     num_calls: int = 0
+    unreported_calls: int = 0
 
 
 @dataclass
@@ -405,10 +473,15 @@ class MeetingUsage:
         :param model: The model that produced the response.
         :param usage: The usage reported by the API, or None if the API did not report any.
         """
-        if usage is None:
-            return
-
         model_usage = self.per_model.setdefault(model, ModelUsage())
+
+        # Some proxies and compatible endpoints leave usage out. Skipping the call made it cost
+        # nothing, which a spending limit reads as room to spend more; counted this way, the
+        # cost is unknown instead.
+        if usage is None:
+            model_usage.num_calls += 1
+            model_usage.unreported_calls += 1
+            return
 
         input_tokens = usage.prompt_tokens or 0
         model_usage.input_tokens += input_tokens
@@ -456,15 +529,28 @@ class MeetingUsage:
         """The total number of API calls."""
         return sum(model_usage.num_calls for model_usage in self.per_model.values())
 
+    @property
+    def unreported_calls(self) -> int:
+        """The number of API calls that did not report their usage."""
+        return sum(model_usage.unreported_calls for model_usage in self.per_model.values())
+
     def compute_cost(self) -> float:
         """Computes the total cost across all models.
 
         Cached input tokens are priced at the full input rate, so the result is an upper bound
         for models and providers that discount them.
 
-        :raises ValueError: If the price of any model is not known.
+        :raises CostUnknownError: If the price of any model is not known, or any call did not
+            report its usage.
         :return: The total cost in USD.
         """
+        for model, model_usage in self.per_model.items():
+            if model_usage.unreported_calls:
+                raise CostUnknownError(
+                    f'The API did not report usage for {model_usage.unreported_calls:,} of the '
+                    f'calls to "{model}", so what they cost is not known'
+                )
+
         return sum(
             compute_token_cost(
                 model=model,
@@ -491,6 +577,7 @@ class MeetingUsage:
             "reasoning_tokens": self.reasoning_tokens,
             "max_input_tokens": self.max_input_tokens,
             "num_calls": self.num_calls,
+            "unreported_calls": self.unreported_calls,
             "cost": cost,
             "per_model": {
                 model: dict(model_usage.__dict__) for model, model_usage in self.per_model.items()

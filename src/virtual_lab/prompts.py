@@ -182,6 +182,21 @@ def team_meeting_start_prompt(
     :param num_rounds: The number of rounds of discussion.
     :return: The start prompt for the tean meeting.
     """
+    # With no rounds the team members never speak, and a plan that says they will leaves the
+    # team lead waiting on input that is not coming
+    if num_rounds == 0:
+        plan = (
+            f"There will be no discussion in this meeting: {team_lead} will address the agenda "
+            f"directly and {SUMMARY_PROMPT}."
+        )
+    else:
+        plan = (
+            f"{team_lead} will convene the meeting. "
+            f"Then, each team member will provide their thoughts on the discussion one-by-one in the order above. "
+            f"After all team members have given their input, {team_lead} will {SYNTHESIS_PROMPT}. "
+            f"This will continue for {num_rounds} rounds. Once the discussion is complete, {team_lead} will {SUMMARY_PROMPT}."
+        )
+
     return (
         f"This is the beginning of a team meeting to discuss your research project. "
         f"This is a meeting with the team lead, {team_lead.title}, and the following team members: "
@@ -191,10 +206,7 @@ def team_meeting_start_prompt(
         f"{format_agenda(agenda)}"
         f"{format_agenda_questions(agenda_questions)}"
         f"{format_agenda_rules(agenda_rules)}"
-        f"{team_lead} will convene the meeting. "
-        f"Then, each team member will provide their thoughts on the discussion one-by-one in the order above. "
-        f"After all team members have given their input, {team_lead} will {SYNTHESIS_PROMPT}. "
-        f"This will continue for {num_rounds} rounds. Once the discussion is complete, {team_lead} will {SUMMARY_PROMPT}."
+        f"{plan}"
     )
 
 

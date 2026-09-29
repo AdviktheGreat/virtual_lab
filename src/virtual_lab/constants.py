@@ -113,6 +113,11 @@ MAX_TOOL_ERROR_CHARACTERS = 1_000
 # two candidates are searched for every article wanted, and the model chooses the number.
 MAX_PUBMED_ARTICLES = 5
 
+# Characters of a tool call's arguments to keep in the meeting record. Enough for every search
+# and lookup the tools take; a model can pass arguments of any length, and the record is a log of
+# what was asked for, not a second copy of it.
+MAX_RECORDED_ARGUMENT_CHARS = 2_000
+
 # Image used to run model-authored code. Pinned to a digest-free but explicit tag so that a
 # meeting is not silently handed a different interpreter than the one it was written for.
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
