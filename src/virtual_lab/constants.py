@@ -97,6 +97,22 @@ CREATIVE_TEMPERATURE = 0.8
 # force a text answer.
 MAX_TOOL_ITERATIONS = 5
 
+# Most characters of one tool result given back to a model. Every lookup already budgets its own
+# report, the largest being a full text at 20,000 characters plus its headings and citation, so
+# this is set above all of them and only binds on output that has no budget of its own: the
+# PubMed search returns whole articles, and one tool call is otherwise one megabyte of request.
+MAX_TOOL_OUTPUT_CHARS = 25_000
+
+# Characters of a tool name, or of an error, to repeat back to a model. The API accepts function
+# names of at most 64 characters, so a longer one is not a tool, and an exception's message is
+# written by whatever raised it and can quote an entire response.
+MAX_TOOL_NAME_CHARACTERS = 64
+MAX_TOOL_ERROR_CHARACTERS = 1_000
+
+# Articles one PubMed search may return. Each is a full text fetched with a request of its own,
+# two candidates are searched for every article wanted, and the model chooses the number.
+MAX_PUBMED_ARTICLES = 5
+
 # Image used to run model-authored code. Pinned to a digest-free but explicit tag so that a
 # meeting is not silently handed a different interpreter than the one it was written for.
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
@@ -199,6 +215,10 @@ MAX_COMMENT_CHARACTERS = 600
 # tens of megabytes.
 MAX_STRUCTURE_FILE_BYTES = 30_000_000
 
+# Characters of a download link a service sends to keep. AlphaFold's are under a hundred, and one
+# is repeated in the report of what was downloaded.
+MAX_URL_CHARACTERS = 2_000
+
 # Free text to show for a compound. PubChem's description of a well known drug runs to several
 # paragraphs, the same unbounded field problem a protein's comments were.
 MAX_DESCRIPTION_CHARACTERS = 600
@@ -219,6 +239,18 @@ MAX_STRUCTURE_CHARACTERS = 500
 # Mechanisms of action to list for one molecule. A promiscuous kinase inhibitor has dozens on
 # record, and the report is meant to say what the drug does rather than enumerate every target.
 MAX_MECHANISMS_REPORTED = 10
+
+# Characters kept of any short field a service sends: a name, a title, a journal, an identifier,
+# a descriptor. Real ones are well under this, the longest titles being around 300 characters,
+# but nothing in a response is bounded except by its size, and a single field of a five megabyte
+# response would otherwise become a five megabyte report. The same figure as a structure string,
+# which is the longest thing of this kind a report shows on purpose.
+MAX_FIELD_CHARACTERS = 500
+
+# Items of a short list to name before saying how many more there are: the genes of a protein,
+# the components bound in a structure, the sections of an article left out. Real ones are a
+# handful, and a list of thousands says nothing more than its count does.
+MAX_ITEMS_LISTED = 20
 
 # Smallest pChEMBL value worth reporting, on a scale where 6 is a micromolar affinity and 9 is
 # nanomolar. Below this a compound is not usefully a binder, and the rows are mostly the inactive

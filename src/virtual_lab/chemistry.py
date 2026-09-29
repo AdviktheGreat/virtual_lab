@@ -11,6 +11,7 @@ here rather than passed on to a model as fact.
 """
 
 import html
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -25,7 +26,12 @@ from virtual_lab.constants import (
 )
 from virtual_lab.records import (
     RecordNotFoundError,
+    as_dict,
+    as_int,
+    as_list,
+    as_text,
     bounded,
+    number_or_none,
     truncate_text,
 )
 from virtual_lab.web import WebRequestError, build_url, request_json
@@ -115,23 +121,17 @@ ACTIVITY_FIELDS = (
 )
 
 
-def number_or_none(value: Any) -> float | None:
-    """Reads a number that a service sent as a string.
+def descriptor(value: Any) -> Any:
+    """Reads one computed property, which is shown as it was sent but only if it is short.
 
-    ChEMBL sends max_phase as "4.0" and molecular weight as "180.16", and PubChem sends molecular
-    weight as "180.16" too. Comparing those to a number silently does the wrong thing, and
-    formatting them assumes a type they do not have.
-
-    :param value: The value as the service sent it.
-    :return: The number, or None if there was not one.
+    :param value: The value as the service sent it, a number from PubChem or a string of one
+        from ChEMBL.
+    :return: A finite number, a shortened string, or None for anything else.
     """
-    if value is None or isinstance(value, bool):
-        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value if math.isfinite(value) else None
 
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return as_text(value) or None
 
 
 def tidy(value: Any) -> str:
@@ -537,20 +537,22 @@ def compound_from(properties: dict[str, Any], description: str = "", title: str 
     :param title: The name PubChem shows for it.
     :return: The compound.
     """
-    # "or" rather than a default, throughout: a key PubChem sends as JSON null is present, so a
-    # default never applies and str() would write the word "None" into a report as though it were
-    # the compound's formula. A null CID would raise TypeError here instead.
+    # Read through as_text and as_int rather than str() and int(), throughout: a key PubChem sends
+    # as JSON null is present, so a default never applies and str() would write the word "None"
+    # into a report as though it were the compound's formula. A null CID made int() raise.
     return Compound(
-        cid=int(properties.get("CID") or 0),
+        cid=as_int(properties.get("CID"), 0) or 0,
         title=title,
-        formula=str(properties.get("MolecularFormula") or ""),
+        formula=as_text(properties.get("MolecularFormula")),
         weight=number_or_none(properties.get("MolecularWeight")),
-        smiles=str(properties.get("SMILES") or ""),
-        connectivity_smiles=str(properties.get("ConnectivitySMILES") or ""),
-        inchikey=str(properties.get("InChIKey") or ""),
-        iupac_name=str(properties.get("IUPACName") or ""),
+        smiles=as_text(properties.get("SMILES"), limit=None),
+        connectivity_smiles=as_text(properties.get("ConnectivitySMILES"), limit=None),
+        inchikey=as_text(properties.get("InChIKey")),
+        iupac_name=as_text(properties.get("IUPACName"), limit=None),
         description=description,
-        properties={key: properties[key] for key in COMPOUND_PROPERTIES if key in properties},
+        properties={
+            key: descriptor(properties[key]) for key in COMPOUND_PROPERTIES if key in properties
+        },
     )
 
 
@@ -570,15 +572,24 @@ def describe_compound(cid: int) -> tuple[str, str]:
     except WebRequestError:
         return "", ""
 
-    entries = ((response or {}).get("InformationList") or {}).get("Information") or []
+    entries = [
+        entry
+        for entry in as_list(as_dict(as_dict(response).get("InformationList")).get("Information"))
+        if isinstance(entry, dict)
+    ]
 
-    title = next((str(entry["Title"]) for entry in entries if entry.get("Title")), "")
+    # Kept whole, like the description below, because the report shortens it
+    title = next(
+        (as_text(entry["Title"], limit=None) for entry in entries if entry.get("Title")), ""
+    )
 
     # The longest rather than the first. PubChem returns descriptions from several sources in no
     # useful order, and for aspirin the first is a one-line Proposition 65 hazard notice while
     # the one that says what the molecule is comes second. Length separates a definition from a
     # regulatory note reliably enough, and the alternative is ranking source names by hand.
-    descriptions = [str(entry["Description"]) for entry in entries if entry.get("Description")]
+    descriptions = [
+        as_text(entry["Description"], limit=None) for entry in entries if entry.get("Description")
+    ]
 
     return title, max(descriptions, key=len, default="")
 
@@ -625,13 +636,13 @@ def get_compound(identifier: str, namespace: str = "name") -> Compound:
             f'PubChem has no compound for {namespace} "{identifier}".'
         ) from error
 
-    rows = ((response or {}).get("PropertyTable") or {}).get("Properties") or []
+    rows = as_list(as_dict(as_dict(response).get("PropertyTable")).get("Properties"))
 
     if not rows:
         raise RecordNotFoundError(f'PubChem returned no properties for {namespace} "{identifier}".')
 
-    row = rows[0]
-    cid = int(row.get("CID") or 0)
+    row = as_dict(rows[0])
+    cid = as_int(row.get("CID"), 0) or 0
 
     # PubChem answers a structure it has never seen with 200 and CID 0 rather than an error, so
     # the only sign that nothing was found is the identifier itself
@@ -648,7 +659,7 @@ def get_compound(identifier: str, namespace: str = "name") -> Compound:
 
 def molecule_from(record: dict[str, Any], mechanisms: tuple[tuple[str, str, str], ...]) -> Drug:
     """Builds a drug record from a ChEMBL molecule record."""
-    structures = record.get("molecule_structures") or {}
+    structures = as_dict(record.get("molecule_structures"))
     routes = tuple(
         label
         for key, label in (("oral", "oral"), ("parenteral", "parenteral"), ("topical", "topical"))
@@ -656,16 +667,19 @@ def molecule_from(record: dict[str, Any], mechanisms: tuple[tuple[str, str, str]
     )
 
     return Drug(
-        chembl_id=str(record.get("molecule_chembl_id") or ""),
-        name=str(record.get("pref_name") or ""),
+        chembl_id=as_text(record.get("molecule_chembl_id")),
+        name=as_text(record.get("pref_name")),
         max_phase=number_or_none(record.get("max_phase")),
-        molecule_type=str(record.get("molecule_type") or ""),
-        first_approval=record.get("first_approval"),
+        molecule_type=as_text(record.get("molecule_type")),
+        first_approval=as_int(record.get("first_approval")),
         withdrawn=bool(record.get("withdrawn_flag")),
         routes=routes,
-        smiles=str(structures.get("canonical_smiles") or ""),
-        inchikey=str(structures.get("standard_inchi_key") or ""),
-        properties=record.get("molecule_properties") or {},
+        smiles=as_text(structures.get("canonical_smiles"), limit=None),
+        inchikey=as_text(structures.get("standard_inchi_key")),
+        properties={
+            key: descriptor(value)
+            for key, value in as_dict(record.get("molecule_properties")).items()
+        },
         mechanisms=mechanisms,
     )
 
@@ -698,11 +712,12 @@ def mechanisms_of(chembl_id: str) -> tuple[tuple[str, str, str], ...]:
 
     return tuple(
         (
-            str(entry.get("action_type") or ""),
-            str(entry.get("mechanism_of_action") or ""),
-            str(entry.get("target_chembl_id") or ""),
+            as_text(entry.get("action_type")),
+            as_text(entry.get("mechanism_of_action")),
+            as_text(entry.get("target_chembl_id")),
         )
-        for entry in ((response or {}).get("mechanisms") or [])
+        for entry in as_list(as_dict(response).get("mechanisms"))
+        if isinstance(entry, dict)
     )
 
 
@@ -752,21 +767,21 @@ def search_drugs(query: str, limit: int = 10) -> SearchHits:
         },
     )
 
-    records = (response or {}).get("molecules") or []
+    records = [as_dict(record) for record in as_list(as_dict(response).get("molecules"))[:size]]
     hits = tuple(
         DrugHit(
-            chembl_id=str(record.get("molecule_chembl_id") or ""),
-            name=str(record.get("pref_name") or ""),
+            chembl_id=as_text(record.get("molecule_chembl_id")),
+            name=as_text(record.get("pref_name")),
             max_phase=number_or_none(record.get("max_phase")),
-            molecule_type=str(record.get("molecule_type") or ""),
+            molecule_type=as_text(record.get("molecule_type")),
         )
-        for record in records[:size]
+        for record in records
     )
 
     return SearchHits(
         query=query,
         kind="molecules",
-        total=int(((response or {}).get("page_meta") or {}).get("total_count") or len(hits)),
+        total=total_count(response) or len(hits),
         hits=hits,
     )
 
@@ -809,42 +824,47 @@ def search_targets(
 
     response = request_json(f"{CHEMBL_BASE}/target/search", params=params)
 
-    records = (response or {}).get("targets") or []
+    records = [as_dict(record) for record in as_list(as_dict(response).get("targets"))[:size]]
     hits = tuple(
         Target(
-            chembl_id=str(record.get("target_chembl_id") or ""),
-            name=str(record.get("pref_name") or ""),
-            target_type=str(record.get("target_type") or ""),
-            organism=str(record.get("organism") or ""),
+            chembl_id=as_text(record.get("target_chembl_id")),
+            name=as_text(record.get("pref_name")),
+            target_type=as_text(record.get("target_type")),
+            organism=as_text(record.get("organism")),
         )
-        for record in records[:size]
+        for record in records
     )
 
     return SearchHits(
         query=f"{query} in {organism}" if organism else query,
         kind="targets",
-        total=int(((response or {}).get("page_meta") or {}).get("total_count") or len(hits)),
+        total=total_count(response) or len(hits),
         hits=hits,
     )
+
+
+def total_count(response: Any) -> int:
+    """Reads how many results ChEMBL says a search has, or zero if it does not say."""
+    return as_int(as_dict(as_dict(response).get("page_meta")).get("total_count"), 0) or 0
 
 
 def activity_from(record: dict[str, Any]) -> Activity:
     """Builds a measurement from a ChEMBL activity record."""
     return Activity(
-        molecule_chembl_id=str(record.get("molecule_chembl_id") or ""),
-        target_chembl_id=str(record.get("target_chembl_id") or ""),
-        target_name=str(record.get("target_pref_name") or ""),
-        organism=str(record.get("target_organism") or ""),
-        measurement=str(record.get("standard_type") or ""),
-        relation=str(record.get("standard_relation") or "="),
+        molecule_chembl_id=as_text(record.get("molecule_chembl_id")),
+        target_chembl_id=as_text(record.get("target_chembl_id")),
+        target_name=as_text(record.get("target_pref_name")),
+        organism=as_text(record.get("target_organism")),
+        measurement=as_text(record.get("standard_type")),
+        relation=as_text(record.get("standard_relation")) or "=",
         value=number_or_none(record.get("standard_value")),
-        units=str(record.get("standard_units") or ""),
+        units=as_text(record.get("standard_units")),
         pchembl=number_or_none(record.get("pchembl_value")),
-        assay_id=str(record.get("assay_chembl_id") or ""),
+        assay_id=as_text(record.get("assay_chembl_id")),
         # Unescaped because the assay descriptions ChEMBL imported from PubChem BioAssay carry
         # HTML entities, so an agent is otherwise told about "Bloom&apos;s syndrome helicase"
-        assay_description=html.unescape(str(record.get("assay_description") or "")),
-        year=record.get("document_year"),
+        assay_description=html.unescape(as_text(record.get("assay_description"), limit=None)),
+        year=as_int(record.get("document_year")),
     )
 
 
@@ -903,8 +923,8 @@ def get_activities(
 
     response = request_json(f"{CHEMBL_BASE}/activity", params=params)
 
-    records = (response or {}).get("activities") or []
-    activities = tuple(activity_from(record) for record in records[:size])
+    records = as_list(as_dict(response).get("activities"))[:size]
+    activities = tuple(activity_from(as_dict(record)) for record in records)
 
     if target_chembl_id and molecule_chembl_id:
         subject = f"{molecule_chembl_id} against {target_chembl_id}"
@@ -918,7 +938,7 @@ def get_activities(
 
     return ActivityResults(
         subject=subject,
-        total=int(((response or {}).get("page_meta") or {}).get("total_count") or len(activities)),
+        total=total_count(response) or len(activities),
         activities=activities,
         grouped_by="molecule" if target_chembl_id else "target",
     )

@@ -18,10 +18,18 @@ from virtual_lab.constants import (
     MAX_CHAINS_REPORTED,
     MAX_COMMENTS_REPORTED,
     MAX_FEATURES_REPORTED,
+    MAX_FIELD_CHARACTERS,
+    MAX_ITEMS_LISTED,
     MAX_SEARCH_RESULTS,
     MAX_SEQUENCE_RESIDUES_REPORTED,
 )
-from virtual_lab.records import DatabaseError, RecordNotFoundError
+from virtual_lab.records import (
+    DatabaseError,
+    RecordNotFoundError,
+    as_int,
+    as_text,
+    listing,
+)
 from virtual_lab.databases import (
     Chain,
     PredictedStructure,
@@ -668,6 +676,21 @@ class TestSearchingForProteins:
         assert bounded(5, 25, "limit") == 5
         assert bounded(99, 25, "limit") == 25
 
+    @pytest.mark.parametrize("limit", ["5", 5.0, float("nan"), True, None, [5]])
+    def test_a_limit_that_is_not_a_whole_number_is_refused_clearly(self, limit) -> None:
+        # A string raised TypeError from the comparison, and NaN passed it, since every
+        # comparison with NaN is false
+        with pytest.raises(ValueError, match="limit must be a whole number"):
+            bounded(limit, 25, "limit")
+
+    def test_a_limit_that_is_not_a_whole_number_is_refused_before_any_request(
+        self, web_transport
+    ) -> None:
+        with pytest.raises(ValueError, match="whole number"):
+            search_proteins("insulin", limit="ten")
+
+        assert web_transport.requests == []
+
 
 class TestLookingUpAStructure:
     def test_the_entry_and_each_chain_are_fetched(self, web_transport) -> None:
@@ -992,39 +1015,66 @@ class TestDownloadingAStructureFile:
         with pytest.raises(RecordNotFoundError, match="no pdb file"):
             download_structure("P01308", save_dir=tmp_path, source="alphafold", file_format="pdb")
 
-    def test_a_hostile_name_from_the_service_is_refused(self, web_transport, tmp_path) -> None:
-        # This URL comes from AlphaFold's own response rather than from a template here, so its
-        # last path segment is the one filename in the library that a service chooses
+    def test_a_file_name_the_service_chooses_is_not_used(self, web_transport, tmp_path) -> None:
+        # The URL comes from AlphaFold's own response rather than from a template here. Naming the
+        # file after its last segment let a response ending in /solve.py overwrite that file
         from conftest import FakeResponse
 
+        (tmp_path / "solve.py").write_text("print('mine')")
         web_transport.responses = [
             FakeResponse(
-                json_body=[INSULIN_PREDICTION[0] | {"cifUrl": "https://alphafold.ebi.ac.uk/f/a:b"}]
+                json_body=[
+                    INSULIN_PREDICTION[0] | {"cifUrl": "https://alphafold.ebi.ac.uk/files/solve.py"}
+                ]
             ),
             FakeResponse(body=b"data"),
         ]
 
-        with pytest.raises(UnsafeFilenameError):
-            download_structure("P01308", save_dir=tmp_path, source="alphafold")
+        downloaded = download_structure("P01308", save_dir=tmp_path, source="alphafold")
+
+        assert downloaded.path.name == "AF-P01308-F1-model_v6.cif"
+        assert (tmp_path / "solve.py").read_text() == "print('mine')"
+
+    def test_a_prediction_without_a_version_is_named_without_one(
+        self, web_transport, tmp_path
+    ) -> None:
+        from conftest import FakeResponse
+
+        web_transport.responses = [
+            FakeResponse(json_body=[INSULIN_PREDICTION[0] | {"latestVersion": "six"}]),
+            FakeResponse(body=b"data"),
+        ]
+
+        downloaded = download_structure(
+            "p01308", save_dir=tmp_path, source="alphafold", file_format="pdb"
+        )
+
+        assert downloaded.path.name == "AF-P01308-F1.pdb"
+
+    @pytest.mark.parametrize("identifier", ["../P01308", "P01308/x", "solve.py", "P0130"])
+    def test_an_identifier_that_is_not_an_accession_is_refused_before_any_request(
+        self, web_transport, tmp_path, identifier: str
+    ) -> None:
+        with pytest.raises(ValueError, match="not a UniProt accession"):
+            download_structure(identifier, save_dir=tmp_path, source="alphafold")
+
+        assert web_transport.requests == []
 
     def test_a_name_that_escapes_after_resolution_is_refused(
         self, web_transport, tmp_path, monkeypatch
     ) -> None:
         # check_filename runs on the name as written; the containment check runs on the path as
         # resolved. Only the second can see a name that becomes an escape once it is joined, so
-        # it is tested by letting a name through the first and asserting the second still holds.
+        # it is tested by letting such a name through the first and asserting the second holds.
         from conftest import FakeResponse
 
-        monkeypatch.setattr(databases, "check_filename", lambda name: name)
-        web_transport.responses = [
-            FakeResponse(
-                json_body=[INSULIN_PREDICTION[0] | {"cifUrl": "https://alphafold.ebi.ac.uk/f/.."}]
-            ),
-            FakeResponse(body=b"data"),
-        ]
+        monkeypatch.setattr(databases, "check_filename", lambda name: "../outside.cif")
+        web_transport.responses = [FakeResponse(body=b"data")]
 
         with pytest.raises(UnsafeFilenameError, match="outside"):
-            download_structure("P01308", save_dir=tmp_path / "inside", source="alphafold")
+            download_structure("4HHB", save_dir=tmp_path / "inside")
+
+        assert not (tmp_path / "outside.cif").exists()
 
     def test_the_name_check_refuses_a_traversing_segment_on_its_own(self) -> None:
         # The guard above is the second of two. This is the first, which is what actually stops
@@ -1064,6 +1114,217 @@ class TestDownloadingAStructureFile:
         web_transport.responses = [FakeResponse(body=b"x" * 8_000_000)]
 
         assert download_structure("4HHB", save_dir=tmp_path).characters == 8_000_000
+
+
+class TestAResponseOfTheWrongShape:
+    """A field of the wrong type is read as absent, and a long one is shortened when it is read.
+
+    Every one of these escaped as AttributeError, TypeError, or ValueError, which is none of the
+    errors a caller handles, or made a report the size of the response.
+    """
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"comments": [{"commentType": "FUNCTION", "texts": ["not an object"]}]},
+            {"comments": ["not an object"], "features": "not a list"},
+            {"features": [{"type": "Chain", "location": "not an object"}]},
+            {"features": [{"type": "Chain", "location": {"start": "5", "end": ["7"]}}]},
+            {"features": [{"type": "Chain", "location": {"start": {"value": "\u00b2"}}}]},
+            {"proteinDescription": ["not an object"], "organism": "Homo sapiens"},
+            {"genes": ["INS"], "uniProtKBCrossReferences": [["PDB", "1A7F"]]},
+            {"sequence": {"value": 7, "length": "long", "molWeight": "heavy"}},
+            {"sequence": {"value": "MA", "length": True, "molWeight": float("inf")}},
+            {"organism": {"taxonId": "9606x"}, "primaryAccession": {"id": "P01308"}},
+        ],
+    )
+    def test_a_protein_entry_of_the_wrong_shape_still_reports(self, entry) -> None:
+        protein = protein_from(INSULIN_ENTRY | entry)
+
+        assert protein.report().startswith("UniProt")
+
+    def test_numbers_sent_as_strings_are_read_as_numbers(self) -> None:
+        protein = protein_from(
+            INSULIN_ENTRY | {"sequence": {"value": "MA", "length": "110", "molWeight": "11981"}}
+        )
+
+        assert protein.length == 110
+        assert protein.mass == 11981.0
+        assert "11,981 Da" in protein.report()
+
+    def test_a_comment_without_any_text_is_left_out(self) -> None:
+        protein = protein_from(
+            INSULIN_ENTRY | {"comments": [{"commentType": "FUNCTION"}, {"commentType": "DOMAIN"}]}
+        )
+
+        assert protein.comments == ()
+
+    def test_a_feature_with_neither_end_known_is_placed_at_a_question_mark(self) -> None:
+        protein = protein_from(
+            INSULIN_ENTRY
+            | {
+                "features": [
+                    {
+                        "type": "Region",
+                        "location": {"start": {"value": None}, "end": {"value": None}},
+                        "description": "Disordered",
+                    }
+                ]
+            }
+        )
+
+        assert protein.features == (("Region", "?", "Disordered"),)
+
+    def test_every_list_and_name_in_a_protein_report_is_bounded(self) -> None:
+        # One gene name repeated 10,000 times made a report of half a megabyte
+        huge = "x" * 1_000_000
+        protein = protein_from(
+            INSULIN_ENTRY
+            | {
+                "genes": [{"geneName": {"value": f"GENE{index}"}} for index in range(10_000)],
+                "proteinDescription": {"recommendedName": {"fullName": {"value": huge}}},
+                "organism": {"scientificName": huge},
+                "features": [
+                    {"type": "Chain", "location": {"start": {"value": 1}}, "description": huge}
+                ],
+                "uniProtKBCrossReferences": [{"database": "PDB", "id": huge}] * 20,
+            }
+        )
+        report = protein.report()
+
+        assert len(report) < 20_000
+        assert f"and {10_000 - MAX_ITEMS_LISTED:,} more" in report
+        assert "GENE19" in report and "GENE20" not in report
+
+    def test_every_list_and_name_in_a_structure_report_is_bounded(self, web_transport) -> None:
+        huge = "x" * 1_000_000
+        web_transport.queue(
+            HAEMOGLOBIN_ENTRY
+            | {
+                "struct": {"title": huge},
+                "exptl": [{"method": huge}] * 3,
+                "rcsb_entry_info": {"nonpolymer_bound_components": ["HEM"] * 100_000},
+            },
+            ALPHA_CHAIN
+            | {
+                "entity_poly": {"pdbx_strand_id": ",".join(["A"] * 10_000)},
+                "rcsb_polymer_entity": {"pdbx_description": huge},
+            },
+            ALPHA_CHAIN,
+        )
+
+        report = get_structure("4HHB").report()
+
+        assert len(report) < 20_000
+        assert f"and {100_000 - MAX_ITEMS_LISTED:,} more" in report
+        assert f"and {10_000 - MAX_ITEMS_LISTED:,} more" in report
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"struct": "a title", "exptl": "X-RAY", "rcsb_entry_info": []},
+            {"rcsb_entry_info": {"resolution_combined": ["fine"]}},
+            {"rcsb_entry_container_identifiers": {"pubmed_id": "PMID6726807"}},
+        ],
+    )
+    def test_a_structure_entry_of_the_wrong_shape_still_reports(
+        self, web_transport, entry
+    ) -> None:
+        web_transport.queue(HAEMOGLOBIN_ENTRY | entry, ["not an entity"], ALPHA_CHAIN)
+
+        assert get_structure("4HHB").report().startswith("PDB 4HHB")
+
+    def test_a_structure_response_that_is_not_an_object_is_read_as_empty(
+        self, web_transport
+    ) -> None:
+        web_transport.queue(["not an entry"])
+
+        structure = get_structure("4HHB")
+
+        assert (structure.title, structure.chains, structure.entity_count) == ("", (), 0)
+
+    def test_a_chain_of_the_wrong_shape_is_read_as_empty(self, web_transport) -> None:
+        web_transport.queue(
+            {
+                "entity_poly": {"pdbx_strand_id": 7, "pdbx_seq_one_letter_code_can": ["M"]},
+                "rcsb_polymer_entity": {"pdbx_number_of_molecules": "two"},
+                "rcsb_entity_source_organism": ["Homo sapiens"],
+            }
+        )
+
+        chain = get_chain("4HHB", "1")
+
+        assert (chain.chain_ids, chain.sequence, chain.copies, chain.organism) == ((), "", 1, "")
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"globalMetricValue": "52.9", "fractionPlddtConfident": "0.5"},
+            {"globalMetricValue": "high", "fractionPlddtConfident": "x", "latestVersion": "six"},
+            {"uniprotSequence": None, "uniprotDescription": {"text": "Insulin"}},
+        ],
+    )
+    def test_a_prediction_of_the_wrong_shape_still_reports(self, web_transport, fields) -> None:
+        web_transport.queue([INSULIN_PREDICTION[0] | fields])
+
+        assert get_predicted_structure("P01308").report().startswith("AlphaFold")
+
+    def test_a_confidence_sent_as_a_string_is_read_as_a_number(self, web_transport) -> None:
+        web_transport.queue([INSULIN_PREDICTION[0] | {"globalMetricValue": "52.9"}])
+
+        assert get_predicted_structure("P01308").mean_plddt == 52.9
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            (7, 7),
+            ("110", 110),
+            (" -3 ", -3),
+            (110.0, 110),
+            (110.5, None),
+            ("\u00b2", None),
+            ("\u0663", None),
+            ("9" * 5000, None),
+            (10**20, None),
+            (float("inf"), None),
+            (float("nan"), None),
+            (True, None),
+            ("", None),
+            ("-", None),
+            (None, None),
+            ([1], None),
+        ],
+    )
+    def test_a_whole_number_is_read_only_when_it_is_one(self, value, expected) -> None:
+        assert as_int(value) == expected
+
+    def test_a_whole_number_that_is_not_one_takes_the_default(self) -> None:
+        assert as_int("many", 0) == 0
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("INS", "INS"),
+            (9606, "9606"),
+            (None, ""),
+            (False, ""),
+            ({"value": "x"}, ""),
+            (["x"], ""),
+        ],
+    )
+    def test_a_text_field_is_read_only_when_it_is_text_or_a_number(self, value, expected) -> None:
+        assert as_text(value) == expected
+
+    def test_a_long_text_field_is_shortened_and_says_so(self) -> None:
+        text = as_text("x" * 10_000)
+
+        assert text.startswith("x" * MAX_FIELD_CHARACTERS)
+        assert "not shown" in text
+        assert as_text("x" * 10_000, limit=None) == "x" * 10_000
+
+    def test_a_short_list_is_joined_without_a_count(self) -> None:
+        assert listing(["a", "b"], 2) == "a, b"
+        assert listing(["a", "b", "c"], 2, separator="/") == "a/b and 1 more"
 
 
 class TestAgainstTheRealDatabases:

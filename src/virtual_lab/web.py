@@ -492,9 +492,10 @@ def read_capped(response: requests.Response, max_bytes: int) -> str:
 
     try:
         return b"".join(chunks).decode(encoding, errors="replace")
-    except LookupError:
+    except (LookupError, UnicodeError):
         # A service naming a codec Python does not have is not a reason to abandon the body, and
-        # letting LookupError escape would bypass every caller's handling of WebRequestError
+        # letting LookupError escape would bypass every caller's handling of WebRequestError.
+        # UnicodeError is for a codec that exists but refuses errors="replace", which idna does
         return b"".join(chunks).decode("utf-8", errors="replace")
 
 
@@ -511,7 +512,9 @@ def retry_delay(attempt: int, response: requests.Response | None) -> float:
     if response is not None:
         requested = response.headers.get("Retry-After")
 
-        if requested is not None and requested.strip().isdigit():
+        # isdecimal for the same reason as the Content-Length check: a superscript two passes
+        # isdigit, and float() then raises on it
+        if requested is not None and requested.strip().isdecimal():
             return min(float(requested.strip()), 60.0)
 
     # Jitter keeps several tool calls that failed together from retrying in lockstep
@@ -706,10 +709,25 @@ def request_json(
         use_cache=use_cache,
     )
 
+    return parse_json(body, url)
+
+
+def parse_json(body: str, url: str) -> Any:
+    """Parses a response body as JSON.
+
+    :param body: The body.
+    :param url: Where it came from, for the message.
+    :raises WebRequestError: If the body is not JSON, or nests too deeply to parse.
+    :return: The parsed body.
+    """
     try:
         return json.loads(body)
     except json.JSONDecodeError as error:
         raise WebRequestError(f"{url} did not return JSON: {error}") from error
+    except RecursionError as error:
+        # The parser recurses once per level, so a body of nothing but opening brackets, which
+        # takes only a few kilobytes, raises RecursionError from inside json.loads
+        raise WebRequestError(f"{url} returned JSON nested too deeply to read") from error
 
 
 def post_json(
@@ -783,10 +801,7 @@ def post_json(
 
                 body = read_capped(response=response, max_bytes=max_bytes)
 
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError as error:
-                raise WebRequestError(f"{url} did not return JSON: {error}") from error
+            return parse_json(body, url)
         except requests.RequestException as error:
             last_error = f"{type(error).__name__}: {error}"
 

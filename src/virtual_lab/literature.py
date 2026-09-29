@@ -22,14 +22,21 @@ from virtual_lab.constants import (
     MAX_ABSTRACT_CHARACTERS,
     MAX_ARTICLE_CHARACTERS,
     MAX_AUTHORS_REPORTED,
+    MAX_FIELD_CHARACTERS,
     MAX_CATEGORIES_REPORTED,
+    MAX_ITEMS_LISTED,
     MAX_SEARCH_RESULTS,
     MAX_SECTION_CHARACTERS,
     SKIPPED_SECTION_TITLES,
 )
 from virtual_lab.records import (
     RecordNotFoundError,
+    as_dict,
+    as_int,
+    as_list,
+    as_text,
     bounded,
+    listing,
     parse_xml,
     truncate_text,
 )
@@ -90,6 +97,16 @@ def collapse(text: str) -> str:
     :return: The text with runs of whitespace reduced to single spaces.
     """
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def field(value: Any, limit: int | None = MAX_FIELD_CHARACTERS) -> str:
+    """Reads a text field onto one line, and shortens it after the whitespace is gone.
+
+    :param value: The value as the service sent it.
+    :param limit: The most characters to keep, or None to keep it whole.
+    :return: The text.
+    """
+    return as_text(collapse(as_text(value, limit=None)), limit=limit)
 
 
 @dataclass(frozen=True)
@@ -267,7 +284,7 @@ class ArticleText:
             lines.append(f"\n## {heading}\n{shown}")
 
         if self.skipped:
-            lines.append(f"\n(Sections not shown: {', '.join(self.skipped)}.)")
+            lines.append(f"\n(Sections not shown: {listing(self.skipped, MAX_ITEMS_LISTED)}.)")
 
         lines.append(f"\n{self.article.url}")
 
@@ -401,9 +418,9 @@ def article_from(record: dict[str, Any]) -> Article:
     :return: The article.
     """
     authors = tuple(
-        collapse(str(author.get("fullName") or ""))
-        for author in ((record.get("authorList") or {}).get("author") or [])
-        if author.get("fullName")
+        field(author.get("fullName"))
+        for author in as_list(as_dict(record.get("authorList")).get("author"))
+        if isinstance(author, dict) and author.get("fullName")
     )
 
     # A lite search does not return the author list, only the string it was rendered from, and a
@@ -411,36 +428,34 @@ def article_from(record: dict[str, Any]) -> Article:
     # ends in a full stop, which becomes part of the last author's name unless it is taken off.
     if not authors and record.get("authorString"):
         authors = tuple(
-            stripped
-            for part in str(record["authorString"]).split(",")
+            as_text(stripped)
+            for part in as_text(record["authorString"], limit=None).split(",")
             if (stripped := part.strip().rstrip("."))
         )
 
     # A preprint has no journal. Its server is recorded under the book details instead, and
     # leaving it blank is what makes a bioRxiv preprint read like a paper with no venue.
-    journal = collapse(
-        str(record.get("journalTitle") or "")
-        or str(((record.get("journalInfo") or {}).get("journal") or {}).get("title") or "")
-        or str((record.get("bookOrReportDetails") or {}).get("publisher") or "")
+    journal = field(
+        as_text(record.get("journalTitle"), limit=None)
+        or as_text(as_dict(as_dict(record.get("journalInfo")).get("journal")).get("title"), None)
+        or as_text(as_dict(record.get("bookOrReportDetails")).get("publisher"), limit=None)
     )
 
-    year = record.get("pubYear")
-
     return Article(
-        article_id=str(record.get("id") or ""),
-        source=str(record.get("source") or ""),
-        pmid=str(record.get("pmid") or ""),
-        pmcid=str(record.get("pmcid") or ""),
-        doi=str(record.get("doi") or ""),
-        title=collapse(str(record.get("title") or "")),
+        article_id=as_text(record.get("id")),
+        source=as_text(record.get("source")),
+        pmid=as_text(record.get("pmid")),
+        pmcid=as_text(record.get("pmcid")),
+        doi=as_text(record.get("doi")),
+        title=field(record.get("title")),
         authors=authors,
         journal=journal,
         # Sent as a string, unlike citedByCount beside it, which is sent as a number
-        year=int(year) if str(year or "").strip().isdigit() else None,
-        cited_by=int(record.get("citedByCount") or 0),
+        year=as_int(record.get("pubYear")),
+        cited_by=as_int(record.get("citedByCount"), 0) or 0,
         open_access=yes(record.get("isOpenAccess")),
         in_europe_pmc=yes(record.get("inEPMC")),
-        abstract=collapse(str(record.get("abstractText") or "")),
+        abstract=field(record.get("abstractText"), limit=None),
     )
 
 
@@ -519,12 +534,12 @@ def search_articles(
         sort=ARTICLE_SORTS[sort],
     )
 
-    records = ((response.get("resultList") or {}).get("result") or [])[:size]
+    records = as_list(as_dict(response.get("resultList")).get("result"))[:size]
 
     return ArticleResults(
         query=asked,
-        total=int(response.get("hitCount") or 0),
-        articles=tuple(article_from(record) for record in records),
+        total=as_int(response.get("hitCount"), 0) or 0,
+        articles=tuple(article_from(as_dict(record)) for record in records),
         sort=sort,
     )
 
@@ -558,12 +573,12 @@ def get_article(identifier: str) -> Article:
         query = f'DOI:"{wanted}"'
 
     response = europe_pmc_search(query=query, result_type="core", size=1)
-    records = (response.get("resultList") or {}).get("result") or []
+    records = as_list(as_dict(response.get("resultList")).get("result"))
 
     if not records:
         raise RecordNotFoundError(f'Europe PMC has no article for "{wanted}".')
 
-    return article_from(records[0])
+    return article_from(as_dict(records[0]))
 
 
 def section_text(element: ElementTree.Element) -> str:
@@ -574,25 +589,44 @@ def section_text(element: ElementTree.Element) -> str:
     the section's own title is dropped; a subsection keeps its own, since those are the structure
     of the argument rather than a repeat.
 
+    Walked with a list of pending work rather than by recursion, and collapsed once at the end
+    rather than at every level. Both matter for a document from elsewhere: recursion raised
+    RecursionError at a nesting depth of 2,000, and collapsing each subsection's text again
+    inside its parent made the cost quadratic in the depth, 5.85 seconds for 822 KB at depth 800.
+
     :param element: The section element.
     :return: Its text, with runs of whitespace collapsed.
     """
-    parts: list[str] = [element.text or ""]
-    dropped = False
+    parts: list[str] = []
+    # Each entry is text to emit, or a section still to be expanded into its text
+    pending: list[str | ElementTree.Element] = [element]
 
-    for child in element:
-        if child.tag == "title" and not dropped:
-            dropped = True
-        elif child.tag == "sec":
-            # Recursed into rather than read wholesale, so that a subsection's heading is marked
-            # off from its first sentence instead of reading as the start of it
-            heading = collapse(child.findtext("title", ""))
-            nested = section_text(child)
-            parts.append(f" {heading}. {nested}" if heading else f" {nested}")
-        else:
-            parts.append("".join(child.itertext()))
+    while pending:
+        item = pending.pop()
 
-        parts.append(child.tail or "")
+        if isinstance(item, str):
+            parts.append(item)
+            continue
+
+        parts.append(item.text or "")
+        expanded: list[str | ElementTree.Element] = []
+        dropped = False
+
+        for child in item:
+            if child.tag == "title" and not dropped:
+                dropped = True
+            elif child.tag == "sec":
+                # Headed rather than read wholesale, so that a subsection's heading is marked off
+                # from its first sentence instead of reading as the start of it
+                heading = collapse(child.findtext("title", ""))
+                expanded.append(f" {heading}. " if heading else " ")
+                expanded.append(child)
+            else:
+                expanded.append("".join(child.itertext()))
+
+            expanded.append(child.tail or "")
+
+        pending.extend(reversed(expanded))
 
     return collapse("".join(parts))
 
@@ -647,7 +681,7 @@ def get_article_text(pmcid: str) -> ArticleText:
             sections.append(("Abstract", text))
 
     for element in root.findall("./body/sec"):
-        heading = collapse(element.findtext("title", "")) or "Untitled section"
+        heading = field(element.findtext("title", "")) or "Untitled section"
 
         if is_skipped(heading):
             skipped.append(heading)
@@ -702,14 +736,14 @@ def preprint_from(entry: ElementTree.Element) -> Preprint:
     """
     # The identifier arrives as a URL, and the version on the end matters: a result for v1 of a
     # paper that is now on v3 is a different document
-    raw_id = collapse(entry.findtext("atom:id", "", ATOM))
+    raw_id = field(entry.findtext("atom:id", "", ATOM))
     arxiv_id = raw_id.rsplit("/abs/", 1)[-1] if "/abs/" in raw_id else raw_id
 
     categories = tuple(
         dict.fromkeys(
             term
             for element in entry.findall("atom:category", ATOM)
-            if (term := element.attrib.get("term", "").strip())
+            if (term := field(element.attrib.get("term")))
         )
     )
 
@@ -717,19 +751,19 @@ def preprint_from(entry: ElementTree.Element) -> Preprint:
         arxiv_id=arxiv_id,
         # Wrapped across lines in the feed, so a title used unchanged carries newlines into the
         # middle of a report
-        title=collapse(entry.findtext("atom:title", "", ATOM)),
+        title=field(entry.findtext("atom:title", "", ATOM)),
         authors=tuple(
-            collapse(name)
+            field(name)
             for author in entry.findall("atom:author", ATOM)
             if (name := author.findtext("atom:name", "", ATOM))
         ),
-        abstract=collapse(entry.findtext("atom:summary", "", ATOM)),
-        published=collapse(entry.findtext("atom:published", "", ATOM)),
-        updated=collapse(entry.findtext("atom:updated", "", ATOM)),
+        abstract=field(entry.findtext("atom:summary", "", ATOM), limit=None),
+        published=field(entry.findtext("atom:published", "", ATOM)),
+        updated=field(entry.findtext("atom:updated", "", ATOM)),
         categories=categories,
-        comment=collapse(entry.findtext("arxiv:comment", "", ATOM)),
-        journal_reference=collapse(entry.findtext("arxiv:journal_ref", "", ATOM)),
-        doi=collapse(entry.findtext("arxiv:doi", "", ATOM)),
+        comment=field(entry.findtext("arxiv:comment", "", ATOM)),
+        journal_reference=field(entry.findtext("arxiv:journal_ref", "", ATOM)),
+        doi=field(entry.findtext("arxiv:doi", "", ATOM)),
     )
 
 
@@ -786,6 +820,6 @@ def search_preprints(
     return PreprintResults(
         query=sent,
         asked=asked,
-        total=int(total) if total.isdigit() else len(preprints),
+        total=as_int(total, len(preprints)),
         preprints=preprints,
     )

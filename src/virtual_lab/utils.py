@@ -81,8 +81,14 @@ def run_pubmed_search(query: str, num_articles: int = 3, abstract_only: bool = F
     :param query: The query to search PubMed with.
     :param num_articles: The number of articles to search for.
     :param abstract_only: Whether to return only the abstract instead of the full text.
+    :raises ValueError: If the number of articles is not a whole number of at least one.
     :return: The full text of the top matching article.
     """
+    from virtual_lab.constants import MAX_PUBMED_ARTICLES
+    from virtual_lab.records import bounded
+
+    num_articles = bounded(num_articles, MAX_PUBMED_ARTICLES, "num_articles")
+
     # Print search query
     print(
         f'Searching PubMed Central for {num_articles} articles ({"abstracts" if abstract_only else "full text"}) with query: "{query}"'
