@@ -17,7 +17,7 @@ import requests
 from conftest import FakeResponse
 
 import virtual_lab.web as web
-from virtual_lab.constants import MIN_SECONDS_BETWEEN_REQUESTS
+from virtual_lab.constants import MAX_PUBMED_ARTICLES, MIN_SECONDS_BETWEEN_REQUESTS
 from virtual_lab.web import (
     ALLOWED_HOSTS,
     RESPONSE_CACHE,
@@ -386,6 +386,14 @@ class TestResponseSize:
 
         assert request_text(UNIPROT) == "hello"
 
+    def test_a_length_header_too_long_for_int_is_ignored_rather_than_raised(
+        self, transport
+    ) -> None:
+        # isdecimal accepts it, and int() then refuses a string past 4,300 digits
+        transport.responses = [FakeResponse(body=b"hello", headers={"Content-Length": "9" * 5000})]
+
+        assert request_text(UNIPROT) == "hello"
+
     def test_a_cached_body_is_still_measured_against_a_smaller_limit(self, transport) -> None:
         # The cache is consulted before the limit is applied, so without the limit in the key a
         # body stored under a generous one would be handed to a caller that asked for less
@@ -428,6 +436,14 @@ class TestDecoding:
                 body=b'{"a": 1}',
                 headers={"Content-Type": "application/json; charset=unknown-8bit"},
             )
+        ]
+
+        assert request_json(UNIPROT) == {"a": 1}
+
+    def test_a_codec_that_refuses_replacement_does_not_crash(self, transport) -> None:
+        # idna exists, so it is not a LookupError, but it raises UnicodeError for errors="replace"
+        transport.responses = [
+            FakeResponse(body=b'{"a": 1}', headers={"Content-Type": "text/plain; charset=idna"})
         ]
 
         assert request_json(UNIPROT) == {"a": 1}
@@ -507,6 +523,27 @@ class TestRetries:
         third = retry_delay(attempt=3, response=None)
 
         assert third > first
+
+    def test_a_retry_after_in_superscript_falls_back_to_backoff(self) -> None:
+        # A superscript two passes str.isdigit, and float() then raises on it
+        response = FakeResponse(status_code=429, headers={"Retry-After": "\u00b2"})
+
+        assert retry_delay(attempt=1, response=response) < 10
+
+    def test_a_transport_error_on_the_final_attempt_is_reported(self, monkeypatch) -> None:
+        attempts = {"count": 0}
+
+        def unreachable(url, **kwargs):
+            attempts["count"] += 1
+            raise requests.ConnectionError("network down")
+
+        monkeypatch.setattr(web, "http_get", unreachable)
+
+        with pytest.raises(WebRequestError, match="after 3 attempts: ConnectionError") as raised:
+            request_text(UNIPROT)
+
+        assert attempts["count"] == 3
+        assert isinstance(raised.value.__cause__, requests.ConnectionError)
 
     def test_a_nonsense_delay_request_is_ignored(self) -> None:
         response = FakeResponse(status_code=429, headers={"Retry-After": "Tue, 1 Jan 2030"})
@@ -716,6 +753,15 @@ class TestJsonHandling:
 
         assert transport.requests[0]["timeout"] > 0
 
+    def test_json_nested_too_deeply_to_parse_is_reported_as_a_request_error(
+        self, transport
+    ) -> None:
+        # json.loads recurses once per level, so 200 KB of opening brackets raised RecursionError
+        transport.responses = [FakeResponse(body=b"[" * 200_000)]
+
+        with pytest.raises(WebRequestError, match="nested too deeply"):
+            request_json(UNIPROT)
+
     def test_undecodable_bytes_do_not_raise(self, transport) -> None:
         transport.responses = [FakeResponse(body=b'{"a": "\xff\xfe"}')]
 
@@ -789,6 +835,58 @@ class TestPostedQueries:
 
         assert web.post_json(RCSB, payload={}) == {"ok": True}
         assert len(post_transport.requests) == 2
+
+    def test_a_temporary_failure_on_every_attempt_is_reported(self, post_transport) -> None:
+        post_transport.responses = [FakeResponse(status_code=503) for _ in range(4)]
+
+        with pytest.raises(WebRequestError, match="after 3 attempts: .* returned 503"):
+            web.post_json(RCSB, payload={})
+
+        assert len(post_transport.requests) == 3
+
+    def test_an_answer_that_is_not_json_is_reported(self, post_transport) -> None:
+        post_transport.responses = [FakeResponse(body=b"<html>maintenance</html>")]
+
+        with pytest.raises(WebRequestError, match="did not return JSON"):
+            web.post_json(RCSB, payload={})
+
+    def test_an_answer_nested_too_deeply_is_reported(self, post_transport) -> None:
+        post_transport.responses = [FakeResponse(body=b"[" * 200_000)]
+
+        with pytest.raises(WebRequestError, match="nested too deeply"):
+            web.post_json(RCSB, payload={})
+
+    def test_a_transport_error_is_retried(self, monkeypatch) -> None:
+        answers = [requests.ConnectionError("network down"), FakeResponse(body=b'{"ok": true}')]
+        sent = []
+
+        def post(url, **kwargs):
+            sent.append(url)
+            answer = answers.pop(0)
+
+            if isinstance(answer, Exception):
+                raise answer
+
+            return answer
+
+        monkeypatch.setattr(web.requests, "post", post)
+
+        assert web.post_json(RCSB, payload={}) == {"ok": True}
+        assert len(sent) == 2
+
+    def test_a_transport_error_on_every_attempt_is_reported(self, monkeypatch) -> None:
+        sent = []
+
+        def post(url, **kwargs):
+            sent.append(url)
+            raise requests.Timeout("read timed out")
+
+        monkeypatch.setattr(web.requests, "post", post)
+
+        with pytest.raises(WebRequestError, match="after 3 attempts: Timeout: read timed out"):
+            web.post_json(RCSB, payload={})
+
+        assert len(sent) == 3
 
     def test_a_permanent_failure_is_not_retried(self, post_transport) -> None:
         post_transport.responses = [FakeResponse(status_code=400) for _ in range(3)]
@@ -1012,6 +1110,49 @@ class TestThePubmedToolUsesThisLayer:
         from virtual_lab.utils import run_pubmed_search
 
         assert "No articles found" in run_pubmed_search("(((", num_articles=1)
+
+    def test_the_number_of_articles_a_model_asks_for_is_capped(self, transport) -> None:
+        transport.responses = [FakeResponse(body=b'{"esearchresult": {"idlist": []}}')]
+
+        from virtual_lab.utils import run_pubmed_search
+
+        run_pubmed_search("spike", num_articles=1_000_000)
+
+        assert transport.requests[0]["params"]["retmax"] == 2 * MAX_PUBMED_ARTICLES
+
+    def test_every_article_asked_for_fits_in_what_the_model_is_given(
+        self, transport, monkeypatch
+    ) -> None:
+        # The tool result is capped as a whole, so an article left at full length would push
+        # every article after it out of what the model sees
+        import virtual_lab.utils as utils
+        from virtual_lab.constants import MAX_TOOL_OUTPUT_CHARS
+
+        transport.responses = [
+            FakeResponse(body=b'{"esearchresult": {"idlist": ["1", "2", "3", "4", "5", "6"]}}')
+        ]
+        monkeypatch.setattr(
+            utils,
+            "get_pubmed_central_article",
+            lambda pmcid, abstract_only: (f"Article {pmcid}", ["word " * 20_000]),
+        )
+
+        text = utils.run_pubmed_search("spike", num_articles=3)
+
+        assert len(text) <= MAX_TOOL_OUTPUT_CHARS
+        assert all(f"PMCID = {pmcid}" in text for pmcid in ("1", "2", "3"))
+        assert "PMCID = 4" not in text
+
+    @pytest.mark.parametrize("num_articles", ["3", 0, True, float("nan")])
+    def test_a_number_of_articles_that_is_not_a_count_is_refused(
+        self, transport, num_articles
+    ) -> None:
+        from virtual_lab.utils import run_pubmed_search
+
+        with pytest.raises(ValueError, match="num_articles"):
+            run_pubmed_search("spike", num_articles=num_articles)
+
+        assert transport.requests == []
 
     def test_an_article_that_cannot_be_fetched_is_skipped(self, transport) -> None:
         from virtual_lab.utils import get_pubmed_central_article

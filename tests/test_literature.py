@@ -11,6 +11,8 @@ difference between the query a caller wrote and the query a service ran.
 """
 
 import os
+import time
+import xml.etree.ElementTree as ElementTree
 
 import pytest
 
@@ -19,11 +21,13 @@ from virtual_lab.constants import (
     MAX_ABSTRACT_CHARACTERS,
     MAX_ARTICLE_CHARACTERS,
     MAX_AUTHORS_REPORTED,
+    MAX_ITEMS_LISTED,
     MAX_SEARCH_RESULTS,
     MAX_SECTION_CHARACTERS,
     WEB_MAX_ATTEMPTS,
 )
 from virtual_lab.literature import (
+    ATOM,
     Article,
     ArticleText,
     Preprint,
@@ -36,6 +40,7 @@ from virtual_lab.literature import (
     preprint_from,
     search_articles,
     search_preprints,
+    section_text,
     yes,
 )
 from virtual_lab.records import RecordNotFoundError, parse_xml
@@ -514,6 +519,21 @@ class TestRefusingAnUnsafeDocument:
         with pytest.raises(WebRequestError, match="document type"):
             parse_xml('<?xml version="1.0"?>\n  <!doctype feed []>\n<feed/>', WebRequestError)
 
+    def test_a_declaration_after_a_long_comment_is_still_refused(self) -> None:
+        # Only the first 4 KB used to be searched, so a comment in front of the declaration let a
+        # 6.6 KB feed through that expanded to a five megabyte report
+        body = (
+            '<?xml version="1.0"?><!--' + "padding " * 1000 + '--><!DOCTYPE f [<!ENTITY a "b">]>'
+            "<feed><entry><title>&a;</title></entry></feed>"
+        )
+
+        with pytest.raises(WebRequestError, match="document type"):
+            parse_xml(body, WebRequestError)
+
+    def test_an_entity_declaration_without_a_doctype_is_refused(self) -> None:
+        with pytest.raises(WebRequestError, match="document type"):
+            parse_xml('<feed><!entity a "b"></feed>', WebRequestError)
+
     def test_an_ordinary_document_is_parsed(self) -> None:
         assert parse_xml("<feed><entry/></feed>", WebRequestError).tag == "feed"
 
@@ -742,6 +762,167 @@ class TestWhatAReportCosts:
         text = ArticleText(article=article_from(ARTICLE_RECORD), sections=sections)
 
         assert len(text.report()) < MAX_ARTICLE_CHARACTERS + 2_000
+
+
+class TestAResponseOfTheWrongShape:
+    """A field of the wrong type is read as absent, and a long one is shortened when it is read."""
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"pubYear": "\u00b2"},
+            {"pubYear": "2012a", "citedByCount": "many"},
+            {"citedByCount": float("inf")},
+            {"authorList": {"author": ["not an object"]}, "authorString": None},
+            {"authorList": ["not an object"], "journalInfo": {"journal": "Nature"}},
+            {"title": {"text": "A title"}, "bookOrReportDetails": ["bioRxiv"]},
+        ],
+    )
+    def test_an_article_of_the_wrong_shape_still_reports(self, overrides) -> None:
+        assert article_from(ARTICLE_RECORD | overrides).report()
+
+    def test_a_year_sent_as_a_number_is_read(self) -> None:
+        assert article_from(ARTICLE_RECORD | {"pubYear": 2012}).year == 2012
+
+    def test_every_field_of_an_article_report_is_bounded(self) -> None:
+        huge = "x" * 1_000_000
+        article = article_from(
+            ARTICLE_RECORD
+            | {
+                "title": huge,
+                "journalTitle": huge,
+                "authorString": ", ".join([huge] * 3),
+                "doi": huge,
+                "abstractText": huge,
+            }
+        )
+
+        assert len(article.report()) < 10_000
+        assert len(article.summary()) < 5_000
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"hitCount": "many", "resultList": {"result": "none"}},
+            {"hitCount": 3, "resultList": ["not an object"]},
+            {"hitCount": 1, "resultList": {"result": ["not an object"]}},
+        ],
+    )
+    def test_a_search_of_the_wrong_shape_still_reports(self, web_transport, response) -> None:
+        queue(web_transport, response)
+
+        assert search_articles("microRNA").report()
+
+    def test_a_total_that_is_not_a_number_is_the_number_of_preprints(self, web_transport) -> None:
+        queue_text(web_transport, ARXIV_FEED.replace(">893<", ">\u00b2<"))
+
+        assert search_preprints("protein language model").total == 1
+
+    def test_every_field_of_a_preprint_report_is_bounded(self) -> None:
+        huge = "x" * 1_000_000
+        entry = ElementTree.fromstring(
+            ARXIV_FEED.replace("Published at ICLR 2025", huge)
+            .replace("The Thirteenth ICLR", huge)
+            .replace("Jacob Beck", huge)
+            .replace('term="cs.LG"', f'term="{huge}"')
+            .replace("<arxiv:primary", f"<arxiv:doi>{huge}</arxiv:doi><arxiv:primary")
+            .replace("Metalic", huge)
+            .encode()
+        ).find("atom:entry", ATOM)
+        preprint = preprint_from(entry)
+
+        assert len(preprint.report()) < 10_000
+        assert len(preprint.summary()) < 10_000
+
+    def test_the_sections_left_out_are_counted_past_the_first_few(self) -> None:
+        text = ArticleText(article=Article(article_id="1"), skipped=("References",) * 100_000)
+
+        assert f"and {100_000 - MAX_ITEMS_LISTED:,} more" in text.report()
+        assert len(text.report()) < 5_000
+
+    def test_a_long_section_heading_is_shortened(self, web_transport) -> None:
+        huge = "H" * 1_000_000
+        queue(web_transport, search_response(ARTICLE_RECORD))
+        web_transport.responses.append(
+            FakeResponse(body=JATS.replace("INTRODUCTION", huge).encode())
+        )
+
+        text = get_article_text("PMC3258128")
+
+        assert len(text.report()) < MAX_ARTICLE_CHARACTERS + 5_000
+
+
+class TestReadingDeeplyNestedSections:
+    """A full text is a document from elsewhere, so how deep its sections go is not ours to pick."""
+
+    def test_sections_nested_past_the_recursion_limit_are_read(self) -> None:
+        body = "<sec>" * 2000 + "deepest" + "</sec>" * 2000
+
+        assert section_text(ElementTree.fromstring(body)) == "deepest"
+
+    def test_markup_nested_past_the_recursion_limit_is_read(self) -> None:
+        # Read with itertext(), which is safe at this depth only because the C implementation of
+        # ElementTree walks it without recursing
+        body = "<sec><title>T</title>" + "<p>" * 2000 + "deepest" + "</p>" * 2000 + "</sec>"
+
+        assert section_text(ElementTree.fromstring(body)) == "deepest"
+
+    def test_deep_nesting_costs_time_in_proportion_to_its_size(self) -> None:
+        # Collapsing each subsection again inside its parent took 5.85 s for this document
+        body = (
+            "".join(f"<sec><title>T{index}</title>" + "word " * 200 for index in range(800))
+            + "</sec>" * 800
+        )
+        root = ElementTree.fromstring(body)
+
+        started = time.perf_counter()
+        text = section_text(root)
+
+        assert time.perf_counter() - started < 1.0
+        assert text.startswith("word word")
+        assert text.endswith("T799. " + " ".join(["word"] * 200))
+
+    def test_text_between_and_after_subsections_keeps_its_place(self) -> None:
+        body = (
+            "<sec><title>Own</title>lead <b>bold</b> tail"
+            "<sec><title>Sub</title>inside<sec>deeper</sec>after deeper</sec>"
+            " between <fig><title>Figure</title><sec>boxed</sec></fig> end</sec>"
+        )
+
+        # Exactly what the recursive version produced, including the two places where it joins
+        # words without a space: after an untitled subsection, and inside markup read whole
+        assert section_text(ElementTree.fromstring(body)) == (
+            "lead bold tail Sub. inside deeperafter deeper between Figureboxed end"
+        )
+
+
+class TestWhatAPreprintReportSays:
+    def test_a_long_author_list_is_named_in_part_and_counted(self) -> None:
+        authors = tuple(f"Author {index}" for index in range(MAX_AUTHORS_REPORTED + 3))
+        preprint = Preprint(arxiv_id="2410.08355v3", authors=authors, published="2024-10-10T20")
+
+        assert preprint.credit().endswith("Author 7, and 3 others. 2024-10-10")
+
+    def test_a_journal_reference_is_marked_in_a_search_result(self) -> None:
+        preprint = Preprint(arxiv_id="1", journal_reference="Nature 1", comment="10 pages")
+
+        assert "[published: Nature 1]" in preprint.summary()
+        assert "10 pages" not in preprint.summary()
+
+    def test_an_author_note_is_marked_when_there_is_no_journal_reference(self) -> None:
+        preprint = Preprint(arxiv_id="1", categories=("cs.LG",), comment="Accepted at  ICLR")
+
+        assert "[cs.LG; Accepted at ICLR]" in preprint.summary()
+
+    def test_a_doi_is_given_its_own_line(self) -> None:
+        report = Preprint(arxiv_id="1", doi="10.1000/xyz").report()
+
+        assert "\nDOI: 10.1000/xyz\n" in report
+
+    def test_a_search_with_no_preprints_says_so(self) -> None:
+        results = PreprintResults(query="all:x", asked="x", total=0)
+
+        assert results.report() == 'No preprints on arXiv match "x".'
 
 
 class TestAgainstTheRealServices:
