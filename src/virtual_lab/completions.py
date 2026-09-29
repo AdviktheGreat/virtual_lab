@@ -27,16 +27,37 @@ MODELS_WITHOUT_TEMPERATURE: set[str] = set()
 _LOCK = threading.Lock()
 
 
-def rejects_temperature(error: openai.BadRequestError) -> bool:
-    """Whether a refused request was refused for its temperature.
+# The codes for a model that takes no temperature, as against one that takes this temperature
+# but not the value given. A value out of range is also reported against "temperature", and
+# treating it as a refusal would drop the caller's mistake silently and stop sending any
+# temperature to that model for the rest of the process.
+UNSUPPORTED_CODES = frozenset({"unsupported_value", "unsupported_parameter"})
 
-    The API names the offending parameter, which is the only part of the error meant to be read
-    by a program; the message wording has changed between models.
+
+def check_temperature(temperature: float | None) -> None:
+    """Refuses a temperature no model accepts, before it is sent.
+
+    :param temperature: The sampling temperature, or None for the model's default.
+    :raises ValueError: If the temperature is outside 0 to 2.
+    """
+    # Written this way round so that NaN, which compares false with everything, is refused
+    if temperature is not None and not 0 <= temperature <= 2:
+        raise ValueError(f"temperature must be between 0 and 2, not {temperature}")
+
+
+def rejects_temperature(error: openai.BadRequestError) -> bool:
+    """Whether a refused request was refused because the model takes no temperature.
+
+    The API names the offending parameter and gives a code, which are the parts of the error
+    meant to be read by a program; the message wording has changed between models.
 
     :param error: The error the API returned.
     :return: Whether removing the temperature could make the request succeed.
     """
-    return getattr(error, "param", None) == "temperature"
+    return (
+        getattr(error, "param", None) == "temperature"
+        and getattr(error, "code", None) in UNSUPPORTED_CODES
+    )
 
 
 def send_request(
@@ -51,9 +72,12 @@ def send_request(
     :param model: The model to ask.
     :param temperature: The sampling temperature wanted, or None for the model's default.
     :param kwargs: The rest of the request.
+    :raises ValueError: If the temperature is outside 0 to 2.
     :raises openai.BadRequestError: If the request is refused for any other reason.
     :return: The response.
     """
+    check_temperature(temperature)
+
     if temperature is not None and model not in MODELS_WITHOUT_TEMPERATURE:
         try:
             return send(model=model, temperature=temperature, **kwargs)

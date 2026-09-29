@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from pydantic import BaseModel
 from tqdm import trange, tqdm
 
 from virtual_lab.agent import Agent
-from virtual_lab.completions import ran_without_temperature, send_request
+from virtual_lab.completions import check_temperature, ran_without_temperature, send_request
 from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
     DEFAULT_MAX_RETRIES,
@@ -177,9 +178,11 @@ def hold_meeting(
     if num_rounds < 0:
         raise ValueError(f"num_rounds must be zero or more, not {num_rounds}")
 
-    # Written this way round so that NaN, which compares false with everything, is refused
-    if max_cost is not None and not max_cost >= 0:
-        raise ValueError(f"max_cost must be zero or more, not {max_cost}")
+    # Infinity would be no limit at all, and is written to the record as JSON cannot hold it
+    if max_cost is not None and not (math.isfinite(max_cost) and max_cost >= 0):
+        raise ValueError(f"max_cost must be a finite amount, zero or more, not {max_cost}")
+
+    check_temperature(temperature)
 
     if max_completion_tokens is not None and max_completion_tokens < 1:
         raise ValueError(f"max_completion_tokens must be at least 1, not {max_completion_tokens}")

@@ -19,7 +19,8 @@ license = { file = "LICENSE" }
 requires-python = ">=3.12"
 dependencies = [
     "notebook",
-    "openai",
+    # parse on chat.completions outside beta, and the finish-reason errors carrying the response
+    "openai>=1.92",
     # Already required by openai, declared here because meeting output schemas are pydantic models
     "pydantic>=2.4",
     "requests",

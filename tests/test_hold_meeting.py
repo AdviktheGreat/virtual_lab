@@ -74,12 +74,14 @@ def partial_transcript(save_dir) -> list[dict[str, str]]:
     return json.loads((save_dir / PARTIAL_MEETING_DIR_NAME / "discussion.json").read_text())
 
 
-def bad_request(param: str | None, message: str = "Unsupported value") -> openai.BadRequestError:
+def bad_request(
+    param: str | None, message: str = "Unsupported value", code: str = "unsupported_value"
+) -> openai.BadRequestError:
     """Builds the error the API returns when it refuses a request parameter."""
     # Only what the error reads from the response; the HTTP library under the SDK has changed
     # name between releases, so it is not constructed here
     response = SimpleNamespace(status_code=400, request=None, headers={})
-    body = {"message": message, "type": "invalid_request_error", "param": param}
+    body = {"message": message, "type": "invalid_request_error", "param": param, "code": code}
 
     return openai.BadRequestError(message, response=response, body=body)  # type: ignore[arg-type]
 
@@ -203,6 +205,10 @@ class TestArguments:
             ({"num_rounds": -1}, "num_rounds"),
             ({"max_cost": -0.01}, "max_cost"),
             ({"max_cost": math.nan}, "max_cost"),
+            ({"max_cost": math.inf}, "max_cost"),
+            ({"temperature": 2.5}, "temperature"),
+            ({"temperature": -0.1}, "temperature"),
+            ({"temperature": math.nan}, "temperature"),
             ({"max_completion_tokens": 0}, "max_completion_tokens"),
         ],
     )
@@ -213,6 +219,7 @@ class TestArguments:
             individual(team_member, tmp_path, **kwargs)
 
         assert fake_client.completions.calls == []
+        assert not (tmp_path / PARTIAL_MEETING_DIR_NAME).exists()
 
     @pytest.mark.parametrize(
         "meeting, message",
@@ -546,6 +553,35 @@ class TestTemperature:
 
         assert result.output == Verdict(decision="go")
         assert "temperature" not in fake_client.completions.parse_calls[-1]
+
+    def test_model_that_takes_no_temperature_parameter_at_all_runs_at_its_default(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.responses = [
+            bad_request("temperature", "Unsupported parameter", code="unsupported_parameter")
+        ]
+
+        result = individual(team_member, tmp_path)
+
+        assert "temperature" not in fake_client.completions.calls[-1]
+        assert result.record.models_at_default_temperature == [TEST_MODEL]
+
+    def test_temperature_out_of_the_model_range_is_an_error_not_a_fallback(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        # Reported against "temperature" too, but it is the caller's mistake, and falling back
+        # would also stop every later meeting on this model from sending its temperature
+        fake_client.completions.responses = [
+            bad_request("temperature", "Expected a value <= 1", code="decimal_above_max_value")
+        ]
+
+        with pytest.raises(openai.BadRequestError):
+            individual(team_member, tmp_path, temperature=1.5)
+
+        individual(team_member, tmp_path, save_name="next")
+
+        assert len(fake_client.completions.calls) == 2
+        assert fake_client.completions.calls[-1]["temperature"] == 0.2
 
     def test_other_refusals_are_not_retried(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
