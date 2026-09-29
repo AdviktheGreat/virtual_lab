@@ -319,12 +319,16 @@ MAX_SHEET_BYTES = 30_000_000
 # wrote, and taking it at its word pads every row out to that width.
 MAX_SPREADSHEET_COLUMNS = 16_384
 
-# Cells to hold from one sheet, counting the blanks each row is padded with. The byte cap does
-# not bound this: a cell's position costs nothing to write, so a 5.7 KB sheet with a cell in
-# column XFD of each row was measured at 600 MB. The smallest real cell is 16 bytes of XML, so
-# a sheet under the byte cap holds fewer than this and is never cut short by it.
+# Cells to hold from one sheet, counting the blanks between the values in each row. The byte
+# cap does not bound this: a cell's position costs nothing to write, so a 5.7 KB sheet with a
+# cell in column XFD of each row was measured at 600 MB. The smallest real cell is 16 bytes of
+# XML, so a dense sheet under the byte cap holds fewer than this.
 MAX_TABLE_CELLS = 2_000_000
 
 # Names to list in one warning about a header. A matrix of per-sample measurements runs to tens
 # of thousands of columns, and a warning naming each blank one is the whole context window.
 MAX_NAMES_LISTED = 5
+
+# Sheets to name in a report. Unlike names in a warning, these are how a sheet is asked for, so
+# a workbook's ordinary handful is always listed in full.
+MAX_SHEETS_LISTED = 30

@@ -41,6 +41,7 @@ from virtual_lab.constants import (
     MAX_SAMPLE_COLUMNS,
     MAX_SAMPLE_ROWS,
     MAX_SHEET_BYTES,
+    MAX_SHEETS_LISTED,
     MAX_SPREADSHEET_COLUMNS,
     MAX_TABLE_BYTES,
     MAX_TABLE_CELLS,
@@ -145,15 +146,27 @@ def count(number: int, thing: str) -> str:
     return f"{number:,} {thing}" if number == 1 else f"{number:,} {thing}s"
 
 
-def listed(items: list[str]) -> str:
+def listed(items: list[str], limit: int = MAX_NAMES_LISTED) -> str:
     """The first few of a list, each shortened, joined, and how many more there are."""
-    shown = ", ".join(
-        truncate_text(item, MAX_CELL_CHARACTERS) for item in items[:MAX_NAMES_LISTED]
-    )
+    shown = ", ".join(truncate_text(item, MAX_CELL_CHARACTERS) for item in items[:limit])
 
-    return shown if len(items) <= MAX_NAMES_LISTED else (
-        f"{shown} and {len(items) - MAX_NAMES_LISTED:,} more"
-    )
+    return shown if len(items) <= limit else f"{shown} and {len(items) - limit:,} more"
+
+
+def whole(text: str, default: int) -> int:
+    """Reads a small whole number written by a file, or the default if it is not one.
+
+    int() is the wrong tool for a number a file claims: it rejects "q" and "²" (which
+    str.isdigit accepts) with ValueError, and anything past 4,300 digits too. Every number read
+    this way is an index or an identifier, so a long one is as wrong as a malformed one.
+    """
+    stripped = text.strip()
+    digits = stripped.removeprefix("-")
+
+    if not digits.isascii() or not digits.isdigit() or len(digits) > 18:
+        return default
+
+    return int(stripped)
 
 
 def looks_like(pattern: re.Pattern[str], value: str) -> bool:
@@ -293,7 +306,8 @@ class Table:
             )
 
         if self.other_sheets:
-            lines.append(f"Other sheets in this workbook: {', '.join(self.other_sheets)}.")
+            others = listed(list(self.other_sheets), MAX_SHEETS_LISTED)
+            lines.append(f"Other sheets in this workbook: {others}.")
 
         lines.append("\nColumns:")
         lines.extend(column.describe() for column in self.columns)
@@ -391,7 +405,11 @@ class ColumnScan:
             self.note("leading zeros", value)
 
         if kind == "number" and value.lstrip("+-").isdigit():
-            if abs(int(value)) > LARGEST_EXACT_INTEGER:
+            digits = value.lstrip("+-").lstrip("0")
+
+            # The length is compared first, since int() refuses more than 4,300 digits and an
+            # identifier column can hold a value that long
+            if len(digits) > 16 or int(digits or "0") > LARGEST_EXACT_INTEGER:
                 self.note("too large to be exact", value)
 
         if kind == "text":
@@ -727,9 +745,11 @@ def scan(
     long = 0
 
     for index, row in enumerate(rows):
-        if len(row) < len(names):
+        # Only a delimited row can be ragged. A spreadsheet row ends at its last value, so one
+        # that stops early has blanks in the rest rather than a field missing.
+        if kinds is None and len(row) < len(names):
             short += 1
-        elif len(row) > len(names):
+        elif kinds is None and len(row) > len(names):
             long += 1
 
         declared = kinds[index] if kinds is not None else None
@@ -961,10 +981,17 @@ def sheets_in(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     found = []
 
     for sheet in workbook.iter(f"{SHEET_NS}sheet"):
+        # Each sheet is a part of the archive, so a workbook listing more sheets than it can
+        # hold parts is listing the same part again and again
+        if len(found) >= MAX_ARCHIVE_ENTRIES:
+            break
+
         identifier = sheet.get(f"{DOCUMENT_NS}id", "")
 
+        # Excel allows 31 characters, so a name longer than a cell is shown is not a real one
         if identifier in targets:
-            found.append((sheet.get("name", "unnamed"), targets[identifier]))
+            label = truncate_text(sheet.get("name", "unnamed"), MAX_CELL_CHARACTERS)
+            found.append((label, targets[identifier]))
 
     if not found:
         raise TableError("This spreadsheet has no sheets")
@@ -1021,13 +1048,13 @@ def date_styles(archive: zipfile.ZipFile) -> set[int]:
         # A format means a date if it positions the parts of one. There is no flag saying so;
         # the letters are the only evidence the file carries.
         if "y" in bare or ("d" in bare and "m" in bare):
-            dated.add(int(custom.get("numFmtId", "-1")))
+            dated.add(whole(custom.get("numFmtId", ""), -1))
 
     styles = set()
 
     for cell_formats in root.iter(f"{SHEET_NS}cellXfs"):
         for index, entry in enumerate(cell_formats.iter(f"{SHEET_NS}xf")):
-            if int(entry.get("numFmtId", "0")) in dated:
+            if whole(entry.get("numFmtId", ""), 0) in dated:
                 styles.add(index)
 
     return styles
@@ -1061,7 +1088,7 @@ def cell_value(
         return text, "text" if text.strip() else "blank"
 
     if kind == "s":
-        index = int(raw) if raw.lstrip("-").isdigit() else -1
+        index = whole(raw, -1)
         text = strings[index] if 0 <= index < len(strings) else ""
         return text, "text" if text.strip() else "blank"
 
@@ -1082,15 +1109,26 @@ def cell_value(
         # holds for every formula in it, and empty text is already counted as a missing value.
         return raw, "text"
 
-    if int(cell.get("s", "-1") or "-1") in dated:
-        return excel_date(float(raw)), "date"
+    if whole(cell.get("s", ""), -1) in dated:
+        moment = excel_date(float(raw))
+
+        if moment is not None:
+            return moment, "date"
 
     return raw, "number"
 
 
-def excel_date(serial: float) -> str:
-    """Turns a spreadsheet's day number into a date."""
-    moment = EXCEL_DAY_ZERO + datetime.timedelta(days=serial)
+def excel_date(serial: float) -> str | None:
+    """Turns a spreadsheet's day number into a date, or None if no date is that day.
+
+    A date style over a number far outside the calendar is a style applied to the wrong
+    column, and the number is what the cell holds.
+    """
+    try:
+        moment = EXCEL_DAY_ZERO + datetime.timedelta(days=serial)
+    except (OverflowError, ValueError):
+        return None
+
     return moment.isoformat()
 
 
@@ -1156,7 +1194,7 @@ def pick_sheet(available: list[tuple[str, str]], wanted: str | None, name: str) 
         if sheet[0] == wanted:
             return sheet
 
-    offered = ", ".join(sheet[0] for sheet in available)
+    offered = listed([sheet[0] for sheet in available], MAX_SHEETS_LISTED)
 
     raise TableError(f'"{name}" has no sheet called "{wanted}". It has: {offered}.')
 
@@ -1182,7 +1220,7 @@ def sheet_rows(
     rows: list[list[str]] = []
     kinds: list[list[str]] = []
     stopped = ""
-    widest = 0
+    held = 0
 
     for row in root.iter(f"{SHEET_NS}row"):
         if len(rows) > MAX_TABLE_ROWS_SCANNED:
@@ -1196,37 +1234,45 @@ def sheet_rows(
             # The reference is optional, and writers that stream cells out in order omit it; a
             # cell without one goes in the column after the previous cell, as Excel reads it
             position = column_number(cell.get("r", "")) or position + 1
+
+            # Checked here as well as in column_number, since a run of cells with no reference
+            # reaches any column without naming it
+            if position > MAX_SPREADSHEET_COLUMNS:
+                raise TableError(
+                    f"This spreadsheet has a row of more than {MAX_SPREADSHEET_COLUMNS:,} cells, "
+                    f"past the last column a spreadsheet can have. The file is damaged or was "
+                    f"not written by a spreadsheet."
+                )
+
             placed[position] = cell_value(cell, strings, dated)
 
         if not placed:
             continue
 
+        # A row is held as far as its last value and no further. Padding every row to the
+        # widest would let one note far to the right of the header multiply the whole sheet.
         width = max(placed)
 
-        # Every row ends up as wide as the widest, so this is what holding one more row costs
-        if (len(rows) + 1) * max(widest, width) > MAX_TABLE_CELLS:
+        if held + width > MAX_TABLE_CELLS:
             stopped = (
-                f"The sheet is {count(max(widest, width), 'column')} wide, which is more than "
-                f"can be held for every row, so only the first {count(len(rows), 'row')} "
-                f"(counting the header) were read. A sheet this wide usually has a stray value "
-                f"far to the right of the table."
+                f"The sheet holds more cells than can be read at once, counting the blanks "
+                f"between the values in each row, so only the first {count(len(rows), 'row')} "
+                f"(counting the header) were read."
             )
             break
 
-        widest = max(widest, width)
+        held += width
         rows.append([placed.get(index, ("", "blank"))[0] for index in range(1, width + 1)])
         kinds.append([placed.get(index, ("", "blank"))[1] for index in range(1, width + 1)])
 
     if not rows:
         return [], [], stopped
 
-    # Every row is padded to the widest, because a header shorter than its data means the last
-    # columns have no name rather than that the rows are ragged
+    # Only the header is padded, because a header shorter than the data means the last columns
+    # have no name. A data row that stops early has blanks in the rest, which is how the scan
+    # and the sample already read a short row.
     width = max(len(row) for row in rows)
-
-    for row, kind in zip(rows, kinds):
-        row.extend([""] * (width - len(row)))
-        kind.extend(["blank"] * (width - len(kind)))
+    rows[0].extend([""] * (width - len(rows[0])))
 
     return rows, kinds, stopped
 

@@ -29,6 +29,7 @@ from virtual_lab.constants import (
     MAX_SAMPLE_COLUMNS,
     MAX_SAMPLE_ROWS,
     MAX_SHEET_BYTES,
+    MAX_SHEETS_LISTED,
     MAX_SPREADSHEET_COLUMNS,
     MAX_TABLE_ROWS_SCANNED,
 )
@@ -42,6 +43,7 @@ from virtual_lab.tables import (
     list_data_files,
     looks_like,
     name_columns,
+    whole,
 )
 
 SHEET_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -429,6 +431,22 @@ class TestRowsThatDoNotFitTheHeader:
 
         assert "1 shorter" in warning
         assert "1 longer" in warning
+
+    def test_an_identifier_too_long_for_int_is_flagged_rather_than_a_crash(
+        self, tmp_path
+    ) -> None:
+        write(tmp_path, "ids.csv", "id\n" + "1" * 5_000 + "\n")
+        column = describe_table(tmp_path, "ids.csv").columns[0]
+
+        assert any("cannot hold them exactly" in note for note in column.notes)
+
+    def test_an_identifier_at_the_exact_limit_is_not_flagged(self, tmp_path) -> None:
+        write(tmp_path, "ids.csv", f"id\n{2**53}\n{2**53 + 1}\n")
+        column = describe_table(tmp_path, "ids.csv").columns[0]
+        note = next(note for note in column.notes if "cannot hold them exactly" in note)
+
+        assert "on 1 of 2 values" in note
+        assert f"({2**53 + 1})" in note
 
     def test_rows_that_are_only_too_long_are_not_also_called_short(self, tmp_path) -> None:
         write(tmp_path, "ragged.csv", "a,b\n1,2\n3,4,5\n")
@@ -903,6 +921,17 @@ class TestCellsThatAreNotWhereTheyLook:
         assert column_number("123") == 0
         assert column_number("") == 0
 
+    @pytest.mark.parametrize("text", ["q", "\u00b2", "1" * 5_000, "", "1.5", "--1"])
+    def test_a_number_a_file_claims_is_only_taken_when_it_is_one(self, text) -> None:
+        # int() raises on each of these: "\u00b2" passes str.isdigit, and past 4,300 digits
+        # int() refuses outright
+        assert whole(text, -7) == -7
+
+    def test_an_ordinary_index_is_read(self) -> None:
+        assert whole("12", -1) == 12
+        assert whole(" 3 ", -1) == 3
+        assert whole("-1", 0) == -1
+
     def test_a_letter_outside_the_alphabet_is_not_a_column(self) -> None:
         # str.isalpha takes both. "é" came out as column 137, and "ß" upper-cases to "SS",
         # which made ord() raise a TypeError out of a function that only raises TableError
@@ -926,34 +955,79 @@ class TestCellsThatAreNotWhereTheyLook:
         with pytest.raises(TableError, match="past the last column"):
             describe_table(tmp_path, "book.xlsx")
 
-    def test_a_stray_value_far_to_the_right_stops_the_read_and_says_why(
+    def test_a_sheet_with_more_cells_than_can_be_held_stops_and_says_why(
         self, tmp_path, monkeypatch
     ) -> None:
-        # Every row is padded to the widest, so one cell in column AD makes each row thirty
-        # cells, and it is the padded total that the limit is on
+        # Each row is held as far as its last value, so a value in column AD makes the row
+        # thirty cells whatever lies between
         monkeypatch.setattr("virtual_lab.tables.MAX_TABLE_CELLS", 100)
-        cells = "".join(row(index, inline(f"A{index}", f"g{index}")) for index in range(1, 5))
-        body = sheet(cells + row(5, inline("A5", "g5") + inline("AD5", "stray")))
-        write(tmp_path, "book.xlsx", workbook({"Results": body}))
-        table = describe_table(tmp_path, "book.xlsx")
-
-        assert table.rows == 3
-        assert table.complete is False
-        assert any("30 columns wide" in warning for warning in table.warnings)
-        assert any("first 4 rows" in warning for warning in table.warnings)
-        assert "longer than" not in table.report()
-
-    def test_the_cell_limit_counts_the_widest_row_so_far_not_the_one_in_hand(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        monkeypatch.setattr("virtual_lab.tables.MAX_TABLE_CELLS", 100)
-        header = row(1, inline("A1", "gene") + inline("AD1", "note"))
-        cells = "".join(row(index, inline(f"A{index}", f"g{index}")) for index in range(2, 10))
-        write(tmp_path, "book.xlsx", workbook({"Results": sheet(header + cells)}))
+        cells = "".join(
+            row(index, inline(f"A{index}", f"g{index}") + inline(f"AD{index}", "far"))
+            for index in range(1, 10)
+        )
+        write(tmp_path, "book.xlsx", workbook({"Results": sheet(cells)}))
         table = describe_table(tmp_path, "book.xlsx")
 
         assert table.rows == 2
         assert table.complete is False
+        assert any("more cells than can be read" in warning for warning in table.warnings)
+        assert any("first 3 rows" in warning for warning in table.warnings)
+        assert "longer than" not in table.report()
+
+    def test_one_note_far_to_the_right_does_not_cut_a_narrow_sheet_short(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Padding every row to the widest made a note beside the header cost thirty cells a
+        # row, and cut a 50,000 row sheet of three columns to 19,999 rows
+        monkeypatch.setattr("virtual_lab.tables.MAX_TABLE_CELLS", 100)
+        header = row(1, inline("A1", "gene") + inline("AD1", "note"))
+        cells = "".join(row(index, inline(f"A{index}", f"g{index}")) for index in range(2, 31))
+        write(tmp_path, "book.xlsx", workbook({"Results": sheet(header + cells)}))
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert table.rows == 29
+        assert table.complete is True
+        assert table.total_columns == 30
+        assert table.columns[29].missing == 29
+        assert not any("same width" in warning for warning in table.warnings)
+        assert table.sample[0][:2] == ("g2", "")
+
+    def test_data_wider_than_the_header_is_named_rather_than_dropped(self, tmp_path) -> None:
+        # Only the header is padded, and without that a column the header does not reach
+        # disappears from the report without a warning
+        body = sheet(
+            row(1, inline("A1", "gene"))
+            + row(2, inline("A2", "TP53") + number("B2", "1.5"))
+            + row(3, inline("A3", "EGFR") + number("B3", "2.5"))
+        )
+        write(tmp_path, "book.xlsx", workbook({"Results": body}))
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert table.total_columns == 2
+        assert table.columns[1].name == "column 2"
+        assert table.columns[1].kind == "number"
+        assert any("no name" in warning for warning in table.warnings)
+
+    def test_a_run_of_cells_with_no_reference_cannot_pass_the_last_column(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Without the check, a row of five million bare cells built a dict of five million
+        # entries before any limit applied
+        monkeypatch.setattr("virtual_lab.tables.MAX_SPREADSHEET_COLUMNS", 3)
+        body = sheet("<row>" + "<c><v>1</v></c>" * 4 + "</row>")
+        write(tmp_path, "book.xlsx", workbook({"Results": body}))
+
+        with pytest.raises(TableError, match="past the last column"):
+            describe_table(tmp_path, "book.xlsx")
+
+    def test_a_run_of_cells_with_no_reference_may_reach_the_last_column(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr("virtual_lab.tables.MAX_SPREADSHEET_COLUMNS", 3)
+        body = sheet("<row>" + "<c><v>1</v></c>" * 3 + "</row><row><c><v>2</v></c></row>")
+        write(tmp_path, "book.xlsx", workbook({"Results": body}))
+
+        assert describe_table(tmp_path, "book.xlsx").total_columns == 3
 
     def test_a_far_right_column_is_placed_rather_than_counted(self, tmp_path) -> None:
         body = sheet(row(1, inline("A1", "first") + inline("AA1", "far")))
@@ -1162,6 +1236,84 @@ class TestRefusingAnUnsafeWorkbook:
         with pytest.raises(TableError, match="missing xl/workbook.xml"):
             describe_table(tmp_path, "hollow.xlsx")
 
+
+    @pytest.mark.parametrize(
+        "cell",
+        [
+            '<c r="A2" s="q"><v>1</v></c>',
+            '<c r="A2" t="s"><v>\u00b2</v></c>',
+            f'<c r="A2" t="s"><v>{"1" * 5_000}</v></c>',
+        ],
+    )
+    def test_a_malformed_number_in_the_markup_is_not_a_crash(self, tmp_path, cell) -> None:
+        body = sheet(row(1, inline("A1", "h")) + f'<row r="2">{cell}</row>')
+        write(tmp_path, "book.xlsx", workbook({"Results": body}, strings=["x"]))
+
+        assert describe_table(tmp_path, "book.xlsx").rows == 1
+
+    def test_a_malformed_style_is_read_as_no_style(self, tmp_path) -> None:
+        body = sheet(row(1, inline("A1", "n")) + row(2, number("A2", "5", style=0)))
+        raw = workbook({"Results": body}, formats=["14"])
+        raw = rebuild(
+            raw, "xl/styles.xml", lambda text: text.replace('numFmtId="14"', 'numFmtId="zz"')
+        )
+        write(tmp_path, "book.xlsx", raw)
+
+        assert describe_table(tmp_path, "book.xlsx").columns[0].kind == "number"
+
+    @pytest.mark.parametrize("value", ["1e300", "-1e7", "1e400"])
+    def test_a_date_style_over_a_number_no_calendar_has_is_left_a_number(
+        self, tmp_path, value
+    ) -> None:
+        # timedelta raises OverflowError on each; the style is on the wrong column
+        body = sheet(row(1, inline("A1", "n")) + row(2, number("A2", value, style=0)))
+        write(tmp_path, "book.xlsx", workbook({"Results": body}, formats=["14"]))
+        column = describe_table(tmp_path, "book.xlsx").columns[0]
+
+        assert column.kind == "number"
+        assert column.examples == (value,)
+
+    def test_a_long_sheet_name_is_shortened(self, tmp_path) -> None:
+        body = sheet(row(1, inline("A1", "gene")) + row(2, inline("A2", "TP53")))
+        write(tmp_path, "book.xlsx", workbook({"a" * 50_000: body, "Second": body}))
+        table = describe_table(tmp_path, "book.xlsx", sheet="Second")
+
+        assert len(table.report()) < 2_000
+        assert "characters not shown" in table.other_sheets[0]
+
+    def test_a_workbook_naming_one_part_over_and_over_is_not_read_as_that_many_sheets(
+        self, tmp_path
+    ) -> None:
+        body = sheet(row(1, inline("A1", "gene")) + row(2, inline("A2", "TP53")))
+        repeats = "".join(
+            f'<sheet name="copy{index}" sheetId="{index + 2}" r:id="rId1" />'
+            for index in range(5_000)
+        )
+        raw = rebuild(workbook({"Results": body}), "xl/workbook.xml", lambda text: text.replace(
+            "</sheets>", f"{repeats}</sheets>"
+        ))
+        write(tmp_path, "book.xlsx", raw)
+        table = describe_table(tmp_path, "book.xlsx")
+
+        assert len(table.other_sheets) == MAX_ARCHIVE_ENTRIES - 1
+        assert f"and {MAX_ARCHIVE_ENTRIES - 1 - MAX_SHEETS_LISTED:,} more" in table.report()
+
+    def test_an_ordinary_workbook_names_every_sheet(self, tmp_path) -> None:
+        body = sheet(row(1, inline("A1", "gene")) + row(2, inline("A2", "TP53")))
+        names = [f"S{index}" for index in range(MAX_SHEETS_LISTED + 1)]
+        write(tmp_path, "book.xlsx", workbook({name: body for name in names}))
+        report = describe_table(tmp_path, "book.xlsx").report()
+
+        assert f"S{MAX_SHEETS_LISTED}." in report
+        assert "more" not in report.split("Other sheets")[1].splitlines()[0]
+
+    def test_the_sheets_offered_when_one_is_missing_are_limited(self, tmp_path) -> None:
+        body = sheet(row(1, inline("A1", "gene")) + row(2, inline("A2", "TP53")))
+        names = [f"S{index}" for index in range(MAX_SHEETS_LISTED + 5)]
+        write(tmp_path, "book.xlsx", workbook({name: body for name in names}))
+
+        with pytest.raises(TableError, match="and 5 more"):
+            describe_table(tmp_path, "book.xlsx", sheet="Nope")
 
     def test_a_chart_sheet_is_not_taken_for_a_sheet_of_data(self, tmp_path) -> None:
         # A chart sheet sits in the workbook's list of sheets like any other, and Excel puts it
