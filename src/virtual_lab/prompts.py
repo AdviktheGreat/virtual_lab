@@ -400,6 +400,46 @@ def structured_output_prompt(agent: Agent) -> str:
     )
 
 
+def code_session_prompt(
+    code_actions: str, working_directory: str, network: bool, data_lake: str | None
+) -> str:
+    """Tells the meeting it has a running session to try things in, and how to use it.
+
+    :param code_actions: "tool" if code is run through the run_code tool, or "tags" if it is
+        written between <execute> and </execute>.
+    :param working_directory: Where the code runs, as the code sees it.
+    :param network: Whether the code can reach the internet.
+    :param data_lake: Where Biomni's data lake is, as the code sees it, if it is mounted.
+    """
+    if code_actions == "tags":
+        how = (
+            "To run code, write it between <execute> and </execute>, and stop there: the code "
+            "is run, and what it printed comes back between <observation> and </observation>, "
+            "after which you continue your turn. Code is Python unless the block starts with "
+            "#!R for R, or #!BASH for a shell script. Run one block at a time, and once you "
+            "have what you need, give your contribution to the discussion in a reply without "
+            "an <execute> block."
+        )
+    else:
+        how = "To run code, call the run_code tool."
+
+    where = [
+        f"The code runs in {working_directory}, and files written there are kept.",
+        "Code can reach the internet." if network else "Code cannot reach the internet.",
+    ]
+    if data_lake is not None:
+        where.append(f"Biomni's data lake of curated biomedical tables is at {data_lake}.")
+
+    return (
+        "This meeting has a running Python session that everyone in it shares. Use it to check "
+        "claims against data and to compute answers rather than estimate them. "
+        f"{how} Python variables, imports, and loaded data persist between runs and between "
+        "speakers, so build on what others have computed rather than repeating it, and say in "
+        "the discussion what you ran and what it showed. A matplotlib figure left open is saved "
+        f"to plots/. {' '.join(where)}"
+    )
+
+
 CODING_RULES = (
     "Your code must be self-contained (with appropriate imports) and complete.",
     "Your code may not include any undefined or unimplemented variables or functions.",

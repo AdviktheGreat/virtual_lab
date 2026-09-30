@@ -142,6 +142,11 @@ CREATIVE_TEMPERATURE = 0.8
 # force a text answer.
 MAX_TOOL_ITERATIONS = 5
 
+# The same limit for a meeting with a session to run code in. An analysis takes many steps of
+# code, each shaped by the output of the last: loading, inspecting, cleaning, and only then
+# computing what was asked. Biomni's agent routinely takes dozens.
+SESSION_MAX_TOOL_ITERATIONS = 20
+
 # Most characters of one tool result given back to a model. Every lookup already budgets its own
 # report, the largest being a full text at 20,000 characters plus its headings and citation, so
 # this is set above all of them and only binds on output that has no budget of its own: the
@@ -261,6 +266,10 @@ DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 # Subdirectory for the record of what happened when a meeting's code was run, kept separate
 # from the meeting's own record for the same reason the others are in their own directories.
 EXECUTION_DIR_NAME = "executions"
+
+# Subdirectory for the log of the code a meeting ran in its session, cell by cell, in full. The
+# meeting's record says which cells each turn ran; this holds their code and output.
+SESSION_LOG_DIR_NAME = "sessions"
 
 # Identifies this library to the services it queries. NCBI and EMBL-EBI both ask clients to say
 # who they are, and an unidentified client is the first to be throttled.

@@ -72,6 +72,10 @@ LANGUAGES = {
 }
 
 
+# What the tool that runs code in a session is called
+CODE_TOOL_NAME = "run_code"
+
+
 class SessionError(ExecutionError):
     """Raised when a session cannot be started, or is used after it was closed."""
 
@@ -450,6 +454,14 @@ class Session:
         """The working directory as the code sees it."""
         return str(self.directory)
 
+    def can_reach_network(self) -> bool:
+        """Whether the code can reach the internet."""
+        return True
+
+    def data_lake_path(self) -> str | None:
+        """Where Biomni's data lake is, as the code sees it, or None if it is not there."""
+        return None
+
 
 def session_executor(
     target: str = "full",
@@ -543,6 +555,12 @@ class DockerSession(Session):
     def where_code_runs(self) -> str:
         return SANDBOX_WORK_DIR
 
+    def can_reach_network(self) -> bool:
+        return self.executor.allow_network
+
+    def data_lake_path(self) -> str | None:
+        return SANDBOX_DATA_LAKE_DIR if self.executor.data_lake is not None else None
+
 
 class LocalSession(Session):
     """A session whose interpreter runs directly on this machine, with no isolation whatsoever.
@@ -603,9 +621,7 @@ def session_tool(session: Session) -> Tool:
     :param session: The session, shared by everyone the tool is given to.
     :return: The tool.
     """
-    executor = getattr(session, "executor", None)
-    network = getattr(executor, "allow_network", True)
-    data_lake = getattr(executor, "data_lake", None) is not None
+    data_lake = session.data_lake_path()
 
     notes = [
         "Run code in the meeting's shared interpreter and see what it prints. Python runs in "
@@ -617,11 +633,11 @@ def session_tool(session: Session) -> Tool:
         "A matplotlib figure left open is saved to plots/ and reported back.",
         "The value of a final expression is printed, as in a notebook. Keep output short: "
         "print summaries, shapes, and heads rather than whole tables.",
-        "Code can reach the internet." if network else "Code has no network access.",
+        "Code can reach the internet." if session.can_reach_network() else "Code has no network access.",
     ]
-    if data_lake:
+    if data_lake is not None:
         notes.append(
-            f"Biomni's data lake is mounted read-only at {SANDBOX_DATA_LAKE_DIR}, also in the "
+            f"Biomni's data lake is mounted read-only at {data_lake}, also in the "
             "BIOMNI_DATA_LAKE environment variable."
         )
 
@@ -629,7 +645,7 @@ def session_tool(session: Session) -> Tool:
         return session.run(code, language=language).report()
 
     return Tool(
-        name="run_code",
+        name=CODE_TOOL_NAME,
         description=" ".join(notes),
         parameters={
             "type": "object",
