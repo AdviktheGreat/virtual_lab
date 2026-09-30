@@ -167,6 +167,25 @@ MAX_RECORDED_ARGUMENT_CHARS = 2_000
 # meeting is not silently handed a different interpreter than the one it was written for.
 DEFAULT_SANDBOX_IMAGE = "python:3.12-slim"
 
+# The name the sandbox images built from Biomni's environment are tagged with (see
+# virtual_lab.environment)
+SANDBOX_IMAGE_NAME = "virtual-lab-sandbox"
+
+# The platform those images are built for. Biomni's environment is only published for x86-64
+# Linux: pystan has no ARM wheels, and several of its command-line tools are x86-64 binaries.
+# On an ARM machine Docker runs the image under emulation.
+SANDBOX_PLATFORM = "linux/amd64"
+
+# Where Biomni publishes its data lake and benchmarks
+BIOMNI_RELEASE_URL = "https://biomni-release.s3.amazonaws.com"
+
+# How much of a data lake file is read at a time. The largest are several gigabytes.
+DATA_LAKE_CHUNK_BYTES = 1024**2
+
+# Where the data lake is mounted in the sandbox, read-only. The same path Biomni's tools read
+# it from, relative to their data directory.
+SANDBOX_DATA_LAKE_DIR = "/biomni_data/data_lake"
+
 # Where the meeting's files are mounted inside the container. Model-authored code sees only
 # this directory, so paths it writes into its own output are relative to here.
 SANDBOX_WORK_DIR = "/workspace"

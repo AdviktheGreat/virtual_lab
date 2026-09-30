@@ -30,6 +30,15 @@ from virtual_lab.databases import (
     get_structure,
     search_proteins,
 )
+from virtual_lab.environment import (
+    DATA_LAKE,
+    SANDBOX_LIBRARIES,
+    SANDBOX_PLATFORM,
+    DataLakeDownload,
+    build_sandbox_image,
+    download_data_lake,
+    sandbox_image,
+)
 from virtual_lab.execution import (
     DockerExecutor,
     DockerUnavailableError,
@@ -191,6 +200,13 @@ __all__ = [
     "get_protein",
     "get_structure",
     "hold_meeting",
+    "DATA_LAKE",
+    "SANDBOX_LIBRARIES",
+    "SANDBOX_PLATFORM",
+    "DataLakeDownload",
+    "build_sandbox_image",
+    "download_data_lake",
+    "sandbox_image",
     "detect_source",
     "get_llm",
     "list_data_files",

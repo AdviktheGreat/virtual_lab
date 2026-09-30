@@ -469,8 +469,11 @@ def describe_executor(executor: Executor) -> dict[str, Any]:
         "cpu_limit",
         "pids_limit",
         "max_file_bytes",
+        "data_lake",
+        "platform",
     ):
         if hasattr(executor, attribute):
-            description[attribute] = getattr(executor, attribute)
+            value = getattr(executor, attribute)
+            description[attribute] = str(value) if isinstance(value, Path) else value
 
     return description

@@ -1,0 +1,8 @@
+The files in biomni_env/ are copied without modification from Biomni
+(https://github.com/snap-stanford/Biomni, commit 400c1f366b96a35ca253e13c9b06c5076af41d65),
+Copyright the Biomni authors, and are used under the Apache License, Version 2.0:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+The Dockerfile in this directory installs them in the order Biomni's biomni_env/setup.sh
+does. Where it departs from Biomni's scripts, it says so in a comment.
