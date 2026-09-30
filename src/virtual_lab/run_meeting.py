@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -24,6 +24,7 @@ from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
     DEFAULT_MAX_RETRIES,
     MAX_RECORDED_ARGUMENT_CHARS,
+    MAX_RECORDED_RETRIEVAL_CHARS,
     MAX_TOOL_ITERATIONS,
     PARTIAL_MEETING_DIR_NAME,
     SESSION_LOG_DIR_NAME,
@@ -44,6 +45,14 @@ from virtual_lab.prompts import (
 )
 from virtual_lab.provenance import MeetingRecord, describe_agent, save_record
 from virtual_lab.records import truncate_text
+from virtual_lab.resources import (
+    Resources,
+    available_resources,
+    parse_retrieval,
+    resources_prompt,
+    retrieval_prompt,
+    select_resources,
+)
 from virtual_lab.session import CODE_TOOL_NAME, Session, session_tool
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
@@ -140,6 +149,8 @@ def hold_meeting(
     session: Session | None = None,
     code_actions: Literal["tool", "tags"] = "tool",
     max_tool_iterations: int | None = None,
+    resources: Literal["retrieve", "all", "none"] | Resources = "retrieve",
+    commercial_mode: bool = False,
 ) -> MeetingResult:
     """Runs a meeting with LLM agents and returns everything it produced.
 
@@ -193,6 +204,18 @@ def hold_meeting(
     :param max_tool_iterations: The most tool calls and runs of code in one agent's turn before
         it is asked to answer without them. Defaults to 20 with a session, which an analysis
         needs, and 5 without one.
+    :param resources: What of Biomni's environment the agents are told they can use in the
+        session: its tool functions, data lake files, software, and know-how documents. With
+        "retrieve", the agent who closes the meeting is first asked which are relevant to the
+        agenda, as Biomni's agent asks before each task, at the cost of one request of about
+        12,000 tokens. With "all", every one is listed, which is about 40,000 tokens more in every
+        request. Pass a Resources to choose them yourself, or "none" to list nothing. Only used
+        with a session; tools and software are listed only where the session can import
+        Biomni's tools, and then only the software the session has installed and the tools whose
+        modules it can import; data is listed only where the data lake is mounted.
+    :param commercial_mode: Whether to leave out data and know-how that may not be used
+        commercially, as Biomni's commercial mode does. It does not check the tools' own licenses;
+        see the license_info.md that ships with Biomni's package.
     :raises BudgetExceededError: Before a request, if the meeting has already spent max_cost.
     :raises CostUnknownError: If max_cost is given and a model's cost, or a response's usage,
         cannot be known.
@@ -218,6 +241,12 @@ def hold_meeting(
 
     if code_actions == "tags" and session is None:
         raise ValueError('code_actions="tags" runs code in a session, so it needs a session')
+
+    if isinstance(resources, Resources):
+        if session is None:
+            raise ValueError("resources lists what can be used in a session, so it needs a session")
+    elif resources not in ("retrieve", "all", "none"):
+        raise ValueError(f'resources must be "retrieve", "all", "none", or a Resources, not {resources!r}')
 
     if max_tool_iterations is None:
         max_tool_iterations = SESSION_MAX_TOOL_ITERATIONS if session is not None else MAX_TOOL_ITERATIONS
@@ -359,16 +388,76 @@ def hold_meeting(
     # image was never built, fails the meeting before anything is spent. The session may have
     # run code for an earlier meeting; only what this one runs is its own.
     first_cell = 0
-    session_prompt = ""
+    catalog: Resources | None = None
     if session is not None:
         session.start()
         first_cell = len(session.history)
-        session_prompt = code_session_prompt(
-            code_actions=code_actions,
-            working_directory=session.where_code_runs(),
-            network=session.can_reach_network(),
-            data_lake=session.data_lake_path(),
-        )
+        if isinstance(resources, Resources):
+            catalog = resources
+            if catalog.data_lake and catalog.data_lake_path is None:
+                catalog = replace(catalog, data_lake_path=session.data_lake_path())
+        elif resources != "none":
+            catalog = available_resources(session, commercial_mode=commercial_mode)
+
+    if catalog is not None:
+        record.resources = {
+            "mode": resources if isinstance(resources, str) else "given",
+            "commercial_mode": commercial_mode,
+            "available": catalog.counts(),
+            "not_installed": catalog.not_installed,
+            "selected": catalog.names(),
+            "retrieval": None,
+        }
+
+    def choose_resources() -> Resources | None:
+        """Asks the agent who closes the meeting which resources the agenda needs, as Biomni does."""
+        if catalog is None or resources != "retrieve" or catalog.is_empty():
+            return catalog
+
+        chooser = team[0]
+        query = agenda
+        if agenda_questions:
+            query += "\n\n" + "\n".join(f"{number}. {question}" for number, question in enumerate(agenda_questions, 1))
+
+        retrieval_messages: list[ChatCompletionMessageParam] = [
+            {"role": "user", "content": retrieval_prompt(query, catalog)}
+        ]
+        check_context_length(messages=retrieval_messages, model=chooser.model)
+        check_budget()
+        retrieval_usage = MeetingUsage()
+        reply = ask_agent(agent=chooser, messages=retrieval_messages, tools=None)
+        count_usage(chooser.model, reply.usage, retrieval_usage)
+
+        chosen = parse_retrieval(reply.content)
+        if chosen is None:
+            # An answer with no list at all is not a choice of nothing, and listing nothing
+            # would leave the agents without the tools the meeting was given a session for
+            print(
+                f"Warning: {chooser.title} did not say which resources the agenda needs, so all of "
+                f"them are listed."
+            )
+            selected = catalog
+        else:
+            selected = select_resources(catalog, chosen)
+
+        assert record.resources is not None
+        record.resources["selected"] = selected.names()
+        record.resources["retrieval"] = {
+            "model": chooser.model,
+            "name": chooser.name,
+            "understood": chosen is not None,
+            "reply": truncate_text(reply.content, MAX_RECORDED_RETRIEVAL_CHARS),
+            "input_tokens": retrieval_usage.input_tokens,
+            "cached_input_tokens": retrieval_usage.cached_input_tokens,
+            "output_tokens": retrieval_usage.output_tokens,
+            "reasoning_tokens": retrieval_usage.reasoning_tokens,
+            "system_fingerprint": reply.system_fingerprint,
+            "finish_reason": reply.finish_reason,
+        }
+        listed = ", ".join(f"{count} {kind.replace('_', ' ')}" for kind, count in selected.counts().items())
+        print(f"Resources listed for the session: {listed}")
+
+        return selected
 
     def save_session(directory: Path) -> None:
         """Saves the code the meeting ran, and notes in the record where it went.
@@ -406,27 +495,40 @@ def hold_meeting(
     # Initialize messages for API calls
     messages: list[ChatCompletionMessageParam] = []
 
-    # Initial prompt for team meeting
-    if meeting_type == "team":
-        assert team_lead is not None and team_members is not None
-        initial_content = team_meeting_start_prompt(
-            team_lead=team_lead,
-            team_members=team_members,
-            agenda=agenda,
-            agenda_questions=agenda_questions,
-            agenda_rules=agenda_rules,
-            summaries=summaries,
-            contexts=contexts,
-            num_rounds=num_rounds,
-        )
-        if session_prompt:
-            initial_content = f"{initial_content}\n\n{session_prompt}"
-        messages.append({"role": "user", "content": initial_content})
-        discussion.append({"agent": "User", "message": initial_content})
-        record.record_turn(speaker="User", kind="prompt")
-
-    # Loop through rounds
     try:
+        session_prompt = ""
+        if session is not None:
+            selected = choose_resources()
+            session_prompt = code_session_prompt(
+                code_actions=code_actions,
+                working_directory=session.where_code_runs(),
+                network=session.can_reach_network(),
+                data_lake=session.data_lake_path(),
+            )
+            retrieved = record.resources is not None and bool((record.resources["retrieval"] or {}).get("understood"))
+            if selected is not None and (listed := resources_prompt(selected, code_actions, retrieved=retrieved)):
+                session_prompt = f"{session_prompt}\n\n{listed}"
+
+        # Initial prompt for team meeting
+        if meeting_type == "team":
+            assert team_lead is not None and team_members is not None
+            initial_content = team_meeting_start_prompt(
+                team_lead=team_lead,
+                team_members=team_members,
+                agenda=agenda,
+                agenda_questions=agenda_questions,
+                agenda_rules=agenda_rules,
+                summaries=summaries,
+                contexts=contexts,
+                num_rounds=num_rounds,
+            )
+            if session_prompt:
+                initial_content = f"{initial_content}\n\n{session_prompt}"
+            messages.append({"role": "user", "content": initial_content})
+            discussion.append({"agent": "User", "message": initial_content})
+            record.record_turn(speaker="User", kind="prompt")
+
+        # Loop through rounds
         for round_index in trange(num_rounds + 1, desc="Rounds (+ Final Round)"):
             round_num = round_index + 1
 

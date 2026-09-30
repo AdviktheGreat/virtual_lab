@@ -1,0 +1,19 @@
+The biomni/ directory here is copied without modification from Biomni
+(https://github.com/snap-stanford/Biomni, commit 400c1f366b96a35ca253e13c9b06c5076af41d65),
+Copyright the Biomni authors, and is used under the Apache License, Version 2.0, whose text is
+in LICENSE beside this file:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+license_info.md, also copied unchanged, lists the licenses of the data and software Biomni's
+tools use, some of which do not permit commercial use.
+
+Only the parts of the package its tools need are copied: biomni/tool/ (the tool functions,
+their descriptions, the protocols and database schemas they read), biomni/know_how/, and the
+modules they import (config.py, llm.py, utils.py, version.py, env_desc.py, env_desc_cm.py, and
+__init__.py). Biomni's agent, evaluation, and retrieval code are not; virtual_lab has its own.
+
+This directory is mounted read-only into the sandbox and put on its Python path, so code run
+there imports the tools as Biomni's agent does. virtual_lab never imports it on the host: it
+reads the tool descriptions and environment descriptions as data, and loads the know-how loader
+from its file.

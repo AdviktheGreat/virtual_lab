@@ -200,7 +200,8 @@ def individual(team_member: Agent, save_dir: Path, **kwargs):  # type: ignore[no
         agenda="Compute a number.",
         save_dir=save_dir,
         team_member=team_member,
-        **kwargs,
+        # Resources are tested in test_resources; here they would add a request to every meeting
+        **{"resources": "none", **kwargs},
     )
 
 
@@ -512,6 +513,7 @@ class TestTagsMode:
             num_rounds=1,
             session=session,
             code_actions="tags",
+            resources="none",
         )
 
         assert result.summary == "Summary: 6."

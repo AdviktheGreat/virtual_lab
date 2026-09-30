@@ -11,6 +11,7 @@ exists for machines without Docker, offers none of that, and has to be asked for
 """
 
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -20,6 +21,7 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from functools import partial
+from importlib.resources import files
 from pathlib import Path
 from typing import IO, Protocol
 from uuid import uuid4
@@ -37,6 +39,8 @@ from virtual_lab.constants import (
     DEFAULT_PIDS_LIMIT,
     DEFAULT_SANDBOX_IMAGE,
     DEFAULT_TMPFS_SIZE,
+    SANDBOX_BIOMNI_PACKAGE_DIR,
+    SANDBOX_BIOMNI_PATH,
     SANDBOX_DATA_LAKE_DIR,
     MAX_CAPTURED_OUTPUT_CHARS,
     MAX_REPORTED_FILES,
@@ -53,6 +57,52 @@ class ExecutionError(Exception):
 
 class DockerUnavailableError(ExecutionError):
     """Raised when the sandbox cannot be used because Docker is missing or not running."""
+
+
+ENVIRONMENT_VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def biomni_package_directory() -> Path:
+    """The directory holding the copy of Biomni's package that ships with virtual_lab.
+
+    On the Python path, it makes Biomni's tools importable as Biomni's agent imports them:
+    from biomni.tool.genomics import ...
+    """
+    return Path(str(files("virtual_lab") / "sandbox" / "biomni_package"))
+
+
+def added_environment(
+    forward_env: Sequence[str], environment: dict[str, str], already_set: Iterable[str]
+) -> dict[str, str]:
+    """Checks the variables a caller asked to give the code, and returns their values.
+
+    :param forward_env: Names of variables to pass through from this process's environment.
+    :param environment: Variables to set, by name.
+    :param already_set: Names the executor sets itself, which neither may change.
+    :raises ExecutionError: If a name is not a valid name, is given twice, is one the executor
+        sets, or is to be passed through but is not set here.
+    :return: Every added variable with its value.
+    """
+    names = [*forward_env, *environment]
+    reserved = set(already_set)
+
+    for name in names:
+        if not isinstance(name, str) or not ENVIRONMENT_VARIABLE_NAME.match(name):
+            raise ExecutionError(f"{name!r} is not a valid environment variable name.")
+        if name in reserved:
+            raise ExecutionError(f"{name} is set by the executor itself, so it cannot be given to the code.")
+
+    if duplicated := sorted({name for name in names if names.count(name) > 1}):
+        raise ExecutionError(f"{', '.join(duplicated)} is given more than once.")
+
+    # A key that is silently absent would surface later as a tool failing to authenticate,
+    # far from its cause
+    if missing := [name for name in forward_env if name not in os.environ]:
+        raise ExecutionError(
+            f"Cannot pass {', '.join(missing)} to the code: not set in this process's environment."
+        )
+
+    return {**{name: os.environ[name] for name in forward_env}, **{name: str(value) for name, value in environment.items()}}
 
 
 class UnsupportedLanguageError(ExecutionError):
@@ -340,6 +390,16 @@ class DockerExecutor:
     # on an ARM machine. Without it Docker still runs such an image, but warns on the run's
     # stderr, which the meeting would then read as the code's own output.
     platform: str | None = None
+    # Whether to mount the copy of Biomni's package, read-only, and put it on the Python path, so
+    # that code can import Biomni's tools. They need the libraries of Biomni's sandbox image.
+    biomni_tools: bool = False
+    # Host environment variables to pass in, by name, such as the API keys some of Biomni's tools
+    # use to call a model. Code run here can read them, and with the network, send them anywhere,
+    # so pass only keys you accept that risk for. Their values never appear in the command.
+    forward_env: tuple[str, ...] = ()
+    # Variables to set in the container, such as BIOMNI_LLM for the model Biomni's tools call.
+    # They appear in the command and in records, so they are not for secrets.
+    environment: dict[str, str] = field(default_factory=dict)
     _checked: bool = field(default=False, init=False, repr=False)
 
     def build_command(
@@ -402,14 +462,17 @@ class DockerExecutor:
             "ALL",
             "--security-opt",
             "no-new-privileges",
-            # The only environment the code gets. HOME must be writable, and unbuffered output
-            # means a run that is killed still reports what it had printed.
+            # The only environment the code gets, with what environment_arguments adds. HOME
+            # must be writable, and unbuffered output means a run that is killed still reports
+            # what it had printed.
             "--env",
             "HOME=/tmp",
             "--env",
             "PYTHONUNBUFFERED=1",
             "--env",
             "PYTHONDONTWRITEBYTECODE=1",
+            *self.biomni_arguments(),
+            *self.environment_arguments(),
         ]
 
         if (user := self.container_user()) is not None:
@@ -447,6 +510,50 @@ class DockerExecutor:
             "--env",
             f"BIOMNI_DATA_LAKE={SANDBOX_DATA_LAKE_DIR}",
         ]
+
+    def biomni_arguments(self) -> list[str]:
+        """The mount and variables that let code import Biomni's tools, if asked for.
+
+        :raises ExecutionError: If the package's path cannot be mounted.
+        """
+        if not self.biomni_tools:
+            return []
+
+        source = biomni_package_directory()
+        check_mountable(source, "Install virtual_lab under another directory.")
+
+        return [
+            "--mount",
+            f"type=bind,source={source},target={SANDBOX_BIOMNI_PACKAGE_DIR},readonly",
+            "--env",
+            f"PYTHONPATH={SANDBOX_BIOMNI_PACKAGE_DIR}",
+            # Biomni's tools find the data lake under their data path, as data_lake/
+            "--env",
+            f"BIOMNI_PATH={SANDBOX_BIOMNI_PATH}",
+        ]
+
+    def environment_arguments(self) -> list[str]:
+        """The variables the caller asked to give the code.
+
+        A variable passed through is named without its value, which docker then reads from its
+        own environment, inherited from this process, so that a key is never in the command.
+
+        :raises ExecutionError: If a variable cannot be given; see added_environment.
+        """
+        already_set = ["HOME", "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE"]
+        if self.data_lake is not None:
+            already_set.append("BIOMNI_DATA_LAKE")
+        if self.biomni_tools:
+            already_set += ["PYTHONPATH", "BIOMNI_PATH"]
+
+        added_environment(self.forward_env, self.environment, already_set)
+        arguments = []
+        for name in self.forward_env:
+            arguments += ["--env", name]
+        for name, value in self.environment.items():
+            arguments += ["--env", f"{name}={value}"]
+
+        return arguments
 
     @staticmethod
     def container_user() -> str | None:
@@ -618,6 +725,11 @@ class LocalExecutor:
     timeout: float = DEFAULT_EXECUTION_TIMEOUT
     warn: bool = True
     max_file_bytes: int = MAX_WRITTEN_FILE_BYTES
+    # As for DockerExecutor: Biomni's tools on the Python path (they need Biomni's environment,
+    # such as its biomni_e1), variables passed through by name, and variables to set
+    biomni_tools: bool = False
+    forward_env: tuple[str, ...] = ()
+    environment: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.warn:
@@ -628,10 +740,10 @@ class LocalExecutor:
                 stacklevel=3,
             )
 
-    @staticmethod
-    def build_environment() -> dict[str, str]:
+    def build_environment(self) -> dict[str, str]:
         """Builds the environment the code will run with, keeping only what it needs.
 
+        :raises ExecutionError: If a variable asked for cannot be given; see added_environment.
         :return: The environment variables to pass.
         """
         environment = {
@@ -642,7 +754,10 @@ class LocalExecutor:
         environment["PYTHONUNBUFFERED"] = "1"
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
 
-        return environment
+        if self.biomni_tools:
+            environment["PYTHONPATH"] = str(biomni_package_directory())
+
+        return {**environment, **added_environment(self.forward_env, self.environment, environment)}
 
     def limit_file_size(self) -> Callable[[], None] | None:
         """Builds what the child runs before the code starts to cap the size of files it writes.

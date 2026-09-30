@@ -97,8 +97,9 @@ class FakeDocker:
 
     def run(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
         self.commands.append(list(command))
-        if command[1:3] == ["image", "inspect"]:
-            return subprocess.CompletedProcess(command, 0 if self.has_image else 1, "", "")
+        if command[1:4] == ["image", "ls", "--quiet"]:
+            # Docker lists nothing, successfully, for an image it does not have
+            return subprocess.CompletedProcess(command, 0, "d0572aed6cf0\n" if self.has_image else "", "")
         return subprocess.CompletedProcess(command, self.build_code)
 
     @property
@@ -125,7 +126,7 @@ class TestBuild:
         tag = build_sandbox_image("base", platform=None)
 
         assert tag == sandbox_image("base", platform=None)
-        assert ["docker", "image", "inspect", tag] in docker.commands
+        assert ["docker", "image", "ls", "--quiet", tag] in docker.commands
         assert "--platform" not in docker.builds[0]
 
     def test_an_existing_image_is_reused(self, docker: FakeDocker) -> None:
