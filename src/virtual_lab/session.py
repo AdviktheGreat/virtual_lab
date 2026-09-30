@@ -332,58 +332,72 @@ class Session:
         if normalized is None:
             raise ValueError(f"Cannot run {language!r} code: use python, r, or bash.")
 
-        limit = self.timeout if timeout is None else timeout
-
         with self._lock:
-            self.start()
-            before = list_files(self.directory)
-            started = time.monotonic()
-            self._requests += 1
-            request = {"id": self._requests, "language": normalized, "code": code, "timeout": limit}
-            answer: dict | None | bool
-
-            try:
-                self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))  # type: ignore[union-attr]
-                self._process.stdin.flush()  # type: ignore[union-attr]
-            except (BrokenPipeError, OSError):
-                answer = None
-            else:
-                deadline = started + limit + SESSION_GRACE_SECONDS
-                answer = self.next_answer(deadline)
-                # An answer to some other request is not this one's, and is not a reason to
-                # give up on the session while this one's may still come
-                while isinstance(answer, dict) and answer.get("id") != request["id"]:
-                    answer = self.next_answer(deadline)
-
-            if isinstance(answer, dict) and answer.get("id") == request["id"]:
-                result = self.result_from(answer, normalized, code, time.monotonic() - started)
-            else:
-                if answer is False:
-                    reason = (
-                        f"the code did not stop at its time limit of {limit:g} seconds, so the "
-                        "session was stopped."
-                    )
-                else:
-                    reason = self.why_it_stopped()
-                self.shut_down()
-                result = CellResult(
-                    language=normalized,
-                    code=code,
-                    status="lost",
-                    output="",
-                    error=f"{reason} Every variable it held is gone; the next code will run in a "
-                    "fresh session.",
-                    duration=time.monotonic() - started,
-                    start=self.starts,
-                    sandboxed=self.sandboxed,
-                )
-
-            result = replace(
-                result, produced_files=tuple(sorted(list_files(self.directory) - before))
-            )
+            result = self.execute(code, normalized, self.timeout if timeout is None else timeout)
             self.history.append(result)
 
             return result
+
+    def check(self, code: str, timeout: float | None = None) -> CellResult:
+        """Runs Python code that asks about the session rather than taking part in its analysis,
+        such as what is installed, and keeps it out of the history.
+
+        The code shares the interpreter with the analysis, so it should leave nothing behind.
+
+        :param code: The code.
+        :param timeout: Seconds to allow, defaulting to the session's limit.
+        :raises SessionError: If the session was closed or cannot be started.
+        :return: What happened.
+        """
+        with self._lock:
+            return self.execute(code, "python", self.timeout if timeout is None else timeout)
+
+    def execute(self, code: str, normalized: str, limit: float) -> CellResult:
+        """Runs a piece of code without recording it. The caller holds the lock."""
+        self.start()
+        before = list_files(self.directory)
+        started = time.monotonic()
+        self._requests += 1
+        request = {"id": self._requests, "language": normalized, "code": code, "timeout": limit}
+        answer: dict | None | bool
+
+        try:
+            self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))  # type: ignore[union-attr]
+            self._process.stdin.flush()  # type: ignore[union-attr]
+        except (BrokenPipeError, OSError):
+            answer = None
+        else:
+            deadline = started + limit + SESSION_GRACE_SECONDS
+            answer = self.next_answer(deadline)
+            # An answer to some other request is not this one's, and is not a reason to
+            # give up on the session while this one's may still come
+            while isinstance(answer, dict) and answer.get("id") != request["id"]:
+                answer = self.next_answer(deadline)
+
+        if isinstance(answer, dict) and answer.get("id") == request["id"]:
+            result = self.result_from(answer, normalized, code, time.monotonic() - started)
+        else:
+            if answer is False:
+                reason = (
+                    f"the code did not stop at its time limit of {limit:g} seconds, so the "
+                    "session was stopped."
+                )
+            else:
+                reason = self.why_it_stopped()
+            self.shut_down()
+            result = CellResult(
+                language=normalized,
+                code=code,
+                status="lost",
+                output="",
+                error=f"{reason} Every variable it held is gone; the next code will run in a "
+                "fresh session.",
+                duration=time.monotonic() - started,
+                start=self.starts,
+                sandboxed=self.sandboxed,
+            )
+
+        return replace(result, produced_files=tuple(sorted(list_files(self.directory) - before)))
 
     def result_from(self, answer: dict, language: str, code: str, duration: float) -> CellResult:
         """Reads the interpreter's answer, trusting none of its types."""
@@ -618,7 +632,8 @@ class LocalSession(Session):
         Biomni's environment, so pass its interpreter as python.
     :param forward_env: Environment variables to pass through, by name, such as the API keys
         Biomni's tools use.
-    :param environment: Variables to set, such as BIOMNI_LLM.
+    :param environment: Variables to set, such as BIOMNI_LLM. They are recorded, so they are not
+        for secrets.
     """
 
     sandboxed = False

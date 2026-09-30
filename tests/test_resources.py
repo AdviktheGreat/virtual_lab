@@ -1,5 +1,6 @@
 """Tests for Biomni's resources: its tools in the sandbox, and choosing what a meeting is told of."""
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -12,6 +13,7 @@ from virtual_lab.constants import (
     SANDBOX_BIOMNI_PACKAGE_DIR,
     SANDBOX_BIOMNI_PATH,
     SANDBOX_DATA_LAKE_DIR,
+    SOFTWARE_CHECK_TIMEOUT,
 )
 from virtual_lab.execution import (
     DockerExecutor,
@@ -22,25 +24,28 @@ from virtual_lab.execution import (
 from virtual_lab.repair import describe_executor
 from virtual_lab.resources import (
     BIOMNI_TOOL_MODULES,
+    INSTALLED_MARKER,
     KnowHow,
     Resource,
     Resources,
     allows_commercial_use,
     available_resources,
     biomni_tools,
+    check_installed,
     commercial_data_lake,
     environment_descriptions,
     format_item_with_description,
     load_know_how,
     parse_retrieval,
     read_literal,
+    report_installed,
     resources_prompt,
     retrieval_prompt,
     select_resources,
     textify_api_dict,
 )
 from virtual_lab.run_meeting import hold_meeting
-from virtual_lab.session import DockerSession, LocalSession, list_data_lake, session_executor
+from virtual_lab.session import CellResult, DockerSession, LocalSession, list_data_lake, session_executor
 from virtual_lab.utils import BudgetExceededError
 
 from conftest import FakeClient, text_response
@@ -170,9 +175,30 @@ class TestKnowHow:
         assert allows_commercial_use({"commercial_use": use}) is allowed
 
 
+EVERY_LIBRARY = sorted({*environment_descriptions(False)[1], *environment_descriptions(True)[1]})
+
+
+def installed_report(missing: tuple[str, ...] = (), failed: dict[str, str] | None = None) -> str:
+    """What report_installed prints in an environment missing some software and modules."""
+    libraries = [name for name in EVERY_LIBRARY if name not in missing]
+    return INSTALLED_MARKER + json.dumps({"libraries": libraries, "failed_modules": failed or {}}) + "\n"
+
+
+def reported(output: str, status: str = "ok", error: str | None = None) -> CellResult:
+    return CellResult(language="python", code="", status=status, output=output, error=error, duration=0.1)
+
+
 class FakeSession:
-    def __init__(self, tools: bool = True, lake: str | None = SANDBOX_DATA_LAKE_DIR, files: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        tools: bool = True,
+        lake: str | None = SANDBOX_DATA_LAKE_DIR,
+        files: tuple[str, ...] = (),
+        report: CellResult | None = None,
+    ) -> None:
         self.tools, self.lake, self.files = tools, lake, list(files)
+        self.report = report if report is not None else reported(installed_report())
+        self.checks: list[tuple[str, float | None]] = []
 
     def has_biomni_tools(self) -> bool:
         return self.tools
@@ -182,6 +208,10 @@ class FakeSession:
 
     def data_lake_files(self) -> list[str]:
         return self.files
+
+    def check(self, code: str, timeout: float | None = None) -> CellResult:
+        self.checks.append((code, timeout))
+        return self.report
 
 
 class TestAvailableResources:
@@ -217,6 +247,124 @@ class TestAvailableResources:
 
         assert [item.name for item in resources.data_lake] == ["affinity_capture-ms.parquet"]
         assert len(resources.libraries) == len(environment_descriptions(True)[1])
+
+    def test_leaves_out_what_the_session_does_not_have(self) -> None:
+        error = "ModuleNotFoundError: No module named 'esm'"
+        session = FakeSession(
+            report=reported(installed_report(missing=("DESeq2", "hyperopt"), failed={"biomni.tool.genomics": error}))
+        )
+
+        resources = available_resources(session)
+
+        assert not any(tool["module"] == "biomni.tool.genomics" for tool in resources.tools)
+        genomics = sum(tool["module"] == "biomni.tool.genomics" for tool in biomni_tools())
+        assert genomics > 0 and len(resources.tools) == 223 - genomics
+        names = [library.name for library in resources.libraries]
+        assert "DESeq2" not in names and "hyperopt" not in names and len(names) == 111
+        # In Biomni's order: software first, then modules
+        assert resources.not_installed == {
+            "hyperopt": "not installed",
+            "DESeq2": "not installed",
+            "biomni.tool.genomics": error,
+        }
+        code, timeout = session.checks[0]
+        assert "'DESeq2'" in code and "'biomni.tool.genomics'" in code
+        assert timeout == 2 * SOFTWARE_CHECK_TIMEOUT + 120
+
+    def test_everything_installed_leaves_nothing_out(self) -> None:
+        resources = available_resources(FakeSession())
+
+        assert resources.not_installed == {}
+
+    @pytest.mark.parametrize(
+        "report",
+        [
+            reported("", status="error", error="NameError: boom"),
+            reported("", status="lost", error="it was killed"),
+            reported("nothing useful\n"),
+            reported(INSTALLED_MARKER + "{not json\n"),
+            reported(INSTALLED_MARKER + json.dumps({"libraries": None, "failed_modules": {}}) + "\n"),
+            reported(INSTALLED_MARKER + json.dumps({"libraries": [{}], "failed_modules": {}}) + "\n"),
+            reported(INSTALLED_MARKER + json.dumps([]) + "\n"),
+            reported(INSTALLED_MARKER + json.dumps({"libraries": [], "failed_modules": None}) + "\n"),
+            reported(INSTALLED_MARKER + json.dumps({"libraries": [], "failed_modules": {"m": 1}}) + "\n"),
+        ],
+    )
+    def test_a_check_that_fails_lists_everything(self, report: CellResult, capsys: pytest.CaptureFixture) -> None:
+        resources = available_resources(FakeSession(report=report))
+
+        assert len(resources.tools) == 223 and len(resources.libraries) == 113
+        assert resources.not_installed is None
+        assert "could not check which of Biomni's software" in capsys.readouterr().out
+
+    def test_nothing_is_checked_without_biomnis_tools(self) -> None:
+        session = FakeSession(tools=False)
+
+        resources = available_resources(session)
+
+        assert session.checks == [] and resources.not_installed is None
+
+
+def write_command(directory: Path, name: str, script: str) -> None:
+    path = directory / name
+    path.write_text(f"#!/bin/sh\n{script}\n")
+    path.chmod(0o755)
+
+
+class TestCheckInstalled:
+    def test_finds_distributions_commands_and_modules(self, capsys: pytest.CaptureFixture) -> None:
+        report_installed(
+            ["PyTest", "typing-extensions", "sh", "Homer", "not-a-real-package-xyz"],
+            {"Homer": ["sh"]},
+            ["json", "not_a_real_module_xyz"],
+            60,
+        )
+
+        line = capsys.readouterr().out.strip()
+        assert line.startswith(INSTALLED_MARKER)
+        found = json.loads(line[len(INSTALLED_MARKER) :])
+        # Distribution names are matched however they are spelled, and commands by name or alias
+        assert found["libraries"] == ["PyTest", "typing-extensions", "sh", "Homer"]
+        assert list(found["failed_modules"]) == ["not_a_real_module_xyz"]
+        assert found["failed_modules"]["not_a_real_module_xyz"].startswith("ModuleNotFoundError")
+
+    def test_r_packages(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+        write_command(tmp_path, "Rscript", "printf 'DESeq2\\nlimma\\n'")
+        monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+
+        report_installed(["DESeq2", "edgeR", "limma"], {}, [], 60)
+
+        found = json.loads(capsys.readouterr().out.strip()[len(INSTALLED_MARKER) :])
+        assert found["libraries"] == ["DESeq2", "limma"]
+
+    def test_r_that_fails_is_not_a_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        write_command(tmp_path, "Rscript", "exit 1")
+        monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+
+        report_installed(["DESeq2"], {}, [], 60)
+
+        assert json.loads(capsys.readouterr().out.strip()[len(INSTALLED_MARKER) :])["libraries"] is None
+
+    def test_runs_in_the_session_without_disturbing_it(self, tmp_path: Path) -> None:
+        with LocalSession(tmp_path, warn=False) as session:
+            session.run("kept = 42")
+
+            checked = check_installed(session, ["pytest", "not-a-real-package-xyz"], ["json", "not_a_real_module_xyz"])
+
+            assert checked is not None
+            missing, failed = checked
+            assert missing == {"not-a-real-package-xyz"}
+            assert list(failed) == ["not_a_real_module_xyz"]
+            # Not part of the analysis: not in the history, and nothing left behind
+            assert len(session.history) == 1
+            after = session.run("print(kept, 'report_installed' in globals())")
+            assert after.output.strip() == "42 False"
+
+    def test_the_marker_is_the_one_printed(self) -> None:
+        # The function's source runs in the session, where it cannot see this module's constant
+        assert repr(INSTALLED_MARKER)[1:-1] in inspect.getsource(report_installed)
 
 
 def small_resources() -> Resources:
@@ -507,6 +655,10 @@ class LakeSession(LocalSession):
     def data_lake_files(self) -> list[str]:
         return self.files
 
+    def check(self, code: str, timeout: float | None = None) -> CellResult:
+        # The host's own environment has only some of Biomni's software; this one has it all
+        return reported(installed_report())
+
 
 @pytest.fixture
 def session(tmp_path: Path):
@@ -567,6 +719,7 @@ class TestMeetingResources:
         record = saved_record(tmp_path)["resources"]
         assert record["mode"] == "retrieve"
         assert record["available"] == {"tools": 223, "data_lake": 2, "libraries": 113, "know_how": 2}
+        assert record["not_installed"] == {}
         assert record["selected"]["tools"] == ["biomni.tool.database.query_uniprot"]
         assert record["selected"]["know_how"] == ["single_cell_annotation"]
         assert record["retrieval"]["understood"] is True
@@ -620,7 +773,18 @@ class TestMeetingResources:
 
         prompt = first_prompt(fake_client, 0)
         assert "Method: find_gene" in prompt and "These are the resources" in prompt
-        assert saved_record(tmp_path)["resources"]["mode"] == "given"
+        assert "following path: /lake." in prompt
+        record = saved_record(tmp_path)["resources"]
+        assert record["mode"] == "given" and record["not_installed"] is None
+
+    def test_given_data_without_a_path_is_where_the_session_has_it(
+        self, fake_client: FakeClient, team_member: Agent, session: LakeSession, tmp_path: Path
+    ) -> None:
+        given = Resources(data_lake=(Resource("a.parquet", "Table A."),))
+
+        meeting(team_member, tmp_path, session=session, resources=given)
+
+        assert f"following path: {SANDBOX_DATA_LAKE_DIR}." in first_prompt(fake_client, 0)
 
     def test_commercial_mode(
         self, fake_client: FakeClient, team_member: Agent, session: LakeSession, tmp_path: Path
@@ -681,6 +845,29 @@ class TestMeetingResources:
     ) -> None:
         with pytest.raises(BudgetExceededError):
             meeting(team_member, tmp_path, session=session, max_cost=0.0)
+
+        assert fake_client.completions.calls == []
+
+    def test_the_retrieval_is_checked_against_the_models_input_limit(
+        self,
+        fake_client: FakeClient,
+        team_member: Agent,
+        session: LakeSession,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from virtual_lab.utils import ContextLengthExceededError
+
+        # The package's run_meeting is the function, which hides the module of the same name
+        module = sys.modules["virtual_lab.run_meeting"]
+
+        def too_long(messages, model):  # type: ignore[no-untyped-def]
+            raise ContextLengthExceededError(f"{len(messages[0]['content'])} characters")
+
+        monkeypatch.setattr(module, "check_context_length", too_long)
+
+        with pytest.raises(ContextLengthExceededError):
+            meeting(team_member, tmp_path, session=session)
 
         assert fake_client.completions.calls == []
 

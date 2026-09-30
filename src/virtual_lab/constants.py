@@ -276,6 +276,12 @@ DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 # from the meeting's own record for the same reason the others are in their own directories.
 EXECUTION_DIR_NAME = "executions"
 
+# Seconds for each part of the check of which of Biomni's software a session has: importing its
+# tool modules, which takes seconds but loads torch in some, and listing the R packages. Each
+# part runs in a process of its own and is abandoned at this limit, so that a check that hangs
+# never costs the session the interpreter the analysis lives in.
+SOFTWARE_CHECK_TIMEOUT = 300
+
 # Most characters of a model's answer to which resources a meeting needs kept in the record. The
 # answer is a few lists of numbers; anything longer is a model that did not follow the prompt.
 MAX_RECORDED_RETRIEVAL_CHARS = 2_000

@@ -474,6 +474,7 @@ def describe_executor(executor: Executor) -> dict[str, Any]:
         "biomni_tools",
         # Names only: the values are what is being kept out of records
         "forward_env",
+        # Recorded with their values, which is why they are not for secrets
         "environment",
     ):
         if hasattr(executor, attribute):

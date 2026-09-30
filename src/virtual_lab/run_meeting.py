@@ -5,7 +5,7 @@ import json
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
@@ -211,7 +211,8 @@ def hold_meeting(
         12,000 tokens. With "all", every one is listed, which is about 40,000 tokens more in every
         request. Pass a Resources to choose them yourself, or "none" to list nothing. Only used
         with a session; tools and software are listed only where the session can import
-        Biomni's tools, and data only where the data lake is mounted.
+        Biomni's tools, and then only the software the session has installed and the tools whose
+        modules it can import; data is listed only where the data lake is mounted.
     :param commercial_mode: Whether to leave out data and know-how that may not be used
         commercially, as Biomni's commercial mode does. It does not check the tools' own licenses;
         see the license_info.md that ships with Biomni's package.
@@ -393,6 +394,8 @@ def hold_meeting(
         first_cell = len(session.history)
         if isinstance(resources, Resources):
             catalog = resources
+            if catalog.data_lake and catalog.data_lake_path is None:
+                catalog = replace(catalog, data_lake_path=session.data_lake_path())
         elif resources != "none":
             catalog = available_resources(session, commercial_mode=commercial_mode)
 
@@ -401,6 +404,7 @@ def hold_meeting(
             "mode": resources if isinstance(resources, str) else "given",
             "commercial_mode": commercial_mode,
             "available": catalog.counts(),
+            "not_installed": catalog.not_installed,
             "selected": catalog.names(),
             "retrieval": None,
         }
@@ -415,11 +419,13 @@ def hold_meeting(
         if agenda_questions:
             query += "\n\n" + "\n".join(f"{number}. {question}" for number, question in enumerate(agenda_questions, 1))
 
+        retrieval_messages: list[ChatCompletionMessageParam] = [
+            {"role": "user", "content": retrieval_prompt(query, catalog)}
+        ]
+        check_context_length(messages=retrieval_messages, model=chooser.model)
         check_budget()
         retrieval_usage = MeetingUsage()
-        reply = ask_agent(
-            agent=chooser, messages=[{"role": "user", "content": retrieval_prompt(query, catalog)}], tools=None
-        )
+        reply = ask_agent(agent=chooser, messages=retrieval_messages, tools=None)
         count_usage(chooser.model, reply.usage, retrieval_usage)
 
         chosen = parse_retrieval(reply.content)

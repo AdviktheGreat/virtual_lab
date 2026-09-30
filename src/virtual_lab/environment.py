@@ -88,11 +88,13 @@ def sandbox_image_exists(tag: str, docker_command: tuple[str, ...] = ("docker",)
     :return: Whether Docker has the image.
     """
     find_docker(docker_command)
+    # Listed rather than inspected: with Docker's containerd image store, inspect looks only for
+    # the machine's own platform, so an x86-64 image on an ARM machine would be reported missing
     result = subprocess.run(
-        [*docker_command, "image", "inspect", tag], capture_output=True, text=True, check=False
+        [*docker_command, "image", "ls", "--quiet", tag], capture_output=True, text=True, check=False
     )
 
-    return result.returncode == 0
+    return result.returncode == 0 and bool(result.stdout.strip())
 
 
 def build_command(

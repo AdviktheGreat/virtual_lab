@@ -13,19 +13,23 @@ Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0). Where they depart from
 says how.
 
 Nothing here imports Biomni's package. Its descriptions are read from their files as data, so
-that listing the tools needs none of the libraries the tools themselves do.
+that listing the tools needs none of the libraries the tools themselves do, and its know-how
+loader, which needs only the standard library, is loaded from its own file.
 """
 
 import ast
 import contextlib
 import copy
 import importlib.util
+import inspect
+import json
 import re
 from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 from typing import Any
 
+from virtual_lab.constants import SOFTWARE_CHECK_TIMEOUT
 from virtual_lab.execution import biomni_package_directory
 
 # The modules of biomni.tool, in the order Biomni's read_module2api lists them
@@ -200,6 +204,8 @@ class Resources:
     :param libraries: Software installed in the environment.
     :param know_how: Know-how documents, given to the agents in full.
     :param data_lake_path: Where the data lake is, as the code sees it.
+    :param not_installed: What of Biomni's software and tool modules was left out because the
+        session does not have it, each with why; None if that was not checked.
     """
 
     tools: tuple[dict[str, Any], ...] = ()
@@ -207,6 +213,7 @@ class Resources:
     libraries: tuple[Resource, ...] = ()
     know_how: tuple[KnowHow, ...] = ()
     data_lake_path: str | None = None
+    not_installed: dict[str, str] | None = None
 
     def is_empty(self) -> bool:
         """Whether there is nothing to tell the agents of."""
@@ -226,20 +233,150 @@ class Resources:
         }
 
 
+# Software Biomni lists under a name that is none of its Python distribution, its R package, or
+# its command: HOMER is a set of Perl scripts, and Open Babel's command is obabel
+SOFTWARE_COMMANDS = {
+    "Homer": ("findMotifs.pl", "findMotifsGenome.pl", "homer2"),
+    "openbabel": ("obabel",),
+}
+
+INSTALLED_MARKER = "VIRTUAL_LAB_INSTALLED "
+
+
+def report_installed(libraries: list[str], commands: dict[str, list[str]], modules: list[str], timeout: float) -> None:
+    """Prints which of the software is installed and which modules fail to import, as JSON after
+    INSTALLED_MARKER.
+
+    Its source is run in a session's interpreter, which the analysis shares, so it defines
+    nothing outside itself and imports only the standard library. The modules are imported in a
+    process of their own: importing all of Biomni's holds most of a gigabyte that the analysis
+    may never need. A part of the check that cannot be done is reported as None.
+    """
+    import json
+    import re
+    import shutil
+    import subprocess
+    import sys
+    from importlib import metadata
+
+    def normalized(name: str) -> str:
+        return re.sub(r"[-_.]+", "-", name).lower()
+
+    distributions = {normalized(d.metadata["Name"]) for d in metadata.distributions() if d.metadata["Name"]}
+
+    r_packages: set[str] | None = set()
+    if shutil.which("Rscript"):
+        try:
+            listed = subprocess.run(
+                ["Rscript", "-e", "cat(rownames(installed.packages()), sep = '\\n')"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            r_packages = set(listed.stdout.split()) if listed.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            r_packages = None
+
+    installed = None
+    if r_packages is not None:
+        installed = [
+            name
+            for name in libraries
+            if normalized(name) in distributions
+            or name in r_packages
+            or any(shutil.which(command) for command in [name, name.lower(), *commands.get(name, [])])
+        ]
+
+    marker = "VIRTUAL_LAB_MODULES "
+    script = (
+        "import importlib, json, sys\n"
+        "failed = {}\n"
+        "for module in sys.argv[1:]:\n"
+        "    try:\n"
+        "        importlib.import_module(module)\n"
+        "    except BaseException as error:\n"
+        "        failed[module] = f'{type(error).__name__}: {error}'\n"
+        f"print({marker!r} + json.dumps(failed))\n"
+    )
+    failed = None
+    try:
+        imported = subprocess.run(
+            [sys.executable, "-c", script, *modules], capture_output=True, text=True, timeout=timeout
+        )
+        lines = [line for line in imported.stdout.splitlines() if line.startswith(marker)]
+        if lines:
+            failed = json.loads(lines[-1][len(marker) :])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        failed = None
+
+    print("VIRTUAL_LAB_INSTALLED " + json.dumps({"libraries": installed, "failed_modules": failed}))
+
+
+def check_installed(
+    session: Any, libraries: list[str], modules: list[str]
+) -> tuple[set[str], dict[str, str]] | None:
+    """Finds which of Biomni's software a session has, and which of its tool modules import.
+
+    Biomni lists all of its software to its agent, in whose environment it is all installed. A
+    session here may run in a stage of the sandbox image that has only some of it, or in an
+    environment of the user's own, and code written for software that is not there fails.
+
+    :param session: The session, which is started if it is not running.
+    :param libraries: The software to look for, by the names Biomni gives it.
+    :param modules: The tool modules to import, such as biomni.tool.genomics.
+    :return: The software that is missing, and each module that fails to import with its error;
+        or None, with a warning, if the check could not be done.
+    """
+    code = (
+        f"{inspect.getsource(report_installed)}\n"
+        "try:\n"
+        f"    report_installed({libraries!r}, {dict(SOFTWARE_COMMANDS)!r}, {modules!r}, {SOFTWARE_CHECK_TIMEOUT!r})\n"
+        "finally:\n"
+        "    del report_installed\n"
+    )
+    # Longer than both parts together, so that the check is always abandoned from within: a
+    # session stopped at its limit would lose everything the analysis had defined
+    result = session.check(code, timeout=2 * SOFTWARE_CHECK_TIMEOUT + 120)
+
+    report = None
+    lines = [line for line in result.output.splitlines() if line.startswith(INSTALLED_MARKER)]
+    if lines:
+        with contextlib.suppress(ValueError):
+            report = json.loads(lines[-1][len(INSTALLED_MARKER) :])
+
+    installed = report.get("libraries") if isinstance(report, dict) else None
+    failed = report.get("failed_modules") if isinstance(report, dict) else None
+    if not (
+        isinstance(installed, list)
+        and all(isinstance(name, str) for name in installed)
+        and isinstance(failed, dict)
+        and all(isinstance(name, str) and isinstance(error, str) for name, error in failed.items())
+    ):
+        detail = result.error or "it did not report what it found"
+        print(
+            f"Warning: could not check which of Biomni's software and tools the session has, so all "
+            f"of them are listed: {detail}"
+        )
+        return None
+
+    return set(libraries) - set(installed), failed
+
+
 def available_resources(session: Any, commercial_mode: bool = False) -> Resources:
     """Everything a session offers of Biomni's resources.
 
     Tools and software are offered only where code can import Biomni's tools, since both come
-    with Biomni's environment, and data lake files only where the data lake is mounted. Know-how
+    with Biomni's environment, and then only the software that is installed and the tools whose
+    modules import. Data lake files are offered only where the data lake is mounted. Know-how
     is offered everywhere: it is advice, not something to run.
 
-    :param session: The session, as in DockerSession or LocalSession.
+    :param session: The session, as in DockerSession or LocalSession, which is started to check
+        what it has installed.
     :param commercial_mode: Whether to leave out data and know-how that may not be used
         commercially, as Biomni's commercial mode does.
     :return: The resources.
     """
     data_lake_descriptions, library_descriptions = environment_descriptions(commercial_mode)
-    has_tools = session.has_biomni_tools()
     data_lake_path = session.data_lake_path()
 
     files = session.data_lake_files() if data_lake_path is not None else []
@@ -248,16 +385,33 @@ def available_resources(session: Any, commercial_mode: bool = False) -> Resource
         # A data lake here may have been fetched in full, so what may not be used is left out.
         files = [name for name in files if name in data_lake_descriptions]
 
+    tools: tuple[dict[str, Any], ...] = ()
+    libraries: tuple[Resource, ...] = ()
+    not_installed = None
+    if session.has_biomni_tools():
+        tools = biomni_tools()
+        libraries = tuple(Resource(name, description) for name, description in library_descriptions.items())
+        modules = [f"biomni.tool.{module}" for module in BIOMNI_TOOL_MODULES]
+
+        checked = check_installed(session, [library.name for library in libraries], modules)
+        if checked is not None:
+            missing, failed = checked
+            tools = tuple(tool for tool in tools if tool["module"] not in failed)
+            libraries = tuple(library for library in libraries if library.name not in missing)
+            not_installed = {
+                **{name: "not installed" for name in library_descriptions if name in missing},
+                **{module: failed[module] for module in modules if module in failed},
+            }
+
     return Resources(
-        tools=biomni_tools() if has_tools else (),
+        tools=tools,
         data_lake=tuple(
             Resource(name, data_lake_descriptions.get(name, f"Data lake item: {name}")) for name in files
         ),
-        libraries=tuple(Resource(name, description) for name, description in library_descriptions.items())
-        if has_tools
-        else (),
+        libraries=libraries,
         know_how=load_know_how(commercial_mode=commercial_mode),
         data_lake_path=data_lake_path,
+        not_installed=not_installed,
     )
 
 
@@ -397,6 +551,7 @@ def select_resources(resources: Resources, chosen: dict[str, list[int]]) -> Reso
         libraries=keep(resources.libraries, chosen.get("libraries", [])),
         know_how=keep(resources.know_how, chosen.get("know_how", [])),
         data_lake_path=resources.data_lake_path,
+        not_installed=resources.not_installed,
     )
 
 
