@@ -37,6 +37,7 @@ from virtual_lab.constants import (
     DEFAULT_PIDS_LIMIT,
     DEFAULT_SANDBOX_IMAGE,
     DEFAULT_TMPFS_SIZE,
+    SANDBOX_DATA_LAKE_DIR,
     MAX_CAPTURED_OUTPUT_CHARS,
     MAX_REPORTED_FILES,
     MAX_REPORTED_OUTPUT_CHARS,
@@ -291,6 +292,24 @@ def run_bounded(
     return None if timed_out else process.returncode, timed_out, stdout, stderr
 
 
+def check_mountable(path: Path, advice: str) -> None:
+    """Refuses a path that Docker's --mount cannot be given intact.
+
+    --mount is parsed as a line of CSV. A comma in the path starts another field that Docker
+    reads as an option, and a line break ends the value early, which would mount whatever
+    directory the path's first line names.
+
+    :param path: The host path to mount.
+    :param advice: What to do instead.
+    :raises ExecutionError: If the path cannot be mounted as it is.
+    """
+    if any(character in str(path) for character in ',"\n\r'):
+        raise ExecutionError(
+            f"Cannot run code in {str(path)!r}: Docker cannot mount a path containing a comma, "
+            f"a quote, or a line break. {advice}"
+        )
+
+
 @dataclass
 class DockerExecutor:
     """Runs code in a container that cannot reach the host.
@@ -314,6 +333,13 @@ class DockerExecutor:
     tmpfs_size: str = DEFAULT_TMPFS_SIZE
     max_file_bytes: int = MAX_WRITTEN_FILE_BYTES
     docker_command: tuple[str, ...] = ("docker",)
+    # A directory of Biomni's data lake (see virtual_lab.environment.download_data_lake), mounted
+    # read-only so that code can read the tables but not change them for the next run
+    data_lake: Path | None = None
+    # The platform to run the image as, e.g. "linux/amd64" for a sandbox image built for x86-64
+    # on an ARM machine. Without it Docker still runs such an image, but warns on the run's
+    # stderr, which the meeting would then read as the code's own output.
+    platform: str | None = None
     _checked: bool = field(default=False, init=False, repr=False)
 
     def build_command(
@@ -327,14 +353,7 @@ class DockerExecutor:
         :raises ExecutionError: If the directory's path cannot be passed to --mount intact.
         :return: The full command, as an argument list.
         """
-        # --mount is parsed as a line of CSV. A comma in the path starts another field that
-        # Docker reads as an option, and a line break ends the value early, which would mount
-        # whatever directory the path's first line names.
-        if any(character in str(directory) for character in ',"\n\r'):
-            raise ExecutionError(
-                f"Cannot run code in {directory!r}: Docker cannot mount a path containing a "
-                "comma, a quote, or a line break. Save the meeting under another directory."
-            )
+        check_mountable(directory, "Save the meeting under another directory.")
 
         arguments = [
             *self.docker_command,
@@ -351,6 +370,8 @@ class DockerExecutor:
             f"/tmp:rw,size={self.tmpfs_size},mode=1777",
             "--mount",
             f"type=bind,source={directory},target={SANDBOX_WORK_DIR}",
+            *self.data_lake_arguments(),
+            *(["--platform", self.platform] if self.platform is not None else []),
             "--workdir",
             SANDBOX_WORK_DIR,
             "--memory",
@@ -388,6 +409,23 @@ class DockerExecutor:
             arguments += ["--user", user]
 
         return tuple([*arguments, self.image, *command])
+
+    def data_lake_arguments(self) -> list[str]:
+        """The mount and variable that give code the data lake, if there is one."""
+        if self.data_lake is None:
+            return []
+
+        source = Path(self.data_lake).resolve()
+        if not source.is_dir():
+            raise ExecutionError(f"The data lake {source} is not a directory. Fetch it with download_data_lake.")
+        check_mountable(source, "Move the data lake under another directory.")
+
+        return [
+            "--mount",
+            f"type=bind,source={source},target={SANDBOX_DATA_LAKE_DIR},readonly",
+            "--env",
+            f"BIOMNI_DATA_LAKE={SANDBOX_DATA_LAKE_DIR}",
+        ]
 
     @staticmethod
     def container_user() -> str | None:
