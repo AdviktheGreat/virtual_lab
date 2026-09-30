@@ -57,9 +57,14 @@ FAKE_PYPLOT = textwrap.dedent(
     class Figure:
         def savefig(self, path, **options):
             open(path, "w").write("png")
-    # Numbered as matplotlib numbers them: by when they were opened, unchanged by closing others
+    # Numbered as matplotlib numbers them: by when they were opened, unchanged by closing others.
+    # Asking for a number that is not open opens a new figure, as matplotlib's does.
     def figure(number):
-        return pyplot.open[[id(f) for f in pyplot.open].index(number)]
+        numbers = [id(f) for f in pyplot.open]
+        if number not in numbers:
+            pyplot.open.append(Figure())
+            return pyplot.open[-1]
+        return pyplot.open[numbers.index(number)]
     def close(figure):
         pyplot.open.remove(figure)
     pyplot.get_fignums = lambda: [id(f) for f in pyplot.open]
@@ -136,6 +141,36 @@ class TestPython:
         session.run("import io, sys\nsys.stdout = io.StringIO()")
 
         assert session.run("print('heard')").output == "heard\n"
+
+    def test_closing_the_output_streams_does_not_break_later_runs(self, session: LocalSession) -> None:
+        session.run("import sys\nsys.stdout.close()\nsys.stderr.close()")
+
+        result = session.run("import sys\nprint('heard')\nprint('also', file=sys.stderr)")
+
+        assert result.succeeded
+        assert result.output == "heard\nalso\n"
+
+    def test_printing_after_a_run_has_ended_does_not_cost_the_session(self, session: LocalSession) -> None:
+        session.run("import threading, time\nkept = 1\nthreading.Timer(0.3, print, ['late']).start()")
+        time.sleep(0.8)
+
+        result = session.run("kept")
+
+        assert result.succeeded
+        assert result.output == "1\n"
+        assert result.start == 1
+
+    def test_a_huge_error_message_is_shortened_rather_than_ending_the_session(
+        self, session: LocalSession
+    ) -> None:
+        session.run("kept = 1")
+
+        result = session.run("raise ValueError('x' * 3_000_000)")
+
+        assert result.status == "error"
+        assert len(result.error) < 3_000
+        assert "characters truncated" in result.error
+        assert session.run("kept").start == 1
 
     def test_exit_does_not_end_the_session(self, session: LocalSession) -> None:
         session.run("kept = True")
@@ -227,6 +262,15 @@ class TestLostSessions:
         session.restart()
 
         assert "NameError" in session.run("x").error
+
+    def test_an_answer_to_another_request_is_skipped(self, session: LocalSession) -> None:
+        session.start()
+        session._answers.put(b'{"id": 999, "status": "ok", "output": "stale"}\n')
+
+        result = session.run("'current'")
+
+        assert result.succeeded
+        assert result.output == "'current'\n"
 
     def test_an_overlong_answer_is_not_read_as_one(self) -> None:
         answers: queue.Queue = queue.Queue()
@@ -326,6 +370,15 @@ class TestFiles:
         assert result.plots == ("plots/figure_1.png", "plots/figure_2.png")
         assert set(result.produced_files) == set(result.plots)
         assert (session.directory / "plots" / "figure_2.png").read_text() == "png"
+        assert session.run("len(pyplot.open)").output == "0\n"
+
+    def test_the_figures_saved_from_one_run_are_capped(self, session: LocalSession) -> None:
+        session.run(FAKE_PYPLOT)
+
+        result = session.run("pyplot.open += [Figure() for _ in range(60)]")
+
+        assert len(result.plots) == 50
+        assert "Only the first 50 of 60" in result.output
         assert session.run("len(pyplot.open)").output == "0\n"
 
     def test_figures_are_saved_where_the_session_started(self, session: LocalSession) -> None:

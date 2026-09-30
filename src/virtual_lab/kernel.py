@@ -44,6 +44,13 @@ DRAIN_SECONDS = 2.0
 # Where figures left open by Python code are saved, relative to the working directory
 PLOT_DIR = "plots"
 
+# Most characters of an error message sent back. Output is bounded by Capture, but an exception
+# can carry a message of any size, and an answer too long to read would end the session.
+MAX_ERROR_CHARS = 2_000
+
+# Most figures saved from one request. The rest are closed unsaved, for the same reason.
+MAX_FIGURES = 50
+
 INTERPRETERS = {"r": ("Rscript",), "bash": ("bash",)}
 
 
@@ -153,8 +160,7 @@ class Kernel:
             if language == "python":
                 plots = self.save_figures()
             flush()
-            # Code that replaced the streams would otherwise leave every later cell silent
-            sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+            restore_streams()
             os.dup2(saved[0], 1)
             os.dup2(saved[1], 2)
             os.close(saved[0])
@@ -162,6 +168,9 @@ class Kernel:
 
         if error is not None and status == "ok":
             status = "error"
+
+        if error is not None and len(error) > MAX_ERROR_CHARS:
+            error = error[:MAX_ERROR_CHARS] + f" [... {len(error) - MAX_ERROR_CHARS:,} characters truncated]"
 
         output, dropped = capture.text(DRAIN_SECONDS)
 
@@ -252,7 +261,12 @@ class Kernel:
 
         saved = []
         try:
-            for number in pyplot.get_fignums():
+            numbers = pyplot.get_fignums()
+            for number in numbers[MAX_FIGURES:]:
+                pyplot.close(pyplot.figure(number))
+            if len(numbers) > MAX_FIGURES:
+                print(f"Only the first {MAX_FIGURES} of {len(numbers)} open figures were saved.", file=sys.stderr)
+            for number in numbers[:MAX_FIGURES]:
                 figure = pyplot.figure(number)
                 os.makedirs(os.path.join(self.home, PLOT_DIR), exist_ok=True)
                 # A restarted session counts from one again, and must not overwrite the figures
@@ -283,6 +297,22 @@ def kill_group(process: subprocess.Popen) -> None:
     process.wait()
 
 
+def restore_streams() -> None:
+    """Gives the next request working standard streams, whatever this one did to them.
+
+    Code that replaced sys.stdout would otherwise leave every later request silent, and code
+    that closed it would leave every later print raising.
+    """
+    for name, descriptor in (("stdout", 1), ("stderr", 2)):
+        original = getattr(sys, f"__{name}__")
+        if original is None or original.closed:
+            original = open(
+                descriptor, "w", encoding="utf-8", errors="backslashreplace", buffering=1, closefd=False
+            )
+            setattr(sys, f"__{name}__", original)
+        setattr(sys, name, original)
+
+
 def flush() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -297,6 +327,9 @@ def main() -> None:
     nothing = os.open(os.devnull, os.O_RDONLY)
     os.dup2(nothing, 0)
     os.close(nothing)
+    # Between requests, and after each one, descriptor 1 is the kernel's stderr rather than the
+    # answers: a thread the code started that prints later would otherwise write into them
+    os.dup2(2, 1)
     sys.stdin = open(os.devnull, encoding="utf-8")
 
     kernel = Kernel()

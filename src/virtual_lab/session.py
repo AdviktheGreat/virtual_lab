@@ -344,7 +344,12 @@ class Session:
             except (BrokenPipeError, OSError):
                 answer = None
             else:
-                answer = self.next_answer(started + limit + SESSION_GRACE_SECONDS)
+                deadline = started + limit + SESSION_GRACE_SECONDS
+                answer = self.next_answer(deadline)
+                # An answer to some other request is not this one's, and is not a reason to
+                # give up on the session while this one's may still come
+                while isinstance(answer, dict) and answer.get("id") != request["id"]:
+                    answer = self.next_answer(deadline)
 
             if isinstance(answer, dict) and answer.get("id") == request["id"]:
                 result = self.result_from(answer, normalized, code, time.monotonic() - started)
