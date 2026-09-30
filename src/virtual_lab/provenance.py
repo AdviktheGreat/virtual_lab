@@ -58,6 +58,8 @@ class TurnRecord:
     :param model: The model that produced the turn, or None for prompts and tool output.
     :param num_api_calls: The number of API calls the turn took, above one if tools were used.
     :param tool_calls: Each tool called while producing the turn, by name, with its arguments.
+    :param code_runs: Each piece of code the turn ran in the meeting's session, by its position in
+        the session's log, with what came of it. The code and its output are in the log.
     :param system_fingerprint: The backend configuration the API reported, when it reports one.
     :param finish_reason: Why the model stopped, which is "length" if it ran out of tokens.
     """
@@ -74,6 +76,7 @@ class TurnRecord:
     reasoning_tokens: int = 0
     num_api_calls: int = 0
     tool_calls: list[dict[str, str]] = field(default_factory=list)
+    code_runs: list[dict[str, Any]] = field(default_factory=list)
     system_fingerprint: str | None = None
     finish_reason: str | None = None
 
@@ -95,6 +98,8 @@ class MeetingRecord:
         at their own default instead.
     :param chat_models: For each model, the LangChain class that answered for it and the server
         it was sent to, where one was set.
+    :param session: How the meeting's session ran code, if it had one: the session's settings,
+        how its code actions were written, and where its log was saved.
     :param prices: What each model used was priced at, in USD per million tokens, since the
         price tables change and a cost is only comparable at the prices it was computed with.
     """
@@ -118,6 +123,7 @@ class MeetingRecord:
     max_cost: float | None = None
     models_at_default_temperature: list[str] = field(default_factory=list)
     chat_models: dict[str, dict[str, str | None]] = field(default_factory=dict)
+    session: dict[str, Any] | None = None
     prices: dict[str, dict[str, float] | None] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_timestamp)
     ended_at: str | None = None
@@ -185,6 +191,7 @@ class MeetingRecord:
             "chat_models": self.chat_models,
             "critic": self.critic,
             "tools": self.tools,
+            "session": self.session,
             "usage": self.usage,
             "prices": self.prices,
             "turns": [turn.to_dict() for turn in self.turns],

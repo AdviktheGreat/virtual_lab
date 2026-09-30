@@ -174,6 +174,29 @@ By default a session runs in Biomni's `full` image with the network on, since Bi
 
 Code is stopped at its time limit (`timeout=`, 300 seconds by default) and the session keeps everything it had defined. Code that ignores the stop, and code that crashes the interpreter or runs out of memory, costs the session: the result's status is `"lost"`, and the next run starts a fresh interpreter, which its `start` number shows. Starting a session in an image Docker emulates takes about half a minute. `LocalSession` runs the same interpreter on your machine, with no isolation, like `LocalExecutor`. Pass `python=` to use an environment already installed there, such as Biomni's `biomni_e1`.
 
+### Running code during a meeting
+
+Give a meeting a session and its agents can run code in it as they talk, checking a claim against the data or computing a number instead of estimating it:
+
+```python
+from virtual_lab import DockerSession, hold_meeting, session_executor
+
+with DockerSession(Path("results/session"), executor=session_executor("bio")) as session:
+    result = hold_meeting(
+        meeting_type="team",
+        agenda="Which genes separate the two clusters in counts.csv?",
+        save_dir=Path("results"),
+        team_lead=principal_investigator,
+        team_members=(bioinformatician, scientific_critic),
+        num_rounds=2,
+        session=session,
+    )
+```
+
+Everyone in the meeting shares the one interpreter, so what one agent loads or computes, the next can use. By default each agent runs code by calling a `run_code` tool. With `code_actions="tags"` it instead writes the code between `<execute>` and `</execute>` in its reply and is answered between `<observation>` and `</observation>`, as Biomni's agent is. That works with any model, including ones served without tool calling. A block starting with `#!R` is R and one starting with `#!BASH` is a shell script.
+
+An agent may run code, or call tools, up to 20 times in a turn with a session (5 without), after which it is asked to answer without them; `max_tool_iterations=` changes that. The session is started before the first request, so one that cannot start costs nothing, and it is left running afterwards, so the next meeting can pick up where this one left off. Every piece of code the meeting ran, with its full output, is saved to `sessions/<save_name>.json`, and each turn in the meeting's record lists the cells it ran and how each ended. The transcript shows the code beside its output.
+
 
 ## Fixing code that fails
 

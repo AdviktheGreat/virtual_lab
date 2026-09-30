@@ -1,6 +1,7 @@
 """Virtual Lab package."""
 
 from virtual_lab.__about__ import __version__
+from virtual_lab.actions import CodeAction, find_code_action
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile, UnsafeFilenameError, save_artifacts
 from virtual_lab.chemistry import (
@@ -146,6 +147,7 @@ __all__ = [
     "CHEMBL_TARGET_SEARCH_TOOL",
     "CellResult",
     "Chain",
+    "CodeAction",
     "CodeArtifacts",
     "CodeFile",
     "Column",
@@ -212,6 +214,7 @@ __all__ = [
     "detect_source",
     "download_data_lake",
     "download_structure",
+    "find_code_action",
     "get_activities",
     "get_article",
     "get_article_text",

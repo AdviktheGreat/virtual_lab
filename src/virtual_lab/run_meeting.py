@@ -16,6 +16,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 from tqdm import trange, tqdm
 
+from virtual_lab.actions import describe_tool_output, find_code_action, observation, without_code_action
 from virtual_lab.agent import Agent
 from virtual_lab.llm import ModelReply, ModelSource, ask, resolve_chat_models
 from virtual_lab.completions import check_temperature, ran_without_temperature, send_request
@@ -25,8 +26,11 @@ from virtual_lab.constants import (
     MAX_RECORDED_ARGUMENT_CHARS,
     MAX_TOOL_ITERATIONS,
     PARTIAL_MEETING_DIR_NAME,
+    SESSION_LOG_DIR_NAME,
+    SESSION_MAX_TOOL_ITERATIONS,
 )
 from virtual_lab.prompts import (
+    code_session_prompt,
     individual_meeting_agent_prompt,
     individual_meeting_critic_prompt,
     individual_meeting_start_prompt,
@@ -40,6 +44,7 @@ from virtual_lab.prompts import (
 )
 from virtual_lab.provenance import MeetingRecord, describe_agent, save_record
 from virtual_lab.records import truncate_text
+from virtual_lab.session import CODE_TOOL_NAME, Session, session_tool
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
@@ -132,6 +137,9 @@ def hold_meeting(
     max_cost: float | None = None,
     on_usage: Callable[[MeetingUsage], None] | None = None,
     max_completion_tokens: int | None = None,
+    session: Session | None = None,
+    code_actions: Literal["tool", "tags"] = "tool",
+    max_tool_iterations: int | None = None,
 ) -> MeetingResult:
     """Runs a meeting with LLM agents and returns everything it produced.
 
@@ -175,6 +183,16 @@ def hold_meeting(
         meeting the way any other failure does.
     :param max_completion_tokens: The most tokens any one response may use, reasoning included,
         or None for the model's own limit.
+    :param session: A session for the agents to run code in, shared by all of them, as in
+        DockerSession or LocalSession. It is started before the first request and left running
+        afterwards, so that the next meeting can use what this one computed; close it when done.
+        The code the meeting ran, and what came of it, is saved under save_dir/sessions/.
+    :param code_actions: How the agents run code in the session: "tool" to call the run_code
+        tool, or "tags" to write it between <execute> and </execute> in their replies, as
+        Biomni's agent does, which works with models served without tool calling.
+    :param max_tool_iterations: The most tool calls and runs of code in one agent's turn before
+        it is asked to answer without them. Defaults to 20 with a session, which an analysis
+        needs, and 5 without one.
     :raises BudgetExceededError: Before a request, if the meeting has already spent max_cost.
     :raises CostUnknownError: If max_cost is given and a model's cost, or a response's usage,
         cannot be known.
@@ -194,6 +212,17 @@ def hold_meeting(
 
     if max_completion_tokens is not None and max_completion_tokens < 1:
         raise ValueError(f"max_completion_tokens must be at least 1, not {max_completion_tokens}")
+
+    if code_actions not in ("tool", "tags"):
+        raise ValueError(f'code_actions must be "tool" or "tags", not {code_actions!r}')
+
+    if code_actions == "tags" and session is None:
+        raise ValueError('code_actions="tags" runs code in a session, so it needs a session')
+
+    if max_tool_iterations is None:
+        max_tool_iterations = SESSION_MAX_TOOL_ITERATIONS if session is not None else MAX_TOOL_ITERATIONS
+    elif max_tool_iterations < 1:
+        raise ValueError(f"max_tool_iterations must be at least 1, not {max_tool_iterations}")
 
     # Validate meeting type
     if meeting_type == "team":
@@ -236,6 +265,9 @@ def hold_meeting(
 
     if pubmed_search and not any(tool.name == PUBMED_TOOL.name for tool in meeting_tools):
         meeting_tools = (PUBMED_TOOL,) + meeting_tools
+
+    if session is not None and code_actions == "tool":
+        meeting_tools = meeting_tools + (session_tool(session),)
 
     # A limit on spending is only a limit if every model's price is known; an unpriced one
     # would be free as far as the limit could tell
@@ -280,7 +312,7 @@ def hold_meeting(
         summaries_sha256=[fingerprint(summary) for summary in summaries],
         contexts_sha256=[fingerprint(context) for context in contexts],
         output_schema=output_schema.__name__ if output_schema is not None else None,
-        max_tool_iterations=MAX_TOOL_ITERATIONS,
+        max_tool_iterations=max_tool_iterations,
         max_completion_tokens=max_completion_tokens,
         max_cost=max_cost,
         chat_models={model: describe_chat_model(llm) for model, llm in llms.items()},
@@ -323,6 +355,41 @@ def hold_meeting(
             temperature=temperature,
         )
 
+    # Started before the first request, so that a session that cannot start, such as one whose
+    # image was never built, fails the meeting before anything is spent. The session may have
+    # run code for an earlier meeting; only what this one runs is its own.
+    first_cell = 0
+    session_prompt = ""
+    if session is not None:
+        session.start()
+        first_cell = len(session.history)
+        session_prompt = code_session_prompt(
+            code_actions=code_actions,
+            working_directory=session.where_code_runs(),
+            network=session.can_reach_network(),
+            data_lake=session.data_lake_path(),
+        )
+
+    def save_session(directory: Path) -> None:
+        """Saves the code the meeting ran, and notes in the record where it went.
+
+        A log that cannot be saved is warned about rather than raised, so that it neither costs
+        the meeting its transcript nor hides the error that ended a failed one.
+        """
+        if session is None:
+            return
+
+        try:
+            log = save_session_log(directory, save_name, session, first_cell)
+            record.session = {
+                **session.describe(),
+                "code_actions": code_actions,
+                "cells_run": len(session.history) - first_cell,
+                "log": log.relative_to(directory).as_posix(),
+            }
+        except Exception as error:
+            print(f"Warning: the log of the code this meeting ran could not be saved: {error}")
+
     # The last thing an agent said, kept apart from the transcript because a structured output
     # follows it there
     summary = ""
@@ -352,6 +419,8 @@ def hold_meeting(
             contexts=contexts,
             num_rounds=num_rounds,
         )
+        if session_prompt:
+            initial_content = f"{initial_content}\n\n{session_prompt}"
         messages.append({"role": "user", "content": initial_content})
         discussion.append({"agent": "User", "message": initial_content})
         record.record_turn(speaker="User", kind="prompt")
@@ -406,6 +475,8 @@ def hold_meeting(
                                 summaries=summaries,
                                 contexts=contexts,
                             )
+                            if session_prompt:
+                                prompt = f"{prompt}\n\n{session_prompt}"
                         else:
                             prompt = individual_meeting_agent_prompt(critic=meeting_critic, agent=team_member)
 
@@ -419,6 +490,7 @@ def hold_meeting(
                 turn_usage = MeetingUsage()
                 turn_tool_calls: list[dict[str, str]] = []
                 turn_fingerprint: str | None = None
+                turn_first_cell = len(session.history) if session is not None else 0
 
                 # Build messages for this agent with their system prompt
                 agent_messages: list[ChatCompletionMessageParam] = [agent.message] + messages
@@ -435,12 +507,12 @@ def hold_meeting(
                         f'"{agent.model}" and may not fit for many more rounds.'
                     )
 
-                # Call the chat completions API, letting the agent use tools repeatedly until it
-                # has what it needs. Tool definitions are offered again after each result so
-                # that one search can inform the next.
-                for tool_iteration in range(MAX_TOOL_ITERATIONS + 1):
+                # Call the chat completions API, letting the agent use tools, or run code, repeatedly
+                # until it has what it needs. Tool definitions are offered again after each result
+                # so that one search can inform the next.
+                for tool_iteration in range(max_tool_iterations + 1):
                     # Withhold the tools on the final attempt to force a text answer
-                    is_final_attempt = tool_iteration == MAX_TOOL_ITERATIONS
+                    is_final_attempt = tool_iteration == max_tool_iterations
 
                     check_budget()
                     reply = ask_agent(
@@ -452,42 +524,84 @@ def hold_meeting(
                     turn_fingerprint = reply.system_fingerprint or turn_fingerprint
                     finish_reason = reply.finish_reason
 
+                    action = (
+                        find_code_action(reply.content)
+                        if code_actions == "tags" and not reply.tool_calls
+                        else None
+                    )
+
                     # Stop once the agent has answered, and never run tools on the forced attempt
-                    if not reply.tool_calls or is_final_attempt:
+                    if (not reply.tool_calls and action is None) or is_final_attempt:
                         break
 
-                    turn_tool_calls.extend(describe_tool_call(tool_call) for tool_call in reply.tool_calls)
-
-                    if tool_iteration == MAX_TOOL_ITERATIONS - 1:
+                    if tool_iteration == max_tool_iterations - 1:
                         print(
-                            f"Warning: {agent.title} reached the limit of {MAX_TOOL_ITERATIONS} "
+                            f"Warning: {agent.title} reached the limit of {max_tool_iterations} "
                             f"rounds of tool calls and will now be asked to answer without tools."
                         )
 
-                    # Run the tools and get outputs
-                    tool_outputs, tool_messages = run_tool_calls(
-                        tool_calls=list(reply.tool_calls), tools=meeting_tools
-                    )
+                    if action is not None:
+                        assert session is not None
+                        try:
+                            report = observation(
+                                session.run(action.code, language=action.language),
+                                runs_left=max_tool_iterations - tool_iteration - 1,
+                            )
+                        except Exception as error:
+                            report = f"<observation>\nThe code could not be run: {error}\n</observation>"
 
-                    # Add the assistant's message with tool_calls to the messages
-                    assistant_tool_message: ChatCompletionAssistantMessageParam = {
-                        "role": "assistant",
-                        "name": agent.name,
-                        "content": reply.content or None,
-                        "tool_calls": [tc.model_dump() for tc in reply.tool_calls],  # type: ignore[misc]
-                    }
-                    messages.append(assistant_tool_message)
+                        # Kept in the meeting as the agent said it, so that everyone after sees
+                        # the code and what it printed
+                        messages.append({"role": "assistant", "name": agent.name, "content": action.said})
+                        discussion.append({"agent": agent.title, "message": action.said})
+                        record.record_turn(speaker=agent.title, kind="code_action", name=agent.name, model=agent.model)
 
-                    # Add tool response messages
-                    for tool_msg in tool_messages:
-                        messages.append(tool_msg)
+                        messages.append({"role": "user", "content": report})
+                        discussion.append({"agent": "Session", "message": report})
+                        record.record_turn(speaker="Session", kind="code_output")
+                    else:
+                        turn_tool_calls.extend(describe_tool_call(tool_call) for tool_call in reply.tool_calls)
 
-                    # Add tool outputs to discussion for visibility
-                    tool_output_content = "\n\n".join(tool_outputs)
-                    discussion.append({"agent": "Tool", "message": tool_output_content})
-                    record.record_turn(speaker="Tool", kind="tool_output")
+                        # Run the tools and get outputs
+                        tool_outputs, tool_messages = run_tool_calls(
+                            tool_calls=list(reply.tool_calls), tools=meeting_tools
+                        )
 
-                    # Send the tool results back on the next iteration
+                        # Add the assistant's message with tool_calls to the messages
+                        assistant_tool_message: ChatCompletionAssistantMessageParam = {
+                            "role": "assistant",
+                            "name": agent.name,
+                            "content": reply.content or None,
+                            "tool_calls": [tc.model_dump() for tc in reply.tool_calls],  # type: ignore[misc]
+                        }
+                        messages.append(assistant_tool_message)
+
+                        # Add tool response messages
+                        for tool_msg in tool_messages:
+                            messages.append(tool_msg)
+
+                        # Add tool outputs to discussion for visibility, with the code that
+                        # produced any output of code, which the model is not sent again
+                        tool_output_content = "\n\n".join(
+                            describe_tool_output(tool_call, output, CODE_TOOL_NAME)
+                            for tool_call, output in zip(reply.tool_calls, tool_outputs)
+                        )
+                        discussion.append({"agent": "Tool", "message": tool_output_content})
+                        record.record_turn(speaker="Tool", kind="tool_output")
+
+                        # Code written beside a tool call is not run, and the agent must know
+                        # that, or it will take the call's output for the code's
+                        if code_actions == "tags" and find_code_action(reply.content or "") is not None:
+                            skipped = (
+                                "<observation>\nThe code in that reply was not run, because the "
+                                "reply also called a tool. Write it again, on its own, to run it."
+                                "\n</observation>"
+                            )
+                            messages.append({"role": "user", "content": skipped})
+                            discussion.append({"agent": "Session", "message": skipped})
+                            record.record_turn(speaker="Session", kind="code_output")
+
+                    # Send the results back on the next iteration
                     agent_messages = [agent.message] + messages
 
                     # Tool output can be large, so re-check before sending it back
@@ -495,6 +609,10 @@ def hold_meeting(
 
                 # Extract the response content
                 response_content = reply.content
+
+                # Only the forced final attempt can end a turn on code, which it was too late to run
+                if code_actions == "tags":
+                    response_content = without_code_action(response_content)
 
                 # A reasoning model can spend its whole allowance thinking and write nothing, and
                 # an empty turn read as the agent's answer would be summarised as agreement
@@ -525,6 +643,7 @@ def hold_meeting(
                     reasoning_tokens=turn_usage.reasoning_tokens,
                     num_api_calls=turn_usage.num_calls,
                     tool_calls=turn_tool_calls,
+                    code_runs=describe_code_runs(session, turn_first_cell, first_cell),
                     system_fingerprint=turn_fingerprint,
                     finish_reason=finish_reason,
                 )
@@ -593,6 +712,7 @@ def hold_meeting(
         if discussion:
             partial_dir = save_dir / PARTIAL_MEETING_DIR_NAME
             save_meeting(save_dir=partial_dir, save_name=save_name, discussion=discussion)
+            save_session(partial_dir)
             save_record(save_dir=partial_dir, save_name=save_name, record=record)
             print(f"Meeting failed. Partial discussion saved to {partial_dir / f'{save_name}.json'}")
         print("Usage before the failure:")
@@ -611,6 +731,7 @@ def hold_meeting(
         save_name=save_name,
         discussion=discussion,
     )
+    save_session(save_dir)
     record_path = save_record(save_dir=save_dir, save_name=save_name, record=record)
     output_path = (
         save_output(save_dir=save_dir, save_name=save_name, output=structured_output)
@@ -628,6 +749,45 @@ def hold_meeting(
         record_path=record_path,
         output_path=output_path,
     )
+
+
+def describe_code_runs(session: Session | None, turn_first_cell: int, first_cell: int) -> list[dict]:
+    """Records the code a turn ran, by its position in the meeting's session log."""
+    if session is None:
+        return []
+
+    turn_cells = session.history[turn_first_cell:]
+
+    return [
+        {
+            "cell": cell,
+            "language": result.language,
+            "status": result.status,
+            "duration": round(result.duration, 3),
+            "plots": list(result.plots),
+        }
+        for cell, result in enumerate(turn_cells, start=turn_first_cell - first_cell)
+    ]
+
+
+def save_session_log(save_dir: Path, save_name: str, session: Session, first_cell: int) -> Path:
+    """Saves the code a meeting ran in its session, cell by cell, with everything it printed.
+
+    :param save_dir: The directory the meeting is saved in.
+    :param save_name: The meeting's name.
+    :param session: The session.
+    :param first_cell: How many cells the session had run before the meeting.
+    :return: Where the log was saved.
+    """
+    path = save_dir / SESSION_LOG_DIR_NAME / f"{save_name}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log = {
+        "session": session.describe(),
+        "cells": [result.to_dict() for result in session.history[first_cell:]],
+    }
+    path.write_text(json.dumps(log, indent=4), encoding="utf-8")
+
+    return path
 
 
 def describe_chat_model(llm: BaseChatModel) -> dict[str, str | None]:
