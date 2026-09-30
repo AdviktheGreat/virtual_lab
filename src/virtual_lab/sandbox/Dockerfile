@@ -54,6 +54,12 @@ ENV PATH=/opt/conda/envs/biomni_e1/bin:/opt/conda/bin:$PATH \
 
 RUN python3 -c "import numpy, pandas, scipy, sklearn, statsmodels, matplotlib, seaborn, networkx"
 
+# The miniforge image starts everything under its own tini, which Docker's --init already
+# provides; the second one warns that it is not PID 1 on the stderr of every run. Every run is
+# given its full command, so there is nothing for an entrypoint or default command to do.
+ENTRYPOINT []
+CMD []
+
 
 FROM base AS bio
 
