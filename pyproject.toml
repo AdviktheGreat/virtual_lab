@@ -18,6 +18,10 @@ license = { file = "LICENSE" }
 # expressions, which PEP 701 only permits from 3.12 onwards.
 requires-python = ">=3.12"
 dependencies = [
+    # Every model is reached through LangChain, as in Biomni, so that agents can use any provider
+    "langchain-anthropic>=1.0",
+    "langchain-core>=1.0",
+    "langchain-openai>=1.0",
     "notebook",
     # parse on chat.completions outside beta, and the finish-reason errors carrying the response
     "openai>=1.92",
@@ -46,6 +50,9 @@ keywords = [
 ]
 
 [project.optional-dependencies]
+# Local models through Ollama, and models on Amazon Bedrock
+ollama = ["langchain-ollama>=1.0"]
+bedrock = ["langchain-aws>=1.0"]
 nanobody-design = [
     "biopython",
     "pandas",

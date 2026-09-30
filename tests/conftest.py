@@ -170,6 +170,37 @@ class FakeCompletions:
         return response
 
 
+    @property
+    def with_raw_response(self) -> "RawResponses":
+        # The shape LangChain calls, since it reads the response's headers as well as its body
+        return RawResponses(self)
+
+
+class RawResponse:
+    """Stands in for the SDK's wrapper around a response and its HTTP headers."""
+
+    def __init__(self, response: Any) -> None:
+        self.response = response
+        self.headers: dict[str, str] = {}
+        self.http_response = None
+
+    def parse(self) -> Any:
+        return self.response
+
+
+class RawResponses:
+    """Stands in for client.chat.completions.with_raw_response."""
+
+    def __init__(self, completions: FakeCompletions) -> None:
+        self.completions = completions
+
+    def create(self, **kwargs: Any) -> RawResponse:
+        return RawResponse(self.completions.create(**kwargs))
+
+    def parse(self, **kwargs: Any) -> RawResponse:
+        return RawResponse(self.completions.parse(**kwargs))
+
+
 class FakeClient:
     """Stands in for openai.OpenAI."""
 
@@ -194,22 +225,28 @@ def forget_models_without_temperature() -> Any:
     MODELS_WITHOUT_TEMPERATURE.update(saved)
 
 
+def fake_llm(client: FakeClient, model: str = TEST_MODEL) -> Any:
+    """A LangChain OpenAI chat model that sends its requests to a fake client."""
+    from virtual_lab.llm import openai_chat_model
+
+    return openai_chat_model(model, client)
+
+
 @pytest.fixture
 def fake_client(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
-    """Replaces the OpenAI client used by run_meeting with a fake.
+    """Makes every chat model a meeting builds for itself send its requests to a fake.
 
-    The same instance is returned for every construction so a test can queue responses before
-    calling run_meeting and inspect the requests afterwards.
+    The same client answers for every model so that a test can queue responses before calling
+    run_meeting and inspect the requests afterwards. What the model was built with is kept in
+    init_kwargs.
     """
     client = FakeClient()
 
-    def build_client(**kwargs: Any) -> FakeClient:
-        client.init_kwargs = kwargs
-        return client
+    def build_llm(model: str, **kwargs: Any) -> Any:
+        client.init_kwargs = {"model": model, **kwargs}
+        return fake_llm(client, model)
 
-    # The module must be patched through the module object, since virtual_lab.run_meeting
-    # resolves to the re-exported function rather than the module it lives in.
-    monkeypatch.setattr(import_module("virtual_lab.run_meeting"), "OpenAI", build_client)
+    monkeypatch.setattr(import_module("virtual_lab.llm"), "get_llm", build_llm)
 
     return client
 

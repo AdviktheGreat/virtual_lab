@@ -19,7 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import langchain_core
 import openai
+from langchain_core.language_models.chat_models import BaseChatModel
 from openai import OpenAI
 
 from virtual_lab.__about__ import __version__
@@ -34,6 +36,7 @@ from virtual_lab.constants import (
     MAX_REPORTED_OUTPUT_CHARS,
 )
 from virtual_lab.execution import ExecutionResult, Executor, run_files
+from virtual_lab.llm import resolve_chat_models
 from virtual_lab.prompts import code_repair_prompt
 from virtual_lab.provenance import describe_agent, utc_timestamp
 from virtual_lab.structured import StructuredOutputError, request_structured_output
@@ -263,6 +266,7 @@ def run_with_repair(
     max_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS,
     timeout: float | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    chat_model: BaseChatModel | None = None,
 ) -> RepairOutcome:
     """Writes a meeting's code, runs it, and asks its author to fix it when it fails.
 
@@ -275,12 +279,14 @@ def run_with_repair(
     :param save_dir: The directory the meeting was saved in.
     :param executor: What to run the code with. Use DockerExecutor unless you have a reason not to.
     :param save_name: The name the meeting was saved under.
-    :param client: The OpenAI client to use, created if not given.
+    :param client: An OpenAI client, or one for any OpenAI-compatible server, to ask for repairs.
     :param model: The model to ask for repairs, defaulting to the author's own model.
     :param temperature: The sampling temperature for repair requests.
     :param max_attempts: The most times to run the code, counting the first run.
     :param timeout: Seconds to allow each execution, defaulting to the executor's own limit.
-    :param max_retries: Retries for failed API calls, used only if a client is created here.
+    :param max_retries: Retries for failed API calls, used only if a chat model is built here.
+    :param chat_model: The LangChain chat model to ask for repairs. With neither this nor a
+        client, one is built with get_llm from the model's name.
     :raises ValueError: If max_attempts is less than one.
     :raises StructuredOutputError: If the author does not return usable corrected files.
     :return: What happened, whether or not the code was made to work.
@@ -288,8 +294,10 @@ def run_with_repair(
     if max_attempts < 1:
         raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
 
-    if client is None:
-        client = OpenAI(max_retries=max_retries)
+    repair_model = model or author.model
+    llm = resolve_chat_models([repair_model], chat_models=chat_model, client=client, max_retries=max_retries)[
+        repair_model
+    ]
 
     outcome = RepairOutcome(artifacts=artifacts)
     attempts: list[RepairAttempt] = []
@@ -330,9 +338,9 @@ def run_with_repair(
         current = merge_artifacts(
             previous=current,
             repaired=request_repair(
-                client=client,
+                llm=llm,
                 author=author,
-                model=model or author.model,
+                model=repair_model,
                 files=current.files,
                 filename=failed_file.filename,
                 report=failed_result.report(),
@@ -352,7 +360,7 @@ def run_with_repair(
 
 
 def request_repair(
-    client: OpenAI,
+    llm: BaseChatModel,
     author: Agent,
     model: str,
     files: tuple[CodeFile, ...] | list[CodeFile],
@@ -368,7 +376,7 @@ def request_repair(
     The request is self-contained rather than a continuation of the meeting, so that a repair
     costs one focused call instead of resending the entire discussion.
 
-    :param client: The OpenAI client to use.
+    :param llm: The chat model to ask.
     :param author: The agent that wrote the code.
     :param model: The model to ask.
     :param files: The files as they currently stand.
@@ -382,8 +390,8 @@ def request_repair(
     :return: The files the agent returned, which may not include every original file.
     """
     try:
-        repaired, response = request_structured_output(
-            client=client,
+        repaired, reply = request_structured_output(
+            llm=llm,
             model=model,
             messages=[
                 {"role": "system", "content": author.prompt},
@@ -406,7 +414,7 @@ def request_repair(
         usage.add(model=model, usage=error.usage)
         raise
 
-    usage.add(model=model, usage=response.usage)
+    usage.add(model=model, usage=reply.usage)
 
     return repaired
 
@@ -430,6 +438,7 @@ def save_execution_record(
     record = {
         "virtual_lab_version": __version__,
         "openai_version": openai.__version__,
+        "langchain_core_version": langchain_core.__version__,
         "python_version": platform.python_version(),
         "platform": sys.platform,
         "save_name": save_name,

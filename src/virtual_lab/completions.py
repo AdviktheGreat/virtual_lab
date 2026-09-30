@@ -14,7 +14,7 @@ transcript produced at 1.0 is not the same experiment as one produced at 0.2.
 """
 
 import threading
-from typing import Any, Callable, TypeVar
+from typing import Callable, TypeVar
 
 import openai
 
@@ -45,43 +45,65 @@ def check_temperature(temperature: float | None) -> None:
         raise ValueError(f"temperature must be between 0 and 2, not {temperature}")
 
 
-def rejects_temperature(error: openai.BadRequestError) -> bool:
+# How providers without OpenAI's error codes say a model takes no temperature. A value out of
+# range is worded differently ("must be", "range"), and is the caller's mistake to see.
+REFUSAL_PHRASES = (
+    "not supported",
+    "unsupported",
+    "does not support",
+    "only the default",
+    "may only be set",
+    "cannot be used",
+    "cannot both be specified",
+    "is deprecated",
+)
+
+
+def rejects_temperature(error: BaseException) -> bool:
     """Whether a refused request was refused because the model takes no temperature.
 
-    The API names the offending parameter and gives a code, which are the parts of the error
-    meant to be read by a program; the message wording has changed between models.
+    OpenAI names the offending parameter and gives a code, which are the parts of its error
+    meant to be read by a program. Anthropic and the OpenAI-compatible servers give neither, so
+    for them the message is read, and only a 400 that names the temperature as unsupported
+    counts.
 
-    :param error: The error the API returned.
+    :param error: The error the request raised.
     :return: Whether removing the temperature could make the request succeed.
     """
-    return (
-        getattr(error, "param", None) == "temperature"
-        and getattr(error, "code", None) in UNSUPPORTED_CODES
-    )
+    if isinstance(error, openai.BadRequestError) and getattr(error, "code", None) is not None:
+        return (
+            getattr(error, "param", None) == "temperature"
+            and getattr(error, "code", None) in UNSUPPORTED_CODES
+        )
+
+    if getattr(error, "status_code", None) != 400:
+        return False
+
+    message = str(getattr(error, "message", None) or error).lower()
+
+    return "temperature" in message and any(phrase in message for phrase in REFUSAL_PHRASES)
 
 
 def send_request(
-    send: Callable[..., ResponseT],
+    send: Callable[[float | None], ResponseT],
     model: str,
     temperature: float | None,
-    **kwargs: Any,
 ) -> ResponseT:
     """Sends a request, without its temperature if the model will not accept one.
 
-    :param send: The client method to call, such as client.chat.completions.create.
-    :param model: The model to ask.
+    :param send: Sends the request at the temperature given, where None means send none.
+    :param model: The model being asked, which is remembered if it refuses a temperature.
     :param temperature: The sampling temperature wanted, or None for the model's default.
-    :param kwargs: The rest of the request.
     :raises ValueError: If the temperature is outside 0 to 2.
-    :raises openai.BadRequestError: If the request is refused for any other reason.
+    :raises Exception: Whatever the request raised, if it was refused for any other reason.
     :return: The response.
     """
     check_temperature(temperature)
 
     if temperature is not None and model not in MODELS_WITHOUT_TEMPERATURE:
         try:
-            return send(model=model, temperature=temperature, **kwargs)
-        except openai.BadRequestError as error:
+            return send(temperature)
+        except Exception as error:
             if not rejects_temperature(error):
                 raise
 
@@ -93,7 +115,7 @@ def send_request(
                 f"running at its default. Results will vary more between runs than asked for."
             )
 
-    return send(model=model, **kwargs)
+    return send(None)
 
 
 def ran_without_temperature(models: list[str]) -> list[str]:

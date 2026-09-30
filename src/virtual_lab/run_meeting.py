@@ -8,13 +8,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from openai import OpenAI, NOT_GIVEN
+from openai import OpenAI
 from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionToolParam
+from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 from tqdm import trange, tqdm
 
 from virtual_lab.agent import Agent
+from virtual_lab.llm import ModelReply, ModelSource, ask, resolve_chat_models
 from virtual_lab.completions import check_temperature, ran_without_temperature, send_request
 from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
@@ -125,6 +128,7 @@ def hold_meeting(
     output_schema: type[BaseModel] | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     client: OpenAI | None = None,
+    chat_models: ModelSource | None = None,
     max_cost: float | None = None,
     on_usage: Callable[[MeetingUsage], None] | None = None,
     max_completion_tokens: int | None = None,
@@ -157,8 +161,12 @@ def hold_meeting(
         the result is saved under save_dir/outputs/. Note that the API makes every field of the
         schema required, so a field default never applies.
     :param max_retries: The number of times to retry a failed API call, with exponential backoff.
-        Only used when no client is given.
-    :param client: The OpenAI client to use, or None to create one.
+        Only used for chat models built here.
+    :param client: An OpenAI client, or one for any OpenAI-compatible server, to ask every model
+        chat_models does not cover. With neither, each model is built with get_llm, which works
+        out its provider from its name.
+    :param chat_models: LangChain chat models to ask: one for every agent, a mapping from model
+        name to chat model, or a function from model name to chat model.
     :param max_cost: The most the meeting may spend, in USD. It is checked before every request,
         so a meeting can overrun it by the cost of one request; max_completion_tokens bounds that.
         Every model in the meeting must be priced for the limit to mean anything.
@@ -212,9 +220,6 @@ def hold_meeting(
     # Start timing the meeting
     start_time = time.time()
 
-    if client is None:
-        client = OpenAI(max_retries=max_retries)
-
     # Set up team
     meeting_critic: Agent | None = None
 
@@ -250,6 +255,12 @@ def hold_meeting(
 
     tool_definitions: list[ChatCompletionToolParam] = [tool.definition for tool in meeting_tools]
 
+    # Built before the first request, so that a model whose provider cannot be worked out, or
+    # whose package is not installed, fails the meeting before anything is spent
+    llms = resolve_chat_models(
+        [agent.model for agent in team], chat_models=chat_models, client=client, max_retries=max_retries
+    )
+
     # Track the token usage reported by the API, per model
     usage = MeetingUsage()
 
@@ -272,6 +283,7 @@ def hold_meeting(
         max_tool_iterations=MAX_TOOL_ITERATIONS,
         max_completion_tokens=max_completion_tokens,
         max_cost=max_cost,
+        chat_models={model: describe_chat_model(llm) for model, llm in llms.items()},
     )
 
     def check_budget() -> None:
@@ -292,7 +304,24 @@ def hold_meeting(
         if on_usage is not None:
             on_usage(usage)
 
-    completion_limit = max_completion_tokens if max_completion_tokens is not None else NOT_GIVEN
+    def ask_agent(
+        agent: Agent,
+        messages: list[ChatCompletionMessageParam],
+        tools: list[ChatCompletionToolParam] | None,
+    ) -> ModelReply:
+        """Asks an agent for its next message, without a temperature if its model refuses one."""
+        return send_request(
+            lambda sent_temperature: ask(
+                llms[agent.model],
+                messages,
+                temperature=sent_temperature,
+                tools=tools or None,
+                max_tokens=max_completion_tokens,
+                reader=agent.name,
+            ),
+            model=agent.model,
+            temperature=temperature,
+        )
 
     # The last thing an agent said, kept apart from the transcript because a structured output
     # follows it there
@@ -414,26 +443,20 @@ def hold_meeting(
                     is_final_attempt = tool_iteration == MAX_TOOL_ITERATIONS
 
                     check_budget()
-                    response = send_request(
-                        client.chat.completions.create,
-                        model=agent.model,
-                        temperature=temperature,
+                    reply = ask_agent(
+                        agent=agent,
                         messages=agent_messages,
-                        tools=tool_definitions if tool_definitions and not is_final_attempt else NOT_GIVEN,
-                        max_completion_tokens=completion_limit,
+                        tools=tool_definitions if not is_final_attempt else None,
                     )
-                    count_usage(agent.model, response.usage, turn_usage)
-                    turn_fingerprint = response.system_fingerprint or turn_fingerprint
-                    finish_reason = response.choices[0].finish_reason
-                    response_message = response.choices[0].message
+                    count_usage(agent.model, reply.usage, turn_usage)
+                    turn_fingerprint = reply.system_fingerprint or turn_fingerprint
+                    finish_reason = reply.finish_reason
 
                     # Stop once the agent has answered, and never run tools on the forced attempt
-                    if not response_message.tool_calls or is_final_attempt:
+                    if not reply.tool_calls or is_final_attempt:
                         break
 
-                    turn_tool_calls.extend(
-                        describe_tool_call(tool_call) for tool_call in response_message.tool_calls
-                    )
+                    turn_tool_calls.extend(describe_tool_call(tool_call) for tool_call in reply.tool_calls)
 
                     if tool_iteration == MAX_TOOL_ITERATIONS - 1:
                         print(
@@ -443,15 +466,15 @@ def hold_meeting(
 
                     # Run the tools and get outputs
                     tool_outputs, tool_messages = run_tool_calls(
-                        tool_calls=response_message.tool_calls, tools=meeting_tools
+                        tool_calls=list(reply.tool_calls), tools=meeting_tools
                     )
 
                     # Add the assistant's message with tool_calls to the messages
                     assistant_tool_message: ChatCompletionAssistantMessageParam = {
                         "role": "assistant",
                         "name": agent.name,
-                        "content": response_message.content,
-                        "tool_calls": [tc.model_dump() for tc in response_message.tool_calls],  # type: ignore[misc]
+                        "content": reply.content or None,
+                        "tool_calls": [tc.model_dump() for tc in reply.tool_calls],  # type: ignore[misc]
                     }
                     messages.append(assistant_tool_message)
 
@@ -471,7 +494,7 @@ def hold_meeting(
                     check_context_length(messages=agent_messages, model=agent.model)
 
                 # Extract the response content
-                response_content = response_message.content or ""
+                response_content = reply.content
 
                 # A reasoning model can spend its whole allowance thinking and write nothing, and
                 # an empty turn read as the agent's answer would be summarised as agreement
@@ -527,19 +550,20 @@ def hold_meeting(
             extraction_usage = MeetingUsage()
 
             try:
-                structured_output, parsed_response = request_structured_output(
-                    client=client,
+                structured_output, structured_reply = request_structured_output(
+                    llm=llms[closing_agent.model],
                     model=closing_agent.model,
                     messages=agent_messages,
                     schema=output_schema,
                     temperature=temperature,
                     max_completion_tokens=max_completion_tokens,
+                    reader=closing_agent.name,
                 )
             except StructuredOutputError as error:
                 count_usage(closing_agent.model, error.usage, extraction_usage)
                 raise
 
-            count_usage(closing_agent.model, parsed_response.usage, extraction_usage)
+            count_usage(closing_agent.model, structured_reply.usage, extraction_usage)
 
             output_json = json.dumps(structured_output.model_dump(mode="json"), indent=4)
             discussion.append({"agent": closing_agent.title, "message": output_json})
@@ -553,8 +577,8 @@ def hold_meeting(
                 output_tokens=extraction_usage.output_tokens,
                 reasoning_tokens=extraction_usage.reasoning_tokens,
                 num_api_calls=extraction_usage.num_calls,
-                system_fingerprint=parsed_response.system_fingerprint,
-                finish_reason=parsed_response.choices[0].finish_reason,
+                system_fingerprint=structured_reply.system_fingerprint,
+                finish_reason=structured_reply.finish_reason,
             )
     # BaseException, so that a meeting interrupted from the keyboard or cancelled by whatever
     # was running it still leaves what it had done, and what it had spent, on disk
@@ -604,6 +628,25 @@ def hold_meeting(
         record_path=record_path,
         output_path=output_path,
     )
+
+
+def describe_chat_model(llm: BaseChatModel) -> dict[str, str | None]:
+    """Says which provider answered for a model, for the record of a meeting."""
+    base_url = next(
+        (
+            getattr(llm, field)
+            for field in ("openai_api_base", "anthropic_api_url", "base_url", "azure_endpoint", "endpoint_url")
+            if getattr(llm, field, None)
+        ),
+        None,
+    )
+
+    if base_url is not None:
+        # A server's address can carry a password, which has no place in a record
+        parts = urlsplit(str(base_url))
+        base_url = urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
+
+    return {"class": f"{type(llm).__module__}.{type(llm).__qualname__}", "base_url": base_url}
 
 
 def close_record(record: MeetingRecord, usage: MeetingUsage, team: list[Agent]) -> None:

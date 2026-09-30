@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import langchain_core
 import openai
 
 from virtual_lab.__about__ import __version__
@@ -92,6 +93,8 @@ class MeetingRecord:
         to the meetings it was given without copying their text into every record.
     :param models_at_default_temperature: Models that refused the temperature asked for and ran
         at their own default instead.
+    :param chat_models: For each model, the LangChain class that answered for it and the server
+        it was sent to, where one was set.
     :param prices: What each model used was priced at, in USD per million tokens, since the
         price tables change and a cost is only comparable at the prices it was computed with.
     """
@@ -114,6 +117,7 @@ class MeetingRecord:
     max_completion_tokens: int | None = None
     max_cost: float | None = None
     models_at_default_temperature: list[str] = field(default_factory=list)
+    chat_models: dict[str, dict[str, str | None]] = field(default_factory=dict)
     prices: dict[str, dict[str, float] | None] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_timestamp)
     ended_at: str | None = None
@@ -154,6 +158,7 @@ class MeetingRecord:
         return {
             "virtual_lab_version": __version__,
             "openai_version": openai.__version__,
+            "langchain_core_version": langchain_core.__version__,
             "python_version": platform.python_version(),
             "platform": sys.platform,
             "meeting_type": self.meeting_type,
@@ -177,6 +182,7 @@ class MeetingRecord:
             "contexts_sha256": self.contexts_sha256,
             "output_schema": self.output_schema,
             "team": self.team,
+            "chat_models": self.chat_models,
             "critic": self.critic,
             "tools": self.tools,
             "usage": self.usage,

@@ -3,7 +3,6 @@
 import json
 from types import SimpleNamespace
 
-import openai
 import pytest
 
 from virtual_lab.agent import Agent
@@ -206,7 +205,7 @@ class TestToolLoopInMeeting:
         )
 
         assert lookup_calls == ["P0DTC2", "P59594"]
-        assert all(call["tools"] is not openai.NOT_GIVEN for call in fake_client.completions.calls)
+        assert all(call.get("tools") for call in fake_client.completions.calls)
 
     def test_tool_output_is_recorded_in_the_transcript(
         self, fake_client: FakeClient, team_member: Agent, lookup_tool: Tool, tmp_path
@@ -274,8 +273,8 @@ class TestToolLoopInMeeting:
         assert len(lookup_calls) == MAX_TOOL_ITERATIONS
         assert len(calls) == MAX_TOOL_ITERATIONS + 1
         # Tools are withheld on the final attempt to force a text answer, and none are run
-        assert calls[-1]["tools"] is openai.NOT_GIVEN
-        assert all(call["tools"] is not openai.NOT_GIVEN for call in calls[:-1])
+        assert "tools" not in calls[-1]
+        assert all(call["tools"] for call in calls[:-1])
 
     def test_no_tools_means_none_are_offered(
         self, fake_client: FakeClient, team_member: Agent, tmp_path
@@ -288,7 +287,7 @@ class TestToolLoopInMeeting:
             num_rounds=0,
         )
 
-        assert fake_client.completions.calls[0]["tools"] is openai.NOT_GIVEN
+        assert "tools" not in fake_client.completions.calls[0]
 
 
 class TestToolRegistration:
