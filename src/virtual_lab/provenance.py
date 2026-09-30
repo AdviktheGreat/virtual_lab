@@ -100,6 +100,9 @@ class MeetingRecord:
         it was sent to, where one was set.
     :param session: How the meeting's session ran code, if it had one: the session's settings,
         how its code actions were written, and where its log was saved.
+    :param resources: What of Biomni's environment the agents were told of, if they had a
+        session: how it was chosen, what there was, what was listed, and the request that chose
+        it, if one did.
     :param prices: What each model used was priced at, in USD per million tokens, since the
         price tables change and a cost is only comparable at the prices it was computed with.
     """
@@ -124,6 +127,7 @@ class MeetingRecord:
     models_at_default_temperature: list[str] = field(default_factory=list)
     chat_models: dict[str, dict[str, str | None]] = field(default_factory=dict)
     session: dict[str, Any] | None = None
+    resources: dict[str, Any] | None = None
     prices: dict[str, dict[str, float] | None] = field(default_factory=dict)
     started_at: str = field(default_factory=utc_timestamp)
     ended_at: str | None = None
@@ -192,6 +196,7 @@ class MeetingRecord:
             "critic": self.critic,
             "tools": self.tools,
             "session": self.session,
+            "resources": self.resources,
             "usage": self.usage,
             "prices": self.prices,
             "turns": [turn.to_dict() for turn in self.turns],

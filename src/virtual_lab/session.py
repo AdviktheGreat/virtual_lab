@@ -462,12 +462,33 @@ class Session:
         """Where Biomni's data lake is, as the code sees it, or None if it is not there."""
         return None
 
+    def data_lake_files(self) -> list[str]:
+        """The files in Biomni's data lake, by name, or none if it is not there."""
+        return []
+
+    def has_biomni_tools(self) -> bool:
+        """Whether code can import Biomni's tools."""
+        return False
+
+
+def list_data_lake(directory: Path | None) -> list[str]:
+    """The files in a data lake directory, leaving out downloads that did not finish."""
+    if directory is None or not Path(directory).is_dir():
+        return []
+
+    return sorted(
+        path.name for path in Path(directory).iterdir() if path.is_file() and not path.name.startswith(".")
+    )
+
 
 def session_executor(
     target: str = "full",
     data_lake: Path | None = None,
     allow_network: bool = True,
     timeout: float = DEFAULT_EXECUTION_TIMEOUT,
+    biomni_tools: bool = True,
+    forward_env: tuple[str, ...] = (),
+    environment: dict[str, str] | None = None,
 ) -> DockerExecutor:
     """The container a session runs in by default: Biomni's environment, with the network.
 
@@ -479,6 +500,13 @@ def session_executor(
     :param data_lake: A directory of Biomni's data lake to mount read-only, if any.
     :param allow_network: Whether code can reach the network.
     :param timeout: Seconds each piece of code may run.
+    :param biomni_tools: Whether code can import Biomni's tools, as Biomni's agent does.
+    :param forward_env: Host environment variables to pass in, by name. About forty of Biomni's
+        tools call a model, most of them the database tools that turn a question into a query,
+        and need its API key: ANTHROPIC_API_KEY for Biomni's default model. Code can read what
+        is passed, and send it anywhere over the network.
+    :param environment: Variables to set, such as BIOMNI_LLM to choose the model Biomni's tools
+        call. They are recorded, so they are not for secrets.
     :return: The executor, to pass to DockerSession.
     """
     return DockerExecutor(
@@ -491,6 +519,9 @@ def session_executor(
         cpu_limit=DEFAULT_SESSION_CPU_LIMIT,
         pids_limit=DEFAULT_SESSION_PIDS_LIMIT,
         tmpfs_size=DEFAULT_SESSION_TMPFS_SIZE,
+        biomni_tools=biomni_tools,
+        forward_env=tuple(forward_env),
+        environment=dict(environment or {}),
     )
 
 
@@ -561,6 +592,12 @@ class DockerSession(Session):
     def data_lake_path(self) -> str | None:
         return SANDBOX_DATA_LAKE_DIR if self.executor.data_lake is not None else None
 
+    def data_lake_files(self) -> list[str]:
+        return list_data_lake(self.executor.data_lake)
+
+    def has_biomni_tools(self) -> bool:
+        return self.executor.biomni_tools
+
 
 class LocalSession(Session):
     """A session whose interpreter runs directly on this machine, with no isolation whatsoever.
@@ -576,6 +613,12 @@ class LocalSession(Session):
     :param timeout: Seconds each piece of code may run.
     :param warn: Whether to warn that nothing is isolated.
     :param start_timeout: Seconds to wait for the interpreter to start.
+    :param max_file_bytes: The largest file the code may write.
+    :param biomni_tools: Whether code can import Biomni's tools. They need the libraries of
+        Biomni's environment, so pass its interpreter as python.
+    :param forward_env: Environment variables to pass through, by name, such as the API keys
+        Biomni's tools use.
+    :param environment: Variables to set, such as BIOMNI_LLM.
     """
 
     sandboxed = False
@@ -588,6 +631,9 @@ class LocalSession(Session):
         warn: bool = True,
         start_timeout: float = SESSION_START_TIMEOUT,
         max_file_bytes: int = MAX_WRITTEN_FILE_BYTES,
+        biomni_tools: bool = False,
+        forward_env: tuple[str, ...] = (),
+        environment: dict[str, str] | None = None,
     ) -> None:
         if warn:
             warnings.warn(
@@ -599,9 +645,18 @@ class LocalSession(Session):
         super().__init__(directory, timeout=timeout, start_timeout=start_timeout)
         self.python = python or sys.executable
         self.max_file_bytes = max_file_bytes
+        self.biomni_tools = biomni_tools
+        self.forward_env = tuple(forward_env)
+        self.environment = dict(environment or {})
 
     def spawn(self) -> tuple[list[str], dict[str, Any], Callable[[subprocess.Popen], None]]:
-        limits = LocalExecutor(warn=False, max_file_bytes=self.max_file_bytes)
+        limits = LocalExecutor(
+            warn=False,
+            max_file_bytes=self.max_file_bytes,
+            biomni_tools=self.biomni_tools,
+            forward_env=self.forward_env,
+            environment=self.environment,
+        )
         options: dict[str, Any] = {
             "cwd": self.directory,
             "env": limits.build_environment(),
@@ -612,7 +667,16 @@ class LocalSession(Session):
         return [self.python, "-u", "-c", KERNEL_SOURCE], options, kill_process_group
 
     def describe(self) -> dict[str, Any]:
-        return {**super().describe(), "python": self.python}
+        return {
+            **super().describe(),
+            "python": self.python,
+            "biomni_tools": self.biomni_tools,
+            "forward_env": list(self.forward_env),
+            "environment": dict(self.environment),
+        }
+
+    def has_biomni_tools(self) -> bool:
+        return self.biomni_tools
 
 
 def session_tool(session: Session) -> Tool:

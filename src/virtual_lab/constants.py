@@ -191,6 +191,15 @@ DATA_LAKE_CHUNK_BYTES = 1024**2
 # it from, relative to their data directory.
 SANDBOX_DATA_LAKE_DIR = "/biomni_data/data_lake"
 
+# The directory Biomni's tools take as their data path, which holds the data lake. Given to them
+# as BIOMNI_PATH, their own configuration's way of setting it.
+SANDBOX_BIOMNI_PATH = "/biomni_data"
+
+# Where Biomni's own package, with its tool functions, is mounted in the sandbox, read-only, and
+# put on the Python path, so that code imports them as Biomni's agent does:
+# from biomni.tool.genomics import ...
+SANDBOX_BIOMNI_PACKAGE_DIR = "/opt/biomni_package"
+
 # Where the meeting's files are mounted inside the container. Model-authored code sees only
 # this directory, so paths it writes into its own output are relative to here.
 SANDBOX_WORK_DIR = "/workspace"
@@ -266,6 +275,10 @@ DEFAULT_MAX_REPAIR_ATTEMPTS = 3
 # Subdirectory for the record of what happened when a meeting's code was run, kept separate
 # from the meeting's own record for the same reason the others are in their own directories.
 EXECUTION_DIR_NAME = "executions"
+
+# Most characters of a model's answer to which resources a meeting needs kept in the record. The
+# answer is a few lists of numbers; anything longer is a model that did not follow the prompt.
+MAX_RECORDED_RETRIEVAL_CHARS = 2_000
 
 # Subdirectory for the log of the code a meeting ran in its session, cell by cell, in full. The
 # meeting's record says which cells each turn ran; this holds their code and output.

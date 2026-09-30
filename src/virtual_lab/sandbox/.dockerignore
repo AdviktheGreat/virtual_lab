@@ -1,0 +1,2 @@
+# Biomni's package is mounted into containers at run time, not built into the image
+biomni_package

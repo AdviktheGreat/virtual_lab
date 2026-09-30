@@ -471,9 +471,19 @@ def describe_executor(executor: Executor) -> dict[str, Any]:
         "max_file_bytes",
         "data_lake",
         "platform",
+        "biomni_tools",
+        # Names only: the values are what is being kept out of records
+        "forward_env",
+        "environment",
     ):
         if hasattr(executor, attribute):
             value = getattr(executor, attribute)
-            description[attribute] = str(value) if isinstance(value, Path) else value
+            if isinstance(value, Path):
+                value = str(value)
+            elif isinstance(value, tuple):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+            description[attribute] = value
 
     return description

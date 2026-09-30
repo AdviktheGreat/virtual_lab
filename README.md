@@ -197,6 +197,41 @@ Everyone in the meeting shares the one interpreter, so what one agent loads or c
 
 An agent may run code, or call tools, up to 20 times in a turn with a session (5 without), after which it is asked to answer without them; `max_tool_iterations=` changes that. The session is started before the first request, so one that cannot start costs nothing, and it is left running afterwards, so the next meeting can pick up where this one left off. Every piece of code the meeting ran, with its full output, is saved to `sessions/<save_name>.json`, and each turn in the meeting's record lists the cells it ran and how each ended. The transcript shows the code beside its output.
 
+### Biomni's tools, data, and know-how in a meeting
+
+Biomni's package ships with this one, unchanged, so code in a session can import its tool functions (223 of them, from database queries to CRISPR screen design) the way Biomni's agent does: `from biomni.tool.database import query_uniprot`. The package is mounted read-only into the container and is never imported on your machine. Each meeting tells its agents what they can use: Biomni's tools, the data lake files that are mounted, the software in the image, and Biomni's know-how documents, which are given in full.
+
+Listing everything adds about 40,000 tokens to every request, so by default the agent who closes the meeting is first asked which resources the agenda needs, as Biomni's agent asks before each task, and only those are listed. That costs one request of about 12,000 tokens, which counts towards `max_cost` and the meeting's usage. An answer that cannot be read lists everything, with a warning.
+
+```python
+from virtual_lab import Resources, available_resources
+
+hold_meeting(..., session=session)                     # the lead picks what the agenda needs
+hold_meeting(..., session=session, resources="all")    # list everything
+hold_meeting(..., session=session, resources="none")   # list nothing
+
+everything = available_resources(session)
+chosen = Resources(tools=tuple(t for t in everything.tools if t["module"] == "biomni.tool.database"))
+hold_meeting(..., session=session, resources=chosen)   # list exactly these
+```
+
+Tools and software are listed only when the session can import Biomni's tools (`biomni_tools=False` in `session_executor` or `LocalSession` turns this off), and data lake files only when the data lake is mounted. The meeting's record says which resources were available, which were listed, and, when they were retrieved, what the agent answered and what that request cost.
+
+About forty of Biomni's tools call a model themselves, most of them the database tools that turn a question into a query. They need an API key inside the container, which is otherwise given none. Pass the names of the variables to forward, and set Biomni's own settings with `environment`:
+
+```python
+executor = session_executor(
+    "bio",
+    data_lake=lake.directory,
+    forward_env=("ANTHROPIC_API_KEY",),
+    environment={"BIOMNI_LLM": "claude-sonnet-4-5"},
+)
+```
+
+A forwarded variable is passed to Docker by name, so its value never appears in a command line, and the record lists only its name. It must be set on your machine, or the session refuses to start. Code in the session can read it, and with the network on it can send it anywhere, so forward only a key you are prepared to have used by the code agents write. Values in `environment` are recorded in full, so they are not for secrets.
+
+`commercial_mode=True` leaves out the data lake files and know-how documents that Biomni's commercial mode leaves out because their licenses forbid commercial use, and describes the data lake as that mode does. `download_data_lake(directory, names=commercial_data_lake())` fetches only the files it uses. It does not check the licenses of the tools themselves or of the databases they query; see `license_info.md` in `virtual_lab/sandbox/biomni_package`.
+
 
 ## Fixing code that fails
 

@@ -77,3 +77,7 @@ filterwarnings = ["error::DeprecationWarning"]
 [project.urls]
 Homepage = "https://github.com/zou-group/virtual-lab"
 Issues = "https://github.com/zou-group/virtual-lab/issues"
+
+[tool.ruff]
+# Copied unchanged from Biomni, so held to Biomni's own style rather than this project's
+extend-exclude = ["src/virtual_lab/sandbox/biomni_package"]
