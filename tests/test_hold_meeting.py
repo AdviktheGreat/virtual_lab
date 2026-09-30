@@ -27,6 +27,7 @@ from virtual_lab.utils import BudgetExceededError, CostUnknownError, MeetingUsag
 from conftest import (
     TEST_MODEL,
     FakeClient,
+    fake_llm,
     make_usage,
     parsed_response,
     text_response,
@@ -287,10 +288,10 @@ class TestArguments:
     def test_given_client_is_used_instead_of_building_one(
         self, monkeypatch: pytest.MonkeyPatch, team_member: Agent, tmp_path
     ) -> None:
-        def refuse(**kwargs) -> None:
-            raise AssertionError("a client was built although one was given")
+        def refuse(*args, **kwargs) -> None:
+            raise AssertionError("a chat model was built although a client was given")
 
-        monkeypatch.setattr(import_module("virtual_lab.run_meeting"), "OpenAI", refuse)
+        monkeypatch.setattr(import_module("virtual_lab.llm"), "get_llm", refuse)
         client = FakeClient()
 
         individual(team_member, tmp_path, client=client)
@@ -314,7 +315,7 @@ class TestArguments:
     ) -> None:
         individual(team_member, tmp_path)
 
-        assert fake_client.completions.calls[0]["max_completion_tokens"] is openai.NOT_GIVEN
+        assert "max_completion_tokens" not in fake_client.completions.calls[0]
 
 
 class TestBudget:
@@ -689,7 +690,7 @@ class TestStructuredOutputFailures:
 
         with pytest.raises(StructuredOutputError):
             request_repair(
-                client=client,  # type: ignore[arg-type]
+                llm=fake_llm(client),
                 author=team_member,
                 model=TEST_MODEL,
                 files=[],

@@ -278,7 +278,8 @@ class BudgetExceededError(RuntimeError):
 def price_key(model: str, prices: dict[str, float]) -> str | None:
     """Finds the entry in a price table for a model, matching only the model itself.
 
-    A dated snapshot such as gpt-5.2-2025-12-11 is priced as the model it is a snapshot of. Any
+    A dated snapshot such as gpt-5.2-2025-12-11 or claude-sonnet-4-5-20250929 is priced as the
+    model it is a snapshot of. Any
     other suffix is a different model: matching gpt-5-pro to gpt-5 as a prefix priced it at a
     twelfth of what it costs, which is the one error a spending limit cannot survive.
 
@@ -289,7 +290,7 @@ def price_key(model: str, prices: dict[str, float]) -> str | None:
     if model in prices:
         return model
 
-    undated = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
+    undated = re.sub(r"-(\d{4}-\d{2}-\d{2}|\d{8})$", "", model)
 
     return undated if undated in prices else None
 

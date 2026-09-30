@@ -39,6 +39,7 @@ from virtual_lab.execution import (
     UnsupportedLanguageError,
     run_files,
 )
+from virtual_lab.llm import detect_source, get_llm
 from virtual_lab.literature import (
     Article,
     ArticleResults,
@@ -190,6 +191,8 @@ __all__ = [
     "get_protein",
     "get_structure",
     "hold_meeting",
+    "detect_source",
+    "get_llm",
     "list_data_files",
     "request_json",
     "request_text",

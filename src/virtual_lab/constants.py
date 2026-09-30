@@ -2,7 +2,8 @@
 
 DEFAULT_MODEL = "gpt-5.2"
 
-# Prices in USD as of December 30, 2025 (https://openai.com/api/pricing/)
+# Prices in USD per token: OpenAI's as of December 30, 2025 (https://openai.com/api/pricing/),
+# Anthropic's and Google's as of September 2026
 MODEL_TO_INPUT_PRICE_PER_TOKEN = {
     "gpt-3.5-turbo-0125": 0.5 / 10**6,
     "gpt-4o-2024-08-06": 2.5 / 10**6,
@@ -14,6 +15,26 @@ MODEL_TO_INPUT_PRICE_PER_TOKEN = {
     "gpt-5-nano": 0.05 / 10**6,
     "gpt-5.2": 1.75 / 10**6,
     "gpt-5.2-pro": 21 / 10**6,
+    # Anthropic (https://platform.claude.com/docs/en/about-claude/pricing)
+    "claude-opus-5": 5 / 10**6,
+    "claude-sonnet-5": 2 / 10**6,
+    "claude-opus-4-8": 5 / 10**6,
+    "claude-opus-4-7": 5 / 10**6,
+    "claude-opus-4-6": 5 / 10**6,
+    "claude-sonnet-4-6": 3 / 10**6,
+    "claude-opus-4-5": 5 / 10**6,
+    "claude-sonnet-4-5": 3 / 10**6,
+    "claude-haiku-4-5": 1 / 10**6,
+    "claude-opus-4-1": 15 / 10**6,
+    "claude-opus-4": 15 / 10**6,
+    "claude-sonnet-4": 3 / 10**6,
+    "claude-3-5-haiku": 0.8 / 10**6,
+    # Google (https://ai.google.dev/gemini-api/docs/pricing), at the rate for prompts over
+    # 200k tokens where there are two, so that a cost is never understated
+    "gemini-3.1-pro-preview": 4 / 10**6,
+    "gemini-2.5-pro": 2.5 / 10**6,
+    "gemini-2.5-flash": 0.3 / 10**6,
+    "gemini-2.5-flash-lite": 0.1 / 10**6,
 }
 
 MODEL_TO_OUTPUT_PRICE_PER_TOKEN = {
@@ -27,6 +48,26 @@ MODEL_TO_OUTPUT_PRICE_PER_TOKEN = {
     "gpt-5-nano": 0.4 / 10**6,
     "gpt-5.2": 14 / 10**6,
     "gpt-5.2-pro": 168 / 10**6,
+    # Anthropic (https://platform.claude.com/docs/en/about-claude/pricing)
+    "claude-opus-5": 25 / 10**6,
+    "claude-sonnet-5": 10 / 10**6,
+    "claude-opus-4-8": 25 / 10**6,
+    "claude-opus-4-7": 25 / 10**6,
+    "claude-opus-4-6": 25 / 10**6,
+    "claude-sonnet-4-6": 15 / 10**6,
+    "claude-opus-4-5": 25 / 10**6,
+    "claude-sonnet-4-5": 15 / 10**6,
+    "claude-haiku-4-5": 5 / 10**6,
+    "claude-opus-4-1": 75 / 10**6,
+    "claude-opus-4": 75 / 10**6,
+    "claude-sonnet-4": 15 / 10**6,
+    "claude-3-5-haiku": 4 / 10**6,
+    # Google (https://ai.google.dev/gemini-api/docs/pricing), at the rate for prompts over
+    # 200k tokens where there are two, so that a cost is never understated
+    "gemini-3.1-pro-preview": 18 / 10**6,
+    "gemini-2.5-pro": 15 / 10**6,
+    "gemini-2.5-flash": 2.5 / 10**6,
+    "gemini-2.5-flash-lite": 0.4 / 10**6,
 }
 
 FINETUNING_MODEL_TO_INPUT_PRICE_PER_TOKEN = {
@@ -88,6 +129,10 @@ METADATA_DIR_NAME = "metadata"
 # exponential backoff by the OpenAI client. Higher than the SDK default of 2 because a
 # failed call discards a whole meeting's worth of work.
 DEFAULT_MAX_RETRIES = 5
+
+# Output tokens allowed per response for providers that insist on a figure, Anthropic and
+# self-hosted servers, as Biomni sets them. A meeting's max_completion_tokens overrides it.
+DEFAULT_MAX_OUTPUT_TOKENS = 8_192
 
 CONSISTENT_TEMPERATURE = 0.2
 CREATIVE_TEMPERATURE = 0.8

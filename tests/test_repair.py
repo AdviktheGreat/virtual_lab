@@ -191,18 +191,9 @@ class TestCodeThatIsRepaired:
 
 
 class TestClient:
-    def test_a_client_is_created_when_none_is_given(
-        self, fake_client: FakeClient, team_member: Agent, tmp_path, monkeypatch
+    def test_a_chat_model_is_built_when_none_is_given(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
     ) -> None:
-        import virtual_lab.repair as repair
-
-        created = []
-
-        def create(max_retries: int) -> FakeClient:
-            created.append(max_retries)
-            return fake_client
-
-        monkeypatch.setattr(repair, "OpenAI", create)
         fake_client.completions.parsed_responses = [parsed_response(parsed=WORKING)]
 
         outcome = run_with_repair(
@@ -214,7 +205,7 @@ class TestClient:
             max_retries=7,
         )
 
-        assert created == [7]
+        assert fake_client.init_kwargs == {"model": team_member.model, "max_retries": 7}
         assert outcome.succeeded
         assert len(fake_client.completions.parse_calls) == 1
 

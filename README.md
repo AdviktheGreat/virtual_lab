@@ -51,9 +51,32 @@ pip install -e .
 ```
 
 
-## OpenAI API Key
+## Models and API keys
 
-The Virtual Lab currently uses GPT-5.2 from OpenAI by default. Save your OpenAI API key as the environment variable `OPENAI_API_KEY`. For example, add `export OPENAI_API_KEY=<your_key>` to your `.bashrc` or `.bash_profile`.
+The Virtual Lab uses GPT-5.2 from OpenAI by default, and any agent can use a model from another provider. Each model is reached through LangChain, and its provider is worked out from its name by the rules [Biomni](https://github.com/snap-stanford/Biomni) uses, so an agent created with `model="claude-sonnet-4-5"` is sent to Anthropic and one with `model="gemini-2.5-pro"` to Google. Agents in the same meeting can use different providers.
+
+| Provider | Model names | Key or setting |
+| --- | --- | --- |
+| OpenAI | `gpt-*`, `o1*`, `o3*`, `o4*`, `ft:*` | `OPENAI_API_KEY` |
+| Anthropic | `claude-*` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `gemini-*` | `GEMINI_API_KEY` |
+| Groq | any name containing `groq` | `GROQ_API_KEY` |
+| Azure OpenAI | `azure-<deployment>` | `OPENAI_API_KEY`, `OPENAI_ENDPOINT` |
+| Ollama (local) | `llama*`, `qwen*`, `mistral*`, `gpt-oss*`, and names with a `/` | `pip install virtual-lab[ollama]` |
+| Amazon Bedrock | `anthropic.claude-*`, `us.*`, and other Bedrock IDs | `AWS_REGION`, `pip install virtual-lab[bedrock]` |
+
+Set `LLM_SOURCE` to one of those providers to override the rules for every model. For anything else, including a self-hosted server with an OpenAI-compatible API, build the model yourself and pass it in:
+
+```python
+from virtual_lab import get_llm, hold_meeting
+
+served = get_llm("biomni-r0", source="Custom", base_url="http://localhost:30000/v1")
+result = hold_meeting(..., chat_models={"biomni-r0": served})
+```
+
+`chat_models` also takes a single LangChain chat model for every agent, or a function from model name to chat model. The record of each meeting names the class that answered for each model and the server it was sent to.
+
+OpenAI's API is told which agent wrote each earlier turn. Other providers have no field for this, so for them the other agents' turns are passed as user messages that begin with the speaker's name, rather than as the reader's own words.
 
 
 ## Holding a meeting and limiting what it spends
@@ -80,7 +103,8 @@ except BudgetExceededError as error:
 
 - `max_cost` is checked before every request, including each tool call and the structured output, so a meeting stops before the request it has no money left for. It can overrun by at most one request, which `max_completion_tokens` bounds.
 - A limit is refused outright if any model in the meeting has no price in `virtual_lab.constants`, and a response that reports no usage stops a limited meeting with `CostUnknownError`. Either would otherwise count as free. Without a limit, `result.cost` is `None` rather than a wrong number.
-- Prices are matched exactly or to a dated snapshot of a listed model (`gpt-4o-2024-08-06`). A name that merely starts with a listed one, such as `gpt-5-pro` or `gpt-5.4`, is unpriced rather than billed at the cheaper model's rate.
+- OpenAI, Anthropic, and Gemini models are priced. Gemini models with two rates are priced at the higher one, so their cost is an upper bound.
+- Prices are matched exactly or to a dated snapshot of a listed model (`gpt-4o-2024-08-06`, `claude-sonnet-4-5-20250929`). A name that merely starts with a listed one, such as `gpt-5-pro` or `gpt-5.4`, is unpriced rather than billed at the cheaper model's rate.
 - `on_usage` is called with the running usage after every response, for a caller keeping a total across meetings. An exception it raises stops the meeting like any other failure.
 - A failed or interrupted meeting, including one stopped by its limit or by Ctrl-C, saves its turns and its record, with the usage up to that point, under `save_dir/partial/`.
 - Several models (GPT-5 and its mini, nano, and pro versions among them) refuse any temperature but their default. When the API refuses the temperature, the request is sent again without it, the model is remembered for the rest of the process, and the record lists it under `models_at_default_temperature`.

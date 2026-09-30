@@ -10,7 +10,7 @@ from virtual_lab.constants import METADATA_DIR_NAME, OUTPUT_DIR_NAME
 from virtual_lab.run_meeting import run_meeting
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
 
-from conftest import TEST_MODEL, FakeClient, make_usage, parsed_response, text_response
+from conftest import TEST_MODEL, FakeClient, fake_llm, make_usage, parsed_response, text_response
 
 
 class Decision(BaseModel):
@@ -63,7 +63,7 @@ class TestRequestStructuredOutput:
         fake_client.completions.parsed_responses = [parsed_response(parsed=DECISION)]
 
         result, response = request_structured_output(
-            client=fake_client,
+            llm=fake_llm(fake_client),
             model=TEST_MODEL,
             messages=[{"role": "user", "content": "Decide."}],
             schema=Decision,
@@ -77,7 +77,7 @@ class TestRequestStructuredOutput:
         fake_client.completions.parsed_responses = [parsed_response(parsed=DECISION)]
 
         request_structured_output(
-            client=fake_client,
+            llm=fake_llm(fake_client),
             model=TEST_MODEL,
             messages=[{"role": "user", "content": "Decide."}],
             schema=Decision,
@@ -93,7 +93,7 @@ class TestRequestStructuredOutput:
 
         with pytest.raises(StructuredOutputError, match="refused"):
             request_structured_output(
-                client=fake_client,
+                llm=fake_llm(fake_client),
                 model=TEST_MODEL,
                 messages=[{"role": "user", "content": "Decide."}],
                 schema=Decision,
@@ -107,7 +107,7 @@ class TestRequestStructuredOutput:
 
         with pytest.raises(StructuredOutputError, match="not json at all"):
             request_structured_output(
-                client=fake_client,
+                llm=fake_llm(fake_client),
                 model=TEST_MODEL,
                 messages=[{"role": "user", "content": "Decide."}],
                 schema=Decision,
