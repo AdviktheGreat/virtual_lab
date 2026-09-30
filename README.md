@@ -153,6 +153,27 @@ The data lake is 76 files and about 11 GB. `download_data_lake` takes a list of 
 
 If you do not have Docker, `LocalExecutor` runs code directly on your machine instead. It is not a sandbox: code run through it can read and write any file you can. It applies a timeout and withholds your API key, and that is the extent of it.
 
+### A shared session for exploratory analysis
+
+A finished script is run once. An analysis is explored instead: load the data, look at it, decide what to do next. A session keeps one Python interpreter running for the length of a meeting, the way Biomni's agent keeps its REPL, so a table one agent loads is still there for the next agent to use:
+
+```python
+from pathlib import Path
+from virtual_lab import DockerSession, session_executor, session_tool
+
+with DockerSession(Path("results/session"), executor=session_executor("bio")) as session:
+    session.run("import pandas as pd\ndf = pd.read_csv('counts.csv')")
+    print(session.run("df.shape").output)          # the value of a final expression is printed
+    session.run("samtools --version", language="bash")
+    tool = session_tool(session)                   # a run_code tool to give the meeting's agents
+```
+
+Each run returns a `CellResult` holding what the code printed (standard output and standard error together, in order), its status, the figures it drew, and the files it wrote. Code that fails or runs out of time is a result, not an exception. A matplotlib figure left open is saved under `plots/` and closed. R and bash code runs as a fresh `Rscript` or `bash` process in the same directory each time, as it does in Biomni.
+
+By default a session runs in Biomni's `full` image with the network on, since Biomni's agent queries databases as it works. Pass `session_executor("bio")` or `session_executor("base")` for a stage you have built, `allow_network=False` to cut the network, and `data_lake=` to mount the data lake. Everything else about the container matches `DockerExecutor`. The limits are higher (8 GB of memory, 4 CPUs, 2 GB of scratch space) because a session holds a whole analysis in memory at once.
+
+Code is stopped at its time limit (`timeout=`, 300 seconds by default) and the session keeps everything it had defined. Code that ignores the stop, and code that crashes the interpreter or runs out of memory, costs the session: the result's status is `"lost"`, and the next run starts a fresh interpreter, which its `start` number shows. Starting a session in an image Docker emulates takes about half a minute. `LocalSession` runs the same interpreter on your machine, with no isolation, like `LocalExecutor`. Pass `python=` to use an environment already installed there, such as Biomni's `biomni_e1`.
+
 
 ## Fixing code that fails
 

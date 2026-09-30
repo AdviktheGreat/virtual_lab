@@ -204,6 +204,30 @@ DEFAULT_PIDS_LIMIT = 256
 # is read-only and many libraries expect somewhere to write
 DEFAULT_TMPFS_SIZE = "256m"
 
+# The same ceilings for a session (see virtual_lab.session), which holds a whole meeting's
+# analysis in memory at once rather than running one script: an AnnData object of a single-cell
+# experiment is gigabytes, and numba and BLAS start a thread per core, each counted as a process
+DEFAULT_SESSION_MEMORY_LIMIT = "8g"
+DEFAULT_SESSION_CPU_LIMIT = "4"
+DEFAULT_SESSION_PIDS_LIMIT = 1024
+DEFAULT_SESSION_TMPFS_SIZE = "2g"
+
+# Seconds to wait for a session's interpreter to say it is ready. An image built for x86-64 is
+# emulated on an ARM machine, where the interpreter alone can take several seconds to start.
+SESSION_START_TIMEOUT = 120
+
+# Seconds past its time limit to wait for code to be stopped before stopping the whole session.
+# Code is interrupted at its limit, which takes effect at its next Python instruction; a call
+# into compiled code that does not return is only ended by stopping the session.
+SESSION_GRACE_SECONDS = 10
+
+# Seconds to wait for a session to exit once its input is closed, before it is killed
+SESSION_CLOSE_TIMEOUT = 5
+
+# Largest answer read from a session's interpreter, in bytes. Its output is already bounded,
+# so an answer past this is not one the interpreter wrote, and ends the session.
+MAX_SESSION_RESPONSE_BYTES = 2 * 1024**2
+
 # Most output that is kept from an execution, per stream, in bytes. Untrusted code can print
 # without bound, so output is read as it arrives and only this much of its tail is held; none of
 # it is written to disk, where a program printing in a loop would otherwise fill the host.

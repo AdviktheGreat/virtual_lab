@@ -343,13 +343,19 @@ class DockerExecutor:
     _checked: bool = field(default=False, init=False, repr=False)
 
     def build_command(
-        self, directory: Path, command: Sequence[str], container_name: str
+        self,
+        directory: Path,
+        command: Sequence[str],
+        container_name: str,
+        interactive: bool = False,
     ) -> tuple[str, ...]:
         """Builds the docker command that runs code under every restriction this class applies.
 
         :param directory: The host directory to mount as the working directory.
         :param command: The command to run inside the container.
         :param container_name: The name to give the container, so a timeout can kill it.
+        :param interactive: Whether to keep the container's standard input open, for a
+            session that is sent code as it goes rather than given a command to finish.
         :raises ExecutionError: If the directory's path cannot be passed to --mount intact.
         :return: The full command, as an argument list.
         """
@@ -358,6 +364,7 @@ class DockerExecutor:
         arguments = [
             *self.docker_command,
             "run",
+            *(["--interactive"] if interactive else []),
             "--rm",
             # tini as the first process, so that orphaned children are reaped rather than left
             "--init",
