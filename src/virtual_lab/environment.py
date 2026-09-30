@@ -47,19 +47,23 @@ def sandbox_context() -> Path:
     return Path(str(files("virtual_lab") / "sandbox"))
 
 
-def sandbox_image(target: str = "full") -> str:
+def sandbox_image(target: str = "full", platform: str | None = SANDBOX_PLATFORM) -> str:
     """The tag a stage of the sandbox image is built under.
 
     The package version is part of the tag, so that upgrading to a version whose environment
-    differs builds a new image rather than silently running the old one.
+    differs builds a new image rather than silently running the old one. So is the platform,
+    since Docker keeps one image per tag: a native build under the same tag as an x86-64 one
+    would replace it, and would then be reused for a run that asks for x86-64 and cannot have it.
 
     :param target: "base", "bio", or "full".
+    :param platform: The platform the image is built for, or None for this machine's own.
     :raises ValueError: If the target is not one of those.
     :return: The image tag.
     """
     check_target(target)
+    architecture = "native" if platform is None else platform.replace("/", "-")
 
-    return f"{SANDBOX_IMAGE_NAME}:{target}-{__version__}"
+    return f"{SANDBOX_IMAGE_NAME}:{target}-{__version__}-{architecture}"
 
 
 def check_target(target: str) -> None:
@@ -125,7 +129,7 @@ def build_sandbox_image(
 
     :param target: "base" for Biomni's analysis libraries, "bio" to add its bioinformatics
         tools, or "full" to add R and the command-line tools as well.
-    :param tag: The tag to build under, defaulting to sandbox_image(target).
+    :param tag: The tag to build under, defaulting to sandbox_image(target, platform).
     :param platform: The platform to build for. Biomni's environment is published for x86-64
         Linux only, so the default is "linux/amd64" even on an ARM machine, where Docker
         emulates it; run the image with DockerExecutor(platform=...) set to match. None builds
@@ -138,7 +142,7 @@ def build_sandbox_image(
     :raises ExecutionError: If the build fails.
     :return: The tag of the image, to pass to DockerExecutor.
     """
-    tag = tag or sandbox_image(target)
+    tag = tag or sandbox_image(target, platform)
     command = build_command(target, tag, platform, docker_command, build_args)
     find_docker(docker_command)
 

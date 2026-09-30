@@ -59,7 +59,10 @@ class TestImageDefinition:
 
 class TestTags:
     def test_the_tag_names_the_stage_and_version(self) -> None:
-        assert sandbox_image("bio") == f"virtual-lab-sandbox:bio-{__version__}"
+        assert sandbox_image("bio") == f"virtual-lab-sandbox:bio-{__version__}-linux-amd64"
+
+    def test_a_native_build_has_a_tag_of_its_own(self) -> None:
+        assert sandbox_image("base", platform=None) == f"virtual-lab-sandbox:base-{__version__}-native"
 
     def test_an_unknown_stage_is_refused(self) -> None:
         with pytest.raises(ValueError, match="target must be one of"):
@@ -117,6 +120,13 @@ class TestBuild:
 
         assert tag == sandbox_image("base")
         assert docker.builds == [list(build_command("base", tag))]
+
+    def test_a_native_build_does_not_reuse_the_x86_64_image(self, docker: FakeDocker) -> None:
+        tag = build_sandbox_image("base", platform=None)
+
+        assert tag == sandbox_image("base", platform=None)
+        assert ["docker", "image", "inspect", tag] in docker.commands
+        assert "--platform" not in docker.builds[0]
 
     def test_an_existing_image_is_reused(self, docker: FakeDocker) -> None:
         docker.has_image = True
@@ -295,6 +305,21 @@ class TestDataLakeMount:
 
         with pytest.raises(ExecutionError, match="comma"):
             self.arguments(DockerExecutor(data_lake=lake), tmp_path)
+
+    @pytest.mark.parametrize("where", ["inside", "same", "around"])
+    def test_a_data_lake_overlapping_the_working_directory_is_refused(self, tmp_path: Path, where: str) -> None:
+        work = tmp_path / "work"
+        lake = {"inside": work / "lake", "same": work, "around": tmp_path}[where]
+        lake.mkdir(parents=True, exist_ok=True)
+
+        with pytest.raises(ExecutionError, match="overlaps the directory code runs in"):
+            self.arguments(DockerExecutor(data_lake=lake), tmp_path)
+
+    def test_a_sibling_whose_name_extends_the_work_directory_is_allowed(self, tmp_path: Path) -> None:
+        lake = tmp_path / "work-lake"
+        lake.mkdir()
+
+        assert f"BIOMNI_DATA_LAKE={SANDBOX_DATA_LAKE_DIR}" in self.arguments(DockerExecutor(data_lake=lake), tmp_path)
 
     def test_the_record_says_which_data_lake_was_used(self, tmp_path: Path) -> None:
         assert describe_executor(DockerExecutor(data_lake=tmp_path))["data_lake"] == str(tmp_path)

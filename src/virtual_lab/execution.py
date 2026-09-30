@@ -370,7 +370,7 @@ class DockerExecutor:
             f"/tmp:rw,size={self.tmpfs_size},mode=1777",
             "--mount",
             f"type=bind,source={directory},target={SANDBOX_WORK_DIR}",
-            *self.data_lake_arguments(),
+            *self.data_lake_arguments(directory),
             *(["--platform", self.platform] if self.platform is not None else []),
             "--workdir",
             SANDBOX_WORK_DIR,
@@ -410,8 +410,13 @@ class DockerExecutor:
 
         return tuple([*arguments, self.image, *command])
 
-    def data_lake_arguments(self) -> list[str]:
-        """The mount and variable that give code the data lake, if there is one."""
+    def data_lake_arguments(self, directory: Path) -> list[str]:
+        """The mount and variable that give code the data lake, if there is one.
+
+        :param directory: The host directory mounted as the working directory.
+        :raises ExecutionError: If the data lake is missing, cannot be mounted, or overlaps the
+            working directory.
+        """
         if self.data_lake is None:
             return []
 
@@ -419,6 +424,15 @@ class DockerExecutor:
         if not source.is_dir():
             raise ExecutionError(f"The data lake {source} is not a directory. Fetch it with download_data_lake.")
         check_mountable(source, "Move the data lake under another directory.")
+
+        # Inside the working directory it would be writable through that mount after all, and
+        # around it, everything else in the directory containing it would be visible too
+        work = Path(directory).resolve()
+        if source.is_relative_to(work) or work.is_relative_to(source):
+            raise ExecutionError(
+                f"The data lake {source} overlaps the directory code runs in, {work}. Keep the "
+                "data lake outside the meeting's save directory, and the meeting outside it."
+            )
 
         return [
             "--mount",

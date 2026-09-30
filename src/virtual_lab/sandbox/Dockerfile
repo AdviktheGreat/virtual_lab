@@ -60,7 +60,7 @@ FROM base AS bio
 COPY biomni_env/bio_env.yml ./
 RUN conda env update -n biomni_e1 -f bio_env.yml \
     && conda clean -afy \
-    && rm -rf /root/.cache
+    && rm -rf /tmp/.cache
 
 RUN python3 -c "import scanpy, Bio, rdkit, pysam, gseapy, lifelines" \
     && samtools --version \
@@ -74,32 +74,43 @@ COPY biomni_env/r_packages.yml biomni_env/install_r_packages.R ./
 RUN conda env update -n biomni_e1 -f r_packages.yml \
     && conda clean -afy \
     && Rscript install_r_packages.R \
-    && rm -rf /tmp/Rtmp* /root/.cache
+    && rm -rf /tmp/Rtmp* /tmp/.cache
 
 COPY biomni_env/install_cli_tools.sh biomni_env/cli_tools_config.json ./
 RUN BIOMNI_AUTO_INSTALL=1 BIOMNI_TOOLS_DIR=/opt/biomni_tools SHELL=/bin/bash bash install_cli_tools.sh \
-    && rm -f /root/.bashrc.biomni_backup
+    && rm -rf /tmp/.cache /tmp/.bashrc*
 
 ENV PATH=/opt/biomni_tools/bin:$PATH
 
 # Biomni 0.0.8's additions (new_software_v008.sh), less the lines that need sudo or a shell
 # profile: git-lfs is installed above, and uv's tools go where every user can run them
 COPY biomni_env/new_software_v008.sh ./
+# uv must not fetch an interpreter of its own: it would keep it under HOME, which is /tmp and
+# so hidden by the scratch space at run time, leaving the tools that use it broken
 ENV UV_TOOL_DIR=/opt/uv/tools \
-    UV_TOOL_BIN_DIR=/usr/local/bin
+    UV_TOOL_BIN_DIR=/usr/local/bin \
+    UV_NO_CACHE=1 \
+    UV_PYTHON_DOWNLOADS=never
 RUN pip install --no-cache-dir transformers sentencepiece langchain-google-genai langchain_ollama mcp \
     && pip install --no-cache-dir lazyslide \
     && pip install --no-cache-dir "git+https://github.com/YosefLab/popV.git@refs/pull/100/head" \
     && pip install --no-cache-dir uv pybiomart fair-esm \
     && uv pip install --system --python "$(command -v python3)" transcriptformer \
     && pip install --no-cache-dir "zarr>=2.0,<3.0" \
-    && uv tool install arc-state \
+    && uv tool install --python "$(command -v python3)" arc-state \
     && pip install --no-cache-dir nnunet nibabel nilearn mi-googlesearch-python \
     && pip install --no-cache-dir "git+https://github.com/pylabrobot/pylabrobot.git" \
     && conda install -y -n biomni_e1 -c conda-forge weasyprint \
     && conda clean -afy \
-    && rm -rf /root/.cache
+    && rm -rf /tmp/.cache
 
+# install_cli_tools.sh exits successfully even when a tool fails to install, so each binary it
+# should have put in place is checked for here
 RUN Rscript -e 'library(DESeq2); library(clusterProfiler)' \
+    && jq -r '.tools[].binary_path' cli_tools_config.json | while read -r binary; do \
+        test -x "/opt/biomni_tools/bin/$(basename "$binary")" \
+            || { echo "$binary was not installed" >&2; exit 1; }; \
+    done \
     && plink2 --version \
-    && iqtree2 --version
+    && iqtree2 --version \
+    && state --help > /dev/null
