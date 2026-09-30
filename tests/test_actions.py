@@ -400,7 +400,7 @@ class TestTagsMode:
         fake_client.completions.responses = [
             text_response("<execute>print('one')</execute>"),
             text_response("<execute>print('two')</execute>"),
-            text_response("<execute>print('three')</execute>"),
+            text_response("One last look.\n<execute>print('three')</execute>\n<observation>3</observation>"),
         ]
 
         result = individual(
@@ -411,7 +411,10 @@ class TestTagsMode:
         assert "last code you can run" in sent_messages(fake_client, 2)[-1]["content"]
         assert "last code you can run" not in sent_messages(fake_client, 1)[-1]["content"]
         assert [entry.code for entry in session.history] == ["print('one')", "print('two')"]
-        assert result.summary == "<execute>print('three')</execute>"
+        # Code too late to run is not left in the answer to look as though it ran
+        assert result.summary.startswith("One last look.\n\n(The code this reply went on to write was not run")
+        assert "print('three')" not in result.summary
+        assert "<observation>" not in result.summary
 
     def test_tool_calls_still_work_alongside_tags(
         self, fake_client: FakeClient, team_member: Agent, session: Session, tmp_path: Path
@@ -434,8 +437,33 @@ class TestTagsMode:
 
         assert result.summary == "Both worked."
         assert sent_tools(fake_client, 0) == ["echo"]
+        # Nothing was skipped, so the agent was not told anything was
+        assert not any("was not run" in str(message["content"]) for message in sent_messages(fake_client, 2))
         assert [entry.code for entry in session.history] == ["print('ran')"]
 
+    def test_code_beside_a_tool_call_is_not_run_and_the_agent_is_told(
+        self, fake_client: FakeClient, team_member: Agent, session: Session, tmp_path: Path
+    ) -> None:
+        from virtual_lab.tools import Tool
+
+        echo = Tool(
+            name="echo",
+            description="Echoes.",
+            parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+            function=lambda text: f"echo: {text}",
+        )
+        both = tool_call_response("echo", {"text": "hi"})
+        both.choices[0].message.content = "<execute>print('skipped')</execute>"
+        fake_client.completions.responses = [both, text_response("Understood.")]
+
+        result = individual(team_member, tmp_path, session=session, code_actions="tags", tools=(echo,))
+
+        assert session.history == []
+        assert "was not run, because the reply also called a tool" in sent_messages(fake_client, 1)[-1]["content"]
+        record = saved_record(tmp_path)
+        assert len(record["turns"]) == len(result.discussion)
+
+    @pytest.mark.parametrize("failure", [SessionError("This session was closed."), OSError("docker vanished")])
     def test_session_error_is_told_to_the_agent(
         self,
         fake_client: FakeClient,
@@ -443,9 +471,10 @@ class TestTagsMode:
         session: Session,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        failure: Exception,
     ) -> None:
         def refuse(*args, **kwargs):  # type: ignore[no-untyped-def]
-            raise SessionError("This session was closed.")
+            raise failure
 
         fake_client.completions.responses = [
             text_response("<execute>print(1)</execute>"),
@@ -456,7 +485,7 @@ class TestTagsMode:
         result = individual(team_member, tmp_path, session=session, code_actions="tags")
 
         assert result.summary == "Could not run it."
-        assert "could not be run: This session was closed." in sent_messages(fake_client, 1)[-1]["content"]
+        assert f"could not be run: {failure}" in sent_messages(fake_client, 1)[-1]["content"]
 
     def test_team_members_share_the_session(
         self,
@@ -510,3 +539,36 @@ class TestTagsMode:
         log = json.loads((partial / record["session"]["log"]).read_text())
         assert log["cells"][0]["output"] == "before the failure\n"
         assert not (tmp_path / SESSION_LOG_DIR_NAME).exists()
+
+    @pytest.mark.parametrize("fails", [False, True])
+    def test_log_that_cannot_be_saved_keeps_the_transcript(
+        self,
+        fake_client: FakeClient,
+        team_member: Agent,
+        session: Session,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fails: bool,
+    ) -> None:
+        from importlib import import_module
+
+        run_meeting_module = import_module("virtual_lab.run_meeting")
+
+        def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise OSError("disk full")
+
+        monkeypatch.setattr(run_meeting_module, "save_session_log", broken)
+        fake_client.completions.responses = [text_response("<execute>print(1)</execute>")]
+        fake_client.completions.responses.append(RuntimeError("the API went away") if fails else text_response("Done."))
+
+        if fails:
+            # The error that ended the meeting is the one raised, not the log's
+            with pytest.raises(RuntimeError, match="went away"):
+                individual(team_member, tmp_path, session=session, code_actions="tags", max_retries=0)
+            saved = tmp_path / PARTIAL_MEETING_DIR_NAME
+        else:
+            individual(team_member, tmp_path, session=session, code_actions="tags")
+            saved = tmp_path
+
+        assert (saved / "discussion.json").exists()
+        assert json.loads((saved / METADATA_DIR_NAME / "discussion.json").read_text())["session"] is None

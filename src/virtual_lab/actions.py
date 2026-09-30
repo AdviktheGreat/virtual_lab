@@ -78,6 +78,25 @@ def find_code_action(content: str) -> CodeAction | None:
     return CodeAction(said=said, language=language, code=code)
 
 
+def without_code_action(content: str) -> str:
+    """Removes code that will not be run from a reply that is to stand as an agent's answer.
+
+    Left in, the code reads as though it ran, and a model often follows it with the output it
+    expected, which the rest of the meeting would take as a result.
+
+    :param content: The reply.
+    :return: The reply up to its first block, with a note that the code was not run.
+    """
+    start = content.find(EXECUTE_OPEN)
+    if start == -1:
+        return content
+
+    note = "(The code this reply went on to write was not run: the turn's limit on code runs was reached.)"
+    said = content[:start].rstrip()
+
+    return f"{said}\n\n{note}" if said else note
+
+
 def observation(result: CellResult, runs_left: int) -> str:
     """What an agent is told after its code ran, in the form Biomni's agent is told it.
 

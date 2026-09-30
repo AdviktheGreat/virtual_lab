@@ -16,7 +16,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import BaseModel
 from tqdm import trange, tqdm
 
-from virtual_lab.actions import describe_tool_output, find_code_action, observation
+from virtual_lab.actions import describe_tool_output, find_code_action, observation, without_code_action
 from virtual_lab.agent import Agent
 from virtual_lab.llm import ModelReply, ModelSource, ask, resolve_chat_models
 from virtual_lab.completions import check_temperature, ran_without_temperature, send_request
@@ -44,7 +44,7 @@ from virtual_lab.prompts import (
 )
 from virtual_lab.provenance import MeetingRecord, describe_agent, save_record
 from virtual_lab.records import truncate_text
-from virtual_lab.session import CODE_TOOL_NAME, Session, SessionError, session_tool
+from virtual_lab.session import CODE_TOOL_NAME, Session, session_tool
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
@@ -371,16 +371,24 @@ def hold_meeting(
         )
 
     def save_session(directory: Path) -> None:
-        """Saves the code the meeting ran, and notes in the record where it went."""
+        """Saves the code the meeting ran, and notes in the record where it went.
+
+        A log that cannot be saved is warned about rather than raised, so that it neither costs
+        the meeting its transcript nor hides the error that ended a failed one.
+        """
         if session is None:
             return
 
-        record.session = {
-            **session.describe(),
-            "code_actions": code_actions,
-            "cells_run": len(session.history) - first_cell,
-            "log": save_session_log(directory, save_name, session, first_cell).relative_to(directory).as_posix(),
-        }
+        try:
+            log = save_session_log(directory, save_name, session, first_cell)
+            record.session = {
+                **session.describe(),
+                "code_actions": code_actions,
+                "cells_run": len(session.history) - first_cell,
+                "log": log.relative_to(directory).as_posix(),
+            }
+        except Exception as error:
+            print(f"Warning: the log of the code this meeting ran could not be saved: {error}")
 
     # The last thing an agent said, kept apart from the transcript because a structured output
     # follows it there
@@ -539,7 +547,7 @@ def hold_meeting(
                                 session.run(action.code, language=action.language),
                                 runs_left=max_tool_iterations - tool_iteration - 1,
                             )
-                        except SessionError as error:
+                        except Exception as error:
                             report = f"<observation>\nThe code could not be run: {error}\n</observation>"
 
                         # Kept in the meeting as the agent said it, so that everyone after sees
@@ -581,6 +589,18 @@ def hold_meeting(
                         discussion.append({"agent": "Tool", "message": tool_output_content})
                         record.record_turn(speaker="Tool", kind="tool_output")
 
+                        # Code written beside a tool call is not run, and the agent must know
+                        # that, or it will take the call's output for the code's
+                        if code_actions == "tags" and find_code_action(reply.content or "") is not None:
+                            skipped = (
+                                "<observation>\nThe code in that reply was not run, because the "
+                                "reply also called a tool. Write it again, on its own, to run it."
+                                "\n</observation>"
+                            )
+                            messages.append({"role": "user", "content": skipped})
+                            discussion.append({"agent": "Session", "message": skipped})
+                            record.record_turn(speaker="Session", kind="code_output")
+
                     # Send the results back on the next iteration
                     agent_messages = [agent.message] + messages
 
@@ -589,6 +609,10 @@ def hold_meeting(
 
                 # Extract the response content
                 response_content = reply.content
+
+                # Only the forced final attempt can end a turn on code, which it was too late to run
+                if code_actions == "tags":
+                    response_content = without_code_action(response_content)
 
                 # A reasoning model can spend its whole allowance thinking and write nothing, and
                 # an empty turn read as the agent's answer would be summarised as agreement
@@ -687,8 +711,8 @@ def hold_meeting(
 
         if discussion:
             partial_dir = save_dir / PARTIAL_MEETING_DIR_NAME
-            save_session(partial_dir)
             save_meeting(save_dir=partial_dir, save_name=save_name, discussion=discussion)
+            save_session(partial_dir)
             save_record(save_dir=partial_dir, save_name=save_name, record=record)
             print(f"Meeting failed. Partial discussion saved to {partial_dir / f'{save_name}.json'}")
         print("Usage before the failure:")
@@ -702,12 +726,12 @@ def hold_meeting(
     usage.print_summary(elapsed_time=time.time() - start_time)
 
     # Save the discussion as JSON and Markdown, plus the record of what produced it
-    save_session(save_dir)
     save_meeting(
         save_dir=save_dir,
         save_name=save_name,
         discussion=discussion,
     )
+    save_session(save_dir)
     record_path = save_record(save_dir=save_dir, save_name=save_name, record=record)
     output_path = (
         save_output(save_dir=save_dir, save_name=save_name, output=structured_output)
