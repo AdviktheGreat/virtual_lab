@@ -205,7 +205,7 @@ class TestClient:
             max_retries=7,
         )
 
-        assert fake_client.init_kwargs == {"model": team_member.model, "max_retries": 7}
+        assert fake_client.init_kwargs == {"model": team_member.model, "source": "OpenAI", "max_retries": 7}
         assert outcome.succeeded
         assert len(fake_client.completions.parse_calls) == 1
 

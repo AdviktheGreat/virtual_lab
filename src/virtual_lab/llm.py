@@ -22,6 +22,7 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
+from uuid import uuid4
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -243,9 +244,30 @@ def resolve_chat_models(
         elif client is not None:
             resolved[model] = openai_chat_model(model, client, max_retries=max_retries)
         else:
-            resolved[model] = get_llm(model, max_retries=max_retries)
+            resolved[model] = get_llm(model, source=meeting_source(model), max_retries=max_retries)
 
     return resolved
+
+
+def meeting_source(model: str) -> SourceType:
+    """The provider for a model a meeting builds itself, keeping what worked before providers.
+
+    Meetings sent every model to OpenAI's client, which reads OPENAI_BASE_URL, before they
+    could reach any other provider. Biomni's rules would refuse a name they do not recognise,
+    such as chatgpt-4o-latest, and send names that look like open models, such as
+    meta-llama/Llama-3-70b, to a local Ollama server. A name the rules cannot place still goes
+    to OpenAI, and while OPENAI_BASE_URL points at a server of your own, so do names that look
+    like open models. LLM_SOURCE overrides both.
+    """
+    try:
+        source = detect_source(model)
+    except ValueError:
+        return "OpenAI"
+
+    if source == "Ollama" and os.getenv("OPENAI_BASE_URL") and os.getenv("LLM_SOURCE") not in ALLOWED_SOURCES:
+        return "OpenAI"
+
+    return source
 
 
 @dataclass(frozen=True)
@@ -379,21 +401,38 @@ def reads_speaker_names(llm: BaseChatModel) -> bool:
     return False
 
 
-def tool_call_from_dict(call: dict[str, Any]) -> dict[str, Any]:
-    """A tool call in a meeting's saved format, as LangChain wants it."""
-    function = call.get("function") or {}
-    try:
-        arguments = json.loads(function.get("arguments") or "{}")
-    except json.JSONDecodeError:
-        arguments = {}
+def tool_call_from_dict(call: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """A tool call in a meeting's saved format, as LangChain wants it.
 
-    return {"id": call.get("id"), "name": function.get("name", ""), "args": arguments if isinstance(arguments, dict) else {}}
+    :return: The call, and whether its arguments were valid. A call whose arguments were not a
+        JSON object keeps them as the model wrote them, so that it is shown what it actually sent
+        alongside the error that came back.
+    """
+    function = call.get("function") or {}
+    raw = function.get("arguments") or "{}"
+    try:
+        arguments = json.loads(raw)
+    except json.JSONDecodeError:
+        arguments = None
+
+    if isinstance(arguments, dict):
+        return {"id": call.get("id"), "name": function.get("name", ""), "args": arguments}, True
+
+    return {"id": call.get("id"), "name": function.get("name", ""), "args": raw, "error": None}, False
+
+
+def describe_call(call: dict[str, Any]) -> str:
+    """A tool call's arguments as text, however they were written."""
+    arguments = call["args"]
+
+    return arguments if isinstance(arguments, str) else json.dumps(arguments)
 
 
 def to_langchain_messages(
     messages: list[ChatCompletionMessageParam],
     reader: str | None = None,
     speaker_names: bool = True,
+    tool_blocks: bool = True,
 ) -> list[BaseMessage]:
     """Turns a meeting's messages into what a LangChain model takes.
 
@@ -406,9 +445,14 @@ def to_langchain_messages(
     :param messages: The messages, in OpenAI's format.
     :param reader: The name of the agent the messages are for.
     :param speaker_names: Whether the model reads the name field.
+    :param tool_blocks: Whether the reader's own tool calls can be sent as tool calls. Anthropic
+        refuses a request that holds tool calls but offers no tools, which is what the last,
+        forced attempt of a turn is, so for that request they are written out as text too.
     :return: The messages as LangChain messages.
     """
     converted: list[BaseMessage] = []
+    # Each is removed once its result is read, so that a provider reusing an id in a later
+    # response cannot have that result attributed to the earlier call
     others_calls: dict[str, tuple[str, str]] = {}
 
     for message in messages:
@@ -425,26 +469,33 @@ def to_langchain_messages(
         elif role == "tool":
             call_id = str(message.get("tool_call_id"))
             if call_id in others_calls:
-                speaker, tool = others_calls[call_id]
-                converted.append(HumanMessage(content=f"[What {tool} returned to {speaker}]\n{content}"))
+                speaker, tool = others_calls.pop(call_id)
+                recipient = "you" if speaker == "" else speaker
+                converted.append(HumanMessage(content=f"[What {tool} returned to {recipient}]\n{content}"))
             else:
                 converted.append(ToolMessage(content=content, tool_call_id=call_id))
         elif role == "assistant":
-            tool_calls = [tool_call_from_dict(call) for call in message.get("tool_calls") or []]
+            calls = [tool_call_from_dict(call) for call in message.get("tool_calls") or []]
             is_other = not speaker_names and name is not None and reader is not None and name != reader
 
-            if is_other:
-                lines = [f"{name}: {content}"] if content else []
-                for call in tool_calls:
-                    others_calls[str(call["id"])] = (str(name), call["name"])
-                    lines.append(f"[{name} called {call['name']} with {json.dumps(call['args'])}]")
-                converted.append(HumanMessage(content="\n".join(lines) or f"{name}: (no answer)"))
+            if is_other or (calls and not tool_blocks):
+                # The empty speaker marks the reader's own calls, written out for a request
+                # that offers no tools
+                speaker = str(name) if is_other else ""
+                caller = str(name) if is_other else "You"
+                lines = [f"{name}: {content}" if is_other else content] if content else []
+                for call, _ in calls:
+                    others_calls[str(call["id"])] = (speaker, call["name"])
+                    lines.append(f"[{caller} called {call['name']} with {describe_call(call)}]")
+                text = "\n".join(lines) or f"{name}: (no answer)"
+                converted.append(HumanMessage(content=text) if is_other else AIMessage(content=text))
             else:
                 converted.append(
                     AIMessage(
                         content=content,
                         name=name if speaker_names else None,
-                        tool_calls=tool_calls,
+                        tool_calls=[call for call, valid in calls if valid],
+                        invalid_tool_calls=[call for call, valid in calls if not valid],
                     )
                 )
         else:
@@ -484,18 +535,20 @@ def text_of(message: AIMessage) -> str:
 
 def reply_from(message: AIMessage) -> ModelReply:
     """Normalises a LangChain response into a ModelReply."""
+    # A provider that leaves out ids gets fresh ones, unique across the meeting, since a result
+    # is matched to its call by id alone
     calls = [
-        ToolCall(id=str(call.get("id") or f"call_{index}"), function=FunctionCall(call["name"], json.dumps(call.get("args") or {})))
-        for index, call in enumerate(message.tool_calls)
+        ToolCall(id=str(call.get("id") or f"call_{uuid4().hex}"), function=FunctionCall(call["name"], json.dumps(call.get("args") or {})))
+        for call in message.tool_calls
     ]
     # A call whose arguments were not valid JSON is still passed on, so that the tool's error
     # reaches the model and it can correct the call
     calls += [
         ToolCall(
-            id=str(call.get("id") or f"invalid_{index}"),
+            id=str(call.get("id") or f"call_{uuid4().hex}"),
             function=FunctionCall(str(call.get("name") or ""), str(call.get("args") or "")),
         )
-        for index, call in enumerate(message.invalid_tool_calls)
+        for call in message.invalid_tool_calls
     ]
 
     return ModelReply(
@@ -528,7 +581,11 @@ def ask(
     """
     model = configure(llm, temperature, max_tokens)
     runnable = model.bind_tools(tools) if tools else model
-    message = runnable.invoke(to_langchain_messages(messages, reader, reads_speaker_names(llm)))
+    speaker_names = reads_speaker_names(llm)
+    # OpenAI accepts earlier tool calls in a request that offers no tools; others may not
+    message = runnable.invoke(
+        to_langchain_messages(messages, reader, speaker_names, tool_blocks=bool(tools) or speaker_names)
+    )
 
     if not isinstance(message, AIMessage):
         raise TypeError(f"Expected an AIMessage from the model, got {type(message).__name__}")

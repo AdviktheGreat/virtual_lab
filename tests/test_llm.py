@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from conftest import FakeClient, fake_llm
 from virtual_lab.agent import Agent
 from virtual_lab.completions import MODELS_WITHOUT_TEMPERATURE, rejects_temperature
-from virtual_lab.constants import DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_RETRIES
+from virtual_lab.constants import DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_MAX_RETRIES, MAX_TOOL_ITERATIONS
 from virtual_lab.llm import (
     FINISH_REASONS,
     GEMINI_BASE_URL,
@@ -23,6 +23,7 @@ from virtual_lab.llm import (
     detect_source,
     finish_reason_of,
     get_llm,
+    meeting_source,
     reads_speaker_names,
     reply_from,
     resolve_chat_models,
@@ -31,6 +32,7 @@ from virtual_lab.llm import (
 )
 from virtual_lab.run_meeting import describe_chat_model, hold_meeting
 from virtual_lab.structured import StructuredOutputError, request_structured_output
+from virtual_lab.tools import Tool
 from virtual_lab.utils import compute_token_cost
 
 CLAUDE = "claude-sonnet-4-5"
@@ -226,6 +228,31 @@ class TestGetLlm:
             get_llm(CLAUDE)
 
 
+class TestMeetingSource:
+    def test_a_name_the_rules_cannot_place_goes_to_openai(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LLM_SOURCE", raising=False)
+        assert meeting_source("chatgpt-4o-latest") == "OpenAI"
+
+    def test_open_model_names_go_to_a_configured_openai_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LLM_SOURCE", raising=False)
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+
+        assert meeting_source("meta-llama/Llama-3-70b") == "OpenAI"
+        assert meeting_source(CLAUDE) == "Anthropic"
+
+    def test_open_model_names_go_to_ollama_otherwise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("LLM_SOURCE", raising=False)
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+        assert meeting_source("meta-llama/Llama-3-70b") == "Ollama"
+
+    def test_the_environment_still_decides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+        monkeypatch.setenv("LLM_SOURCE", "Ollama")
+
+        assert meeting_source("meta-llama/Llama-3-70b") == "Ollama"
+
+
 class TestResolveChatModels:
     def test_one_model_answers_for_everyone(self) -> None:
         shared = ScriptedChatModel()
@@ -303,12 +330,54 @@ class TestMessages:
         assert converted[3].tool_call_id == "call_1"
         assert converted[6].content == "Scientific_Critic: Earlier I said no."
 
-    def test_unreadable_arguments_become_no_arguments(self) -> None:
+    def test_unreadable_arguments_are_sent_back_as_written(self) -> None:
         messages = [{"role": "assistant", "content": "", "tool_calls": [
             {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{not json"}}
         ]}]
 
-        assert to_langchain_messages(messages)[0].tool_calls[0]["args"] == {}
+        converted = to_langchain_messages(messages)[0]
+
+        assert converted.tool_calls == []
+        assert converted.invalid_tool_calls[0]["args"] == "{not json"
+
+    def test_unreadable_arguments_reach_openai_as_written(self) -> None:
+        client = FakeClient()
+        messages = [
+            {"role": "user", "content": "Go."},
+            {"role": "assistant", "name": "A", "content": None, "tool_calls": [
+                {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{not json"}}
+            ]},
+            {"role": "tool", "tool_call_id": "c", "content": "Invalid JSON"},
+        ]
+
+        ask(fake_llm(client), messages, temperature=None)
+
+        sent = client.completions.calls[0]["messages"][1]["tool_calls"][0]["function"]
+        assert sent == {"name": "f", "arguments": "{not json"}
+
+    def test_a_reused_id_is_matched_to_the_latest_call(self) -> None:
+        call = {"id": "call_0", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+        messages = [
+            {"role": "assistant", "name": "A", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_0", "content": "resA"},
+            {"role": "assistant", "name": "B", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_0", "content": "resB"},
+        ]
+
+        converted = to_langchain_messages(messages, reader="B", speaker_names=False)
+
+        assert converted[1].content == "[What search returned to A]\nresA"
+        assert isinstance(converted[3], ToolMessage)
+        assert converted[3].content == "resB"
+
+    def test_own_tool_calls_become_text_when_no_tools_can_be_offered(self) -> None:
+        converted = to_langchain_messages(self.MEETING, reader="Immunologist", speaker_names=False, tool_blocks=False)
+
+        assert not any(isinstance(message, ToolMessage) for message in converted)
+        assert not any(getattr(message, "tool_calls", None) for message in converted)
+        assert converted[2].content == '[You called pubmed_search with {"query": "VHH"}]'
+        assert isinstance(converted[2], AIMessage)
+        assert converted[3].content == "[What pubmed_search returned to you]\nThree papers."
 
     def test_an_unknown_role_is_refused(self) -> None:
         with pytest.raises(ValueError, match="Unknown message role"):
@@ -369,6 +438,14 @@ class TestReplies:
         call = reply_from(message).tool_calls[0]
 
         assert (call.id, call.function.name, call.function.arguments) == ("bad", "f", "{oops")
+
+    def test_calls_without_ids_get_ids_unique_across_replies(self) -> None:
+        message = AIMessage(content="", tool_calls=[{"id": None, "name": "f", "args": {}}])
+
+        first, second = reply_from(message).tool_calls[0].id, reply_from(message).tool_calls[0].id
+
+        assert first != second
+        assert first.startswith("call_")
 
     def test_tool_calls_are_shaped_as_openais(self) -> None:
         message = AIMessage(content="", tool_calls=[{"id": "c1", "name": "f", "args": {"x": 1}}])
@@ -465,6 +542,29 @@ class TestMeetingsWithOtherProviders:
         critic_meeting(tmp_path, llm, max_completion_tokens=77)
 
         assert {setting["max_tokens"] for setting in llm.settings} == {77}
+
+    def test_the_forced_last_attempt_carries_no_tool_calls(self, tmp_path) -> None:
+        tool = Tool(
+            name="search",
+            description="Search.",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            function=lambda query: f"results for {query}",
+        )
+        searching = [
+            answer("", reason="tool_use", tool_calls=[{"id": f"s{index}", "name": "search", "args": {"query": "x"}}])
+            for index in range(MAX_TOOL_ITERATIONS)
+        ]
+        llm = ScriptedChatModel(replies=[*searching, answer("Done.")])
+
+        critic_meeting(tmp_path, llm, tools=(tool,))
+
+        # Anthropic refuses a request that holds tool calls but offers no tools
+        last = llm.received[MAX_TOOL_ITERATIONS]
+        assert "tools" not in llm.settings[MAX_TOOL_ITERATIONS]
+        assert not any(isinstance(message, ToolMessage) or getattr(message, "tool_calls", None) for message in last)
+        assert any("[What search returned to you]" in str(message.content) for message in last)
+        # Earlier attempts, which offer the tool, keep the calls as calls
+        assert any(isinstance(message, ToolMessage) for message in llm.received[MAX_TOOL_ITERATIONS - 1])
 
     def test_structured_output_works_by_tool_calling(self, tmp_path) -> None:
         decided = answer(tool_calls=[{"id": "d", "name": "Decision", "args": {"choice": "VHH", "confidence": 0.8}}], content="")

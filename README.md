@@ -65,7 +65,7 @@ The Virtual Lab uses GPT-5.2 from OpenAI by default, and any agent can use a mod
 | Ollama (local) | `llama*`, `qwen*`, `mistral*`, `gpt-oss*`, and names with a `/` | `pip install virtual-lab[ollama]` |
 | Amazon Bedrock | `anthropic.claude-*`, `us.*`, and other Bedrock IDs | `AWS_REGION`, `pip install virtual-lab[bedrock]` |
 
-Set `LLM_SOURCE` to one of those providers to override the rules for every model. For anything else, including a self-hosted server with an OpenAI-compatible API, build the model yourself and pass it in:
+Set `LLM_SOURCE` to one of those providers to override the rules for every model. A meeting sends a name the rules do not recognise, such as `chatgpt-4o-latest`, to OpenAI as it always has, and while `OPENAI_BASE_URL` points at a server of your own it sends names that look like open models there rather than to Ollama. For anything else, including a self-hosted server with an OpenAI-compatible API, build the model yourself and pass it in:
 
 ```python
 from virtual_lab import get_llm, hold_meeting
