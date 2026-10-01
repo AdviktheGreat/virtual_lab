@@ -542,6 +542,10 @@ class TestBiomniEval1Interface:
         assert list(eval1.df.columns) == list(EVAL1_ROWS[0])
         assert list(eval1.get_instances_by_task("crispr_delivery").task_instance_id) == [0, 1]
         assert len(eval1.get_instances_by_task("patient_gene_detection", split="val")) == 0
+        # Indexed by row in the whole dataset, as Biomni's is, so .loc finds the same row in df
+        variants = eval1.get_instances_by_task("gwas_variant_prioritization", split="val")
+        assert list(variants.index) == [3]
+        assert eval1.df.loc[3, "answer"] == variants.loc[3, "answer"] == "rs4253311"
 
 
 class TestAnswerText:

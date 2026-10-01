@@ -723,11 +723,14 @@ class BiomniEval1:
         return results
 
     def get_instances_by_task(self, task_name: str, split: str | None = None) -> Any:
-        """A task's questions, in one split if given, as a pandas DataFrame."""
-        pandas = optional_module("pandas")
-        rows = [row for row in self.rows if row["task_name"] == task_name and (not split or row["split"] == split)]
+        """A task's questions, in one split if given, as a pandas DataFrame indexed, as Biomni's
+        is, by each question's row in the whole dataset."""
+        frame = self.df
+        frame = frame[frame["task_name"] == task_name]
+        if split:
+            frame = frame[frame["split"] == split]
 
-        return pandas.DataFrame(rows, columns=list(self.rows[0]) if self.rows else None)
+        return frame.copy()
 
     def __repr__(self) -> str:
         return f"BiomniEval1(instances={len(self.rows)}, tasks={len(self.list_tasks())})"
