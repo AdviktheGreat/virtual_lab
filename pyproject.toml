@@ -53,6 +53,9 @@ keywords = [
 # Local models through Ollama, and models on Amazon Bedrock
 ollama = ["langchain-ollama>=1.0"]
 bedrock = ["langchain-aws>=1.0"]
+# Biomni's benchmarks: pyarrow reads their files, numpy shuffles LAB-Bench's options as Biomni
+# does, and pandas gives Biomni's BiomniEval1 its DataFrames
+eval = ["numpy", "pandas", "pyarrow"]
 nanobody-design = [
     "biopython",
     "pandas",

@@ -187,6 +187,37 @@ BIOMNI_RELEASE_URL = "https://biomni-release.s3.amazonaws.com"
 # How much of a data lake file is read at a time. The largest are several gigabytes.
 DATA_LAKE_CHUNK_BYTES = 1024**2
 
+# Biomni-Eval1, at the revision of its dataset that Biomni's BiomniEval1 reads. Pinned, so that
+# a score can be compared with another made on the same questions.
+BIOMNI_EVAL1_URL = (
+    "https://huggingface.co/datasets/biomni/Eval1/resolve/"
+    "51f97feb9e377fac7384faae49046bc067283c38/biomni_eval1_dataset.parquet"
+)
+BIOMNI_EVAL1_FILE = "eval1/biomni_eval1_dataset.parquet"
+
+# Biomni's archive of the files its LAB-Bench and Humanity's Last Exam tasks read, unpacked as
+# Biomni unpacks it into its benchmark directory
+BIOMNI_BENCHMARK_ARCHIVE = "benchmark.zip"
+BIOMNI_BENCHMARK_ARCHIVE_SHA256 = "27f4d9021dca7472efc225f6442f9a1dc595062a4851e4f708ba94d637ace6ff"
+
+# Every benchmark file, by its path under the benchmark directory, with what it must hash to.
+# Biomni's archive is not versioned, so a changed file is refused rather than scored as if it
+# were the same benchmark.
+BENCHMARK_FILES = {
+    BIOMNI_EVAL1_FILE: "cb8443b059cfc81d3d94bab35473bb271b4e7e1935473f2b61b5fae58a2db861",
+    "DbQA/train-00000-of-00001.parquet": "d984bf7690ec690bd9859b77706c9304cf70e45f5a8851b449d0e18c15c0bb4f",
+    "DbQA/train-00000-of-00001_sampled.parquet": "c5910bbda84b2e2ab3e75828199895549ddaddcf5d2e45fded16cd838c74ce1d",
+    "DbQA/train-00000-of-00001_test.parquet": "c373221f9803f45cf3de59d6435c20bfac12c8ff2c327aa94c4edf31c837f5a2",
+    "SeqQA/train-00000-of-00001.parquet": "09c7b26ea1a4366dc6ce9e05a09e505d41e7073780a7c782a1018689d733c3f8",
+    "SeqQA/train-00000-of-00001_sampled.parquet": "39f2b2ad880949ac75b69212c12afa7fb79c50a16115c1f630b7223ae919adf3",
+    "SeqQA/train-00000-of-00001_test.parquet": "a21197ffe4f35fa878ed4e82971debfd19c6b4c91e1bc30f44c3006ffbd76ce8",
+    "hle/test_sampled_biology_medicine.parquet": "9382aeba3e9aca2587020eec6369a9641f6f6c60d311ad4de2f202be365fe8ae",
+}
+
+# Reading an answer out of a transcript has one right result, so the model reading it is not
+# asked to vary
+EXTRACTION_TEMPERATURE = 0.0
+
 # Where the data lake is mounted in the sandbox, read-only. The same path Biomni's tools read
 # it from, relative to their data directory.
 SANDBOX_DATA_LAKE_DIR = "/biomni_data/data_lake"
