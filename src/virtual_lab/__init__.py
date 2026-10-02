@@ -82,6 +82,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.memory import Finding, Findings, LabMemory, MemoryEntry
 from virtual_lab.planning import NextStep, PlanTask, ProjectReport, ProjectRound, ResearchPlan, Review, run_project
 from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError, ProjectStep
 from virtual_lab.records import DatabaseError, RecordNotFoundError
@@ -212,13 +213,17 @@ __all__ = [
     "EvaluationReport",
     "ExecutionError",
     "ExecutionResult",
+    "Finding",
+    "Findings",
     "HumanitysLastExam",
     "ImplementationPlan",
     "KnowHow",
     "LabBench",
+    "LabMemory",
     "LocalExecutor",
     "LocalSession",
     "MeetingResult",
+    "MemoryEntry",
     "NextStep",
     "PDB_LOOKUP_TOOL",
     "PUBCHEM_LOOKUP_TOOL",

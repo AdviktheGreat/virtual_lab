@@ -13,19 +13,24 @@ run that stopped is carried on by running it again on the same directory: the st
 read back for nothing, and it goes on from the round it stopped in. Nothing a step is asked
 depends on the budget or the limits on rounds, so raising them to carry on changes none of the
 steps already taken.
+
+What the work finds is kept in a LabMemory, as findings, and each step is given the findings it
+needs rather than the summary of every step before it: those the principal investigator names
+when it decides the step, by default, or those that best match the step's agenda.
 """
 
 import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field
 
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts
-from virtual_lab.constants import REPORT_FILE_NAME, REPORT_MARKDOWN_FILE_NAME, RESEARCH_LOG_FILE_NAME
+from virtual_lab.constants import MEMORY_FILE_NAME, REPORT_FILE_NAME, REPORT_MARKDOWN_FILE_NAME, RESEARCH_LOG_FILE_NAME
 from virtual_lab.execution import Executor
+from virtual_lab.memory import Findings, LabMemory, MemoryEntry
 from virtual_lab.project import REPAIR_OPTIONS, Project, ProjectBudgetExceededError
 from virtual_lab.prompts import CODING_RULES, PRINCIPAL_INVESTIGATOR, SCIENTIFIC_CRITIC
 from virtual_lab.provenance import describe_agent
@@ -35,6 +40,8 @@ from virtual_lab.utils import write_atomically
 Action = Literal["team_meeting", "individual_meeting", "write_code", "change_team", "finish"]
 
 Status = Literal["finished", "out_of_budget", "out_of_rounds", "stalled", "stopped"]
+
+Memory = Literal["pick", "bm25", "summaries"]
 
 # Code is run by the project as it is, with no one there to give it anything
 PROJECT_CODING_RULES = tuple(
@@ -94,6 +101,11 @@ class NextStep(BaseModel):
     agenda_questions: list[str] = Field(
         description="For a meeting or write_code, specific questions the work must answer. May be empty."
     )
+    findings: list[str] = Field(
+        description="The ids of the listed findings the step needs in full: for a meeting or write_code, those it "
+        "builds on, and for finish, those the answer rests on. Empty if none are listed, or if the agenda says "
+        "findings are chosen another way."
+    )
     add_members: list[AgentSpec] = Field(description="For change_team, the scientists to bring onto the team.")
     remove_members: list[str] = Field(description="For change_team, the exact titles of the members to let go.")
     answer: str = Field(
@@ -131,6 +143,8 @@ class ProjectRound:
     :param steps: The project's steps the round took, by name.
     :param team: The team's titles after the round, the principal investigator and critic aside.
     :param tasks_done: How many of the plan's tasks were done after the round.
+    :param findings: The findings the round's step was given, by id.
+    :param found: The findings the round's step made, by id.
     """
 
     number: int
@@ -141,6 +155,8 @@ class ProjectRound:
     steps: list[str] = field(default_factory=list)
     team: list[str] = field(default_factory=list)
     tasks_done: int = 0
+    findings: list[str] = field(default_factory=list)
+    found: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -160,6 +176,7 @@ class ProjectReport:
     :param team: The team at the end, as describe_agent gives each member.
     :param team_changes: Every change to the team: the round, who was added and removed, and why.
     :param plan: The plan at the end, as PlanTask.model_dump gives each task.
+    :param findings: Every finding the project made, as its LabMemory keeps them.
     :param rounds: Every round.
     :param spent: What the project has spent in USD, over every run of it, or None if unknown.
     :param max_cost: The project's limit, if it has one.
@@ -176,6 +193,7 @@ class ProjectReport:
     team: list[dict[str, str]]
     team_changes: list[dict[str, Any]]
     plan: list[dict[str, str]]
+    findings: list[dict[str, Any]]
     rounds: list[ProjectRound]
     spent: float | None
     max_cost: float | None
@@ -206,6 +224,9 @@ class ProjectReport:
 
         marks = {"done": "[x]", "dropped": "[-]", "in progress": "[~]", "to do": "[ ]"}
         lines += ["## Plan", "", *(f"- {marks[task['status']]} {task['task']}" for task in self.plan), ""]
+
+        if self.findings:
+            lines += ["## Findings", "", *(f"- [{finding['id']}] {' '.join(finding['claim'].split())}" for finding in self.findings), ""]
 
         lines += ["## Rounds", "", "| Round | Decision | Outcome |", "| --- | --- | --- |"]
         for round_ in self.rounds:
@@ -242,6 +263,8 @@ def run_project(
     executor: Executor | None = None,
     approve: Callable[[int, NextStep], NextStep | None] | None = None,
     repair_options: dict[str, Any] | None = None,
+    memory: Memory = "pick",
+    findings_per_step: int = 8,
 ) -> ProjectReport:
     """Runs a project to its goal, with its team lead deciding each step, and reports how it ended.
 
@@ -258,7 +281,19 @@ def run_project(
       ends only if the critic agrees the answer meets the goal; otherwise the critic's objections
       are what the next round has to go on.
 
-    Every meeting is told the goal and the plan, and given the summaries of the work done so far.
+    Every meeting is told the goal, the team, and the plan. What the work finds is kept as
+    findings: each meeting restates what it established as Findings, in one more request, and
+    the author of code that was run says what the run established, in a short meeting of its
+    own. What else a step is given depends on memory:
+
+    - "pick": the team lead is shown every finding by its id and claim, with what each step
+      found, and names in each decision the findings the step needs, which it is given in full.
+      This is how Biomni's agent chooses the resources a task needs, and costs no more requests.
+    - "bm25": each step is given the findings that best match its agenda and questions, or a
+      proposed answer, by BM25, at most findings_per_step of them.
+    - "summaries": no findings are kept, and each step is given the summary of every step before
+      it, as the Virtual Lab's meetings are. Context grows with every step.
+
     A decision that cannot be carried out, such as one naming someone not on the team, is
     recorded, and the team lead is told why in the next round. The research log,
     research_log.json, is saved after every round, and the report, report.json and report.md, at
@@ -288,8 +323,12 @@ def run_project(
         log and is not asked about again when the project is carried on, however far an earlier
         run got; one the hook stopped is asked about again.
     :param repair_options: Options for run_with_repair, as Project.repair takes them, for code.
+    :param memory: How each step is given what the work before it found: "pick", "bm25", or
+        "summaries", as above.
+    :param findings_per_step: The most findings a step is given with "bm25".
     :raises ProjectStateError: If the project's directory holds steps taken with other inputs:
-        another team lead, critic, team, max_team_size, or meeting_rounds, or an executor or a
+        another team lead, critic, team, max_team_size, meeting_rounds, or memory, a
+        findings_per_step that changes which findings a step is given, or an executor or a
         session where there was none, or none where there was one.
     :raises CostUnknownError: If the project has a limit and a cost cannot be worked out.
     :return: How the project ended. Running out of budget ends it with a report, not an error.
@@ -299,9 +338,13 @@ def run_project(
         ("max_rounds", max_rounds, 1),
         ("max_stalled_rounds", max_stalled_rounds, 1),
         ("meeting_rounds", meeting_rounds, 0),
+        ("findings_per_step", findings_per_step, 1),
     ):
         if value < least:
             raise ValueError(f"{name} must be at least {least}, not {value}")
+
+    if memory not in get_args(Memory):
+        raise ValueError(f'memory must be "pick", "bm25", or "summaries", not {memory!r}')
 
     if normalize_title(team_lead.title) == normalize_title(critic.title):
         raise ValueError("The team lead and the critic must have different titles")
@@ -324,6 +367,8 @@ def run_project(
         executor=executor,
         approve=approve,
         repair_options=dict(repair_options or {}),
+        memory=memory,
+        findings_per_step=findings_per_step,
     ).run()
 
 
@@ -351,6 +396,25 @@ def describe_member(agent: Agent) -> str:
     return f"{agent.title}, with expertise in {agent.expertise}, whose role is to {agent.role}"
 
 
+@dataclass
+class Event:
+    """Something a project did, as the steps after it are told of it.
+
+    :param what: What it was.
+    :param found: What came of it.
+    :param shown: Whether the team is told of it, as well as the team lead.
+    :param work: Whether it was work, a meeting or code, rather than something that happened to
+        the project, such as a change to the team.
+    :param finding_ids: The findings it made, by id.
+    """
+
+    what: str
+    found: str
+    shown: bool
+    work: bool = False
+    finding_ids: tuple[str, ...] = ()
+
+
 class ProjectRun:
     """One run of run_project: the team, the plan, and what has been done, round by round."""
 
@@ -367,6 +431,8 @@ class ProjectRun:
         executor: Executor | None,
         approve: Callable[[int, NextStep], NextStep | None] | None,
         repair_options: dict[str, Any],
+        memory: Memory = "pick",
+        findings_per_step: int = 8,
     ) -> None:
         self.project = project
         self.team_lead = team_lead
@@ -380,12 +446,15 @@ class ProjectRun:
         self.executor = executor
         self.approve = approve
         self.repair_options = repair_options
+        self.memory_mode = memory
+        self.findings_per_step = findings_per_step
+        # Built again on every run from the steps, which are read back, so it is what they found
+        self.memory = LabMemory()
 
         self.plan: list[PlanTask] = []
         self.rounds: list[ProjectRound] = []
         self.team_changes: list[dict[str, Any]] = []
-        # What each step found, as (what it was, what came of it, whether the team is shown it)
-        self.history: list[tuple[str, str, bool]] = []
+        self.history: list[Event] = []
         self.answer: str | None = None
         self.proposed_answer: str | None = None
         self.objections: list[str] = []
@@ -509,7 +578,7 @@ class ProjectRun:
             )
         assert isinstance(result.output, ResearchPlan)
         self.plan = [PlanTask(task=task, status="to do") for task in result.output.tasks]
-        self.history.append(("The plan the team made", result.summary, True))
+        self.history.append(Event("The plan the team made", result.summary, shown=True, work=True))
 
     # Each round
 
@@ -538,7 +607,7 @@ class ProjectRun:
 
         if (problem := self.check(approved)) is not None:
             round_.outcome, round_.note = "invalid", problem
-            self.history.append((f"Round {number}: your decision could not be carried out", problem, False))
+            self.history.append(Event(f"Round {number}: your decision could not be carried out", problem, shown=False))
             self.finish_round(round_)
             return None
 
@@ -570,11 +639,24 @@ class ProjectRun:
         ]
         parts = [
             f"This is round {number} of the project. Decide the single most useful next step towards the goal, "
-            "given the work done so far, which the summaries above give. The steps you can take:",
+            "given the work done so far, as given above. The steps you can take:",
             "\n".join(actions),
         ]
         if self.project.session is not None:
             parts.append("Every meeting has a running session that code can be run in as it goes.")
+        if self.memory_mode == "pick" and len(self.memory):
+            parts.append(
+                "The findings the project has made are listed above by id and claim. In findings, name the ones "
+                "the step needs: a meeting or write_code is given those in full, and no others, and for finish, "
+                f"name the ones the answer rests on, which the {self.critic.title} is given in full."
+            )
+        elif self.memory_mode == "pick":
+            parts.append("The project has made no findings yet, so leave findings empty.")
+        elif self.memory_mode == "bm25":
+            parts.append(
+                "Each step is given the findings whose words best match its agenda and questions, so state the "
+                "agenda in the terms of the findings it builds on. Leave findings empty."
+            )
         parts.append(
             "Restate the whole plan with each task's status, revised in light of what has been learned: mark a "
             "task done only when the work so far shows it done, and add or drop tasks as the work requires. "
@@ -588,8 +670,8 @@ class ProjectRun:
             agenda,
             name=f"round_{number:02d}_decision",
             team_member=self.team_lead,
-            summaries=tuple(self.summaries(everything=True)),
-            contexts=(self.brief(),),
+            summaries=tuple(self.decision_summaries()),
+            contexts=self.contexts(),
             num_rounds=0,
             output_schema=NextStep,
         )
@@ -622,6 +704,11 @@ class ProjectRun:
             return "The plan was left empty. Restate the whole plan, every task with its status."
 
         action = decision.action
+        if self.memory_mode == "pick" and action not in ("change_team",):
+            if unknown := self.memory.unknown(decision.findings):
+                listed = ", ".join(entry.id for entry in self.memory) or "none yet"
+                return f"No finding has the id {', '.join(unknown)}. The findings: {listed}."
+
         if action in ("team_meeting", "individual_meeting", "write_code"):
             if not decision.agenda.strip():
                 return f"{article(action)} {action} needs an agenda."
@@ -668,12 +755,16 @@ class ProjectRun:
     def take(self, number: int, decision: NextStep, round_: ProjectRound) -> tuple[Status, str] | None:
         """Takes the step decided on."""
         prefix = f"round_{number:02d}"
+        query = decision.answer if decision.action == "finish" else " ".join([decision.agenda, *decision.agenda_questions])
+        given = self.given(decision, query)
+        round_.findings = [entry.id for entry in given]
         meeting = {
             "agenda_questions": tuple(decision.agenda_questions),
-            "summaries": tuple(self.summaries(everything=False)),
-            "contexts": (self.brief(),),
+            "summaries": tuple(self.step_summaries()),
+            "contexts": (self.brief(), *self.given_contexts(given)),
             "num_rounds": self.meeting_rounds,
         }
+        findings = Findings if self.memory_mode != "summaries" else None
 
         if decision.action == "team_meeting":
             members = tuple(self.member(title, [*self.team, self.critic]) for title in decision.participants)
@@ -684,20 +775,41 @@ class ProjectRun:
                 name=f"{prefix}_meeting",
                 team_lead=self.team_lead,
                 team_members=members,
+                output_schema=findings,
                 **meeting,
             )
             who = ", ".join(agent.title for agent in members)
             self.history.append(
-                (f"Round {number}: a team meeting of {self.team_lead.title} with {who} on: {decision.agenda}", result.summary, True)
+                Event(
+                    f"Round {number}: a team meeting of {self.team_lead.title} with {who} on: {decision.agenda}",
+                    result.summary,
+                    shown=True,
+                    work=True,
+                    finding_ids=self.remember(result.output, f"{prefix}_meeting", number, round_),
+                )
             )
 
         elif decision.action == "individual_meeting":
             member = self.member(decision.participants[0], [self.team_lead, *self.team])
             round_.steps.append(f"{prefix}_meeting")
             result = self.project.meeting(
-                "individual", decision.agenda, name=f"{prefix}_meeting", team_member=member, critic=self.critic, **meeting
+                "individual",
+                decision.agenda,
+                name=f"{prefix}_meeting",
+                team_member=member,
+                critic=self.critic,
+                output_schema=findings,
+                **meeting,
             )
-            self.history.append((f"Round {number}: {member.title} worked on: {decision.agenda}", result.summary, True))
+            self.history.append(
+                Event(
+                    f"Round {number}: {member.title} worked on: {decision.agenda}",
+                    result.summary,
+                    shown=True,
+                    work=True,
+                    finding_ids=self.remember(result.output, f"{prefix}_meeting", number, round_),
+                )
+            )
 
         elif decision.action == "write_code":
             author = self.member(decision.participants[0], [self.team_lead, *self.team])
@@ -716,11 +828,28 @@ class ProjectRun:
             assert isinstance(result.output, CodeArtifacts)
             round_.steps.append(f"{prefix}_run")
             outcome = self.project.repair(result.output, author, self.executor, name=f"{prefix}_run", **self.repair_options)
+            found: tuple[str, ...] = ()
+            if findings is not None:
+                round_.steps.append(f"{prefix}_findings")
+                stated = self.project.meeting(
+                    "individual",
+                    f"The code you wrote for this agenda was run:\n\n{decision.agenda}\n\nWhat came of running it:\n\n"
+                    f"{outcome.report()}\n\nSay what the run established. If it failed, or showed nothing, say so, and "
+                    "claim nothing it did not show.",
+                    name=f"{prefix}_findings",
+                    team_member=author,
+                    contexts=(self.brief(),),
+                    num_rounds=0,
+                    output_schema=findings,
+                )
+                found = self.remember(stated.output, f"{prefix}_findings", number, round_)
             self.history.append(
-                (
+                Event(
                     f"Round {number}: {author.title} wrote code for: {decision.agenda}",
                     f"{result.summary}\n\nWhat came of running it:\n\n{outcome.report()}",
-                    True,
+                    shown=True,
+                    work=True,
+                    finding_ids=found,
                 )
             )
 
@@ -732,20 +861,20 @@ class ProjectRun:
             self.record_team_change(number, added=added, removed=removed, why=decision.rationale)
             changes = [f"{describe_member(agent)}, joined" for agent in added]
             changes += [f"{agent.title} left" for agent in removed]
-            self.history.append((f"Round {number}: the team changed", "; ".join(changes) + ".", True))
+            self.history.append(Event(f"Round {number}: the team changed", "; ".join(changes) + ".", shown=True))
 
         else:
             round_.steps.append(f"{prefix}_review")
             result = self.project.meeting(
                 "individual",
                 f"The {self.team_lead.title} proposes to end the project with this answer:\n\n{decision.answer}\n\n"
-                "Review it against the project's goal and the work done, which the summaries above give. The goal "
+                "Review it against the project's goal and the work done, as given above. The goal "
                 "is met only if the answer gives everything the goal asks for, and the work supports it. Say what "
                 "is missing, unsupported, or wrong, specifically enough to act on.",
                 name=f"{prefix}_review",
                 team_member=self.critic,
-                summaries=tuple(self.summaries(everything=False)),
-                contexts=(self.brief(),),
+                summaries=tuple(self.step_summaries()),
+                contexts=(*self.contexts(), *self.given_contexts(given)),
                 num_rounds=0,
                 output_schema=Review,
             )
@@ -761,10 +890,10 @@ class ProjectRun:
             round_.outcome, round_.note = "objected", "; ".join(review.objections)
             objections = "\n".join(f"- {objection}" for objection in review.objections) or "- (none given)"
             self.history.append(
-                (
+                Event(
                     f"Round {number}: the {self.critic.title} did not accept this answer: {decision.answer}",
                     f"The {self.critic.title}'s objections:\n{objections}",
-                    True,
+                    shown=True,
                 )
             )
 
@@ -794,9 +923,75 @@ class ProjectRun:
         return brief
 
     def summaries(self, everything: bool) -> list[str]:
-        """What the steps so far found, for a meeting: all of it for the team lead's decisions, and
-        what the team is shown for the rest."""
-        return [f"{what}\n\n{found}" for what, found, shown in self.history if everything or shown]
+        """What the steps so far found, in full: all of it for the team lead's decisions, and what
+        the team is shown for the rest."""
+        return [f"{event.what}\n\n{event.found}" for event in self.history if everything or event.shown]
+
+    def decision_summaries(self) -> list[str]:
+        """What the team lead is told of the steps so far when it decides the next.
+
+        With findings kept, work is told of by the findings it made, which are listed by claim,
+        except the latest, which is told of in full, as what the next step most often follows on
+        from.
+        """
+        if self.memory_mode == "summaries":
+            return self.summaries(everything=True)
+
+        latest = max((index for index, event in enumerate(self.history) if event.work), default=None)
+        told = []
+        for index, event in enumerate(self.history):
+            ids = f"Findings: {', '.join(event.finding_ids) or 'none'}"
+            if not event.work:
+                told.append(f"{event.what}\n\n{event.found}")
+            elif index == latest:
+                told.append(f"{event.what}\n\n{event.found}\n\n{ids}")
+            else:
+                told.append(f"{event.what}\n\n{ids}")
+
+        return told
+
+    def step_summaries(self) -> list[str]:
+        """What a step is told of the steps before it: with findings kept, only what the team is
+        shown of what happened to the project, since what the work found is given as findings."""
+        if self.memory_mode == "summaries":
+            return self.summaries(everything=False)
+
+        return [f"{event.what}\n\n{event.found}" for event in self.history if event.shown and not event.work]
+
+    @staticmethod
+    def given_contexts(given: list[MemoryEntry]) -> tuple[str, ...]:
+        """The findings a step is given, in full, as a context of their own."""
+        if not given:
+            return ()
+
+        findings = "\n\n".join(entry.describe() for entry in given)
+        return (f"Findings from the project's work so far, which this step builds on:\n\n{findings}",)
+
+    def contexts(self) -> tuple[str, ...]:
+        """The brief, and every finding by its claim, for the team lead's decisions and the review."""
+        if self.memory_mode == "summaries" or not len(self.memory):
+            return (self.brief(),)
+
+        return (self.brief(), f"The project's findings so far, by id and claim:\n\n{self.memory.catalog()}")
+
+    def given(self, decision: NextStep, query: str) -> list[MemoryEntry]:
+        """The findings a step is given in full."""
+        if decision.action == "change_team":
+            return []
+        if self.memory_mode == "pick":
+            return self.memory.get(decision.findings)
+        if self.memory_mode == "bm25":
+            return self.memory.search(query, self.findings_per_step)
+        return []
+
+    def remember(self, output: Any, source: str, number: int, round_: ProjectRound) -> tuple[str, ...]:
+        """Keeps what a step found, if it was asked for findings."""
+        if not isinstance(output, Findings):
+            return ()
+        ids = tuple(entry.id for entry in self.memory.add(output.findings, source=source, round=number))
+        round_.found += ids
+
+        return ids
 
     # Keeping a record
 
@@ -827,6 +1022,7 @@ class ProjectRun:
             "team": [describe_agent(agent) for agent in self.team],
             "team_changes": self.team_changes,
             "plan": [task.model_dump(mode="json") for task in self.plan],
+            "memory": self.memory_mode,
             "rounds": [asdict(round_) for round_ in self.rounds],
             "approvals": {str(number): self.approvals[number] for number in sorted(self.approvals)},
         }
@@ -834,6 +1030,7 @@ class ProjectRun:
     def save_log(self, status: str = "running", error: BaseException | None = None) -> None:
         log = self.project.save_dir / RESEARCH_LOG_FILE_NAME
         write_atomically(log, json.dumps(self.describe(status, error), indent=4).encode("utf-8"))
+        self.memory.save(self.project.save_dir / MEMORY_FILE_NAME)
 
     def finish(self, status: Status, reason: str) -> ProjectReport:
         """Ends the run: saves the research log and the report, and returns the report."""
@@ -850,6 +1047,7 @@ class ProjectRun:
             team=[describe_agent(agent) for agent in self.team],
             team_changes=self.team_changes,
             plan=[task.model_dump(mode="json") for task in self.plan],
+            findings=self.memory.to_dict()["findings"],
             rounds=self.rounds,
             spent=self.project.spent,
             max_cost=self.project.max_cost,

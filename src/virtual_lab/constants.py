@@ -332,6 +332,9 @@ RESEARCH_LOG_FILE_NAME = "research_log.json"
 REPORT_FILE_NAME = "report.json"
 REPORT_MARKDOWN_FILE_NAME = "report.md"
 
+# The findings a project run to its goal has made, as its LabMemory keeps them
+MEMORY_FILE_NAME = "memory.json"
+
 # Identifies this library to the services it queries. NCBI and EMBL-EBI both ask clients to say
 # who they are, and an unidentified client is the first to be throttled.
 WEB_USER_AGENT = "virtual-lab (https://github.com/zou-group/virtual_lab)"
