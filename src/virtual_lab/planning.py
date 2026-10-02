@@ -262,7 +262,8 @@ def run_project(
     A decision that cannot be carried out, such as one naming someone not on the team, is
     recorded, and the team lead is told why in the next round. The research log,
     research_log.json, is saved after every round, and the report, report.json and report.md, at
-    the end, in the project's directory.
+    the end, in the project's directory. A run that fails with an error other than running out
+    of budget leaves no report, and the log says what the error was.
 
     Nothing a step is asked depends on the project's budget, max_rounds, or max_stalled_rounds,
     so a project that stopped for one of them is carried on by raising it and running it again:
@@ -283,8 +284,9 @@ def run_project(
     :param executor: What to run code with, for write_code.
     :param approve: Called with the round and the team lead's decision before it is carried out.
         It returns the decision to carry out, which may be changed, or None to stop the project.
-        A decision it approved is recorded in the research log, and is not asked about again
-        when the project is carried on; one it stopped is asked about again.
+        Every decision carried out, approved or taken with no hook, is recorded in the research
+        log and is not asked about again when the project is carried on, however far an earlier
+        run got; one the hook stopped is asked about again.
     :param repair_options: Options for run_with_repair, as Project.repair takes them, for code.
     :raises ProjectStateError: If the project's directory holds steps taken with other inputs:
         another team lead, critic, team, max_team_size, or meeting_rounds, or an executor or a
@@ -328,6 +330,8 @@ def run_project(
 def check_titles_are_free(members: tuple[Agent, ...], taken: tuple[Agent, ...]) -> None:
     """Refuses a team whose titles repeat, or are the team lead's or critic's."""
     titles = [normalize_title(member.title) for member in members]
+    if not all(titles):
+        raise ValueError("Every team member needs a title")
     if len(set(titles)) != len(titles):
         raise ValueError("Team members must have different titles")
     if clashes := sorted(member.title for member in members if normalize_title(member.title) in {normalize_title(agent.title) for agent in taken}):
@@ -386,11 +390,18 @@ class ProjectRun:
         self.proposed_answer: str | None = None
         self.objections: list[str] = []
 
+        # Every decision carried out, by round, as proposed and as carried out. A step taken on one
+        # is read back only if it is asked for the same way, so these are kept however far a
+        # later run gets, and are never asked about again.
         log = project.save_dir / RESEARCH_LOG_FILE_NAME
-        logged = json.loads(log.read_text(encoding="utf-8"))["rounds"] if log.is_file() else []
-        self.logged_rounds: dict[int, dict[str, Any]] = {entry["number"]: entry for entry in logged}
+        saved = json.loads(log.read_text(encoding="utf-8")) if log.is_file() else {}
+        self.approvals: dict[int, dict[str, Any]] = {int(number): entry for number, entry in saved.get("approvals", {}).items()}
 
     def run(self) -> ProjectReport:
+        # A report left from an earlier run would say how a run that is no longer the last ended
+        for name in (REPORT_FILE_NAME, REPORT_MARKDOWN_FILE_NAME):
+            (self.project.save_dir / name).unlink(missing_ok=True)
+
         number = 0
         try:
             if self.given_team is None:
@@ -424,6 +435,9 @@ class ProjectRun:
                 self.finish_round(self.rounds[-1])
             when = f"in round {number}" if number else "before its first round"
             return self.finish("out_of_budget", f"The project ran out of budget {when}: {error}.")
+        except BaseException as error:
+            self.save_log("failed", error)
+            raise
 
     # Before the first round
 
@@ -444,9 +458,19 @@ class ProjectRun:
         chosen = list(result.output.to_agents(model=self.team_lead.model))
 
         notes = []
-        free = [agent for agent in chosen if find_agent(agent.title, [self.team_lead, self.critic]) is None]
-        if len(free) < len(chosen):
-            notes.append(f"{', '.join(agent.title for agent in chosen if agent not in free)} left out, as already on the project")
+        if untitled := [agent for agent in chosen if not normalize_title(agent.title)]:
+            notes.append(f"{len(untitled)} left out, as without a title")
+        free: list[Agent] = []
+        clashing = []
+        for agent in chosen:
+            if agent in untitled:
+                continue
+            if find_agent(agent.title, [self.team_lead, self.critic, *free]) is None:
+                free.append(agent)
+            else:
+                clashing.append(agent.title)
+        if clashing:
+            notes.append(f"{', '.join(clashing)} left out, as already on the project")
         if len(free) > self.max_team_size:
             notes.append(f"{', '.join(agent.title for agent in free[self.max_team_size :])} left out, as over the limit")
             free = free[: self.max_team_size]
@@ -575,16 +599,20 @@ class ProjectRun:
 
     def approval(self, number: int, proposed: NextStep) -> NextStep | None:
         """The decision to carry out: the one approved before, if this one was, or the hook's."""
-        logged = self.logged_rounds.get(number)
-        if logged is not None and logged["approved"] is not None and logged["proposed"] == proposed.model_dump(mode="json"):
-            return NextStep.model_validate(logged["approved"])
+        dumped = proposed.model_dump(mode="json")
+        saved = self.approvals.get(number)
+        if saved is not None and saved["proposed"] == dumped:
+            return NextStep.model_validate(saved["approved"])
 
         if self.approve is None:
-            return proposed
+            approved: NextStep | None = proposed
+        else:
+            approved = self.approve(number, proposed.model_copy(deep=True))
+            if approved is not None and not isinstance(approved, NextStep):
+                raise TypeError(f"approve must return a NextStep or None, not {type(approved).__name__}")
 
-        approved = self.approve(number, proposed.model_copy(deep=True))
-        if approved is not None and not isinstance(approved, NextStep):
-            raise TypeError(f"approve must return a NextStep or None, not {type(approved).__name__}")
+        if approved is not None:
+            self.approvals[number] = {"proposed": dumped, "approved": approved.model_dump(mode="json")}
 
         return approved
 
@@ -622,6 +650,8 @@ class ProjectRun:
             removed = {normalize_title(title) for title in decision.remove_members}
             staying = [agent for agent in self.team if normalize_title(agent.title) not in removed]
             added = [spec.title for spec in decision.add_members]
+            if any(not normalize_title(title) for title in added):
+                return "A scientist to add needs a title."
             if len({normalize_title(title) for title in added}) != len(added):
                 return "Two scientists to add have the same title."
             for title in added:
@@ -787,21 +817,23 @@ class ProjectRun:
         round_.team = [agent.title for agent in self.team]
         round_.tasks_done = self.tasks_done()
 
-    def describe(self, status: str) -> dict[str, Any]:
+    def describe(self, status: str, error: BaseException | None = None) -> dict[str, Any]:
         return {
             "goal": self.project.goal,
             "status": status,
+            "error": {"type": type(error).__name__, "message": str(error)} if error is not None else None,
             "team_lead": describe_agent(self.team_lead),
             "critic": describe_agent(self.critic),
             "team": [describe_agent(agent) for agent in self.team],
             "team_changes": self.team_changes,
             "plan": [task.model_dump(mode="json") for task in self.plan],
             "rounds": [asdict(round_) for round_ in self.rounds],
+            "approvals": {str(number): self.approvals[number] for number in sorted(self.approvals)},
         }
 
-    def save_log(self, status: str = "running") -> None:
+    def save_log(self, status: str = "running", error: BaseException | None = None) -> None:
         log = self.project.save_dir / RESEARCH_LOG_FILE_NAME
-        write_atomically(log, json.dumps(self.describe(status), indent=4).encode("utf-8"))
+        write_atomically(log, json.dumps(self.describe(status, error), indent=4).encode("utf-8"))
 
     def finish(self, status: Status, reason: str) -> ProjectReport:
         """Ends the run: saves the research log and the report, and returns the report."""

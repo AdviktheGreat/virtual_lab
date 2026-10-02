@@ -190,7 +190,7 @@ class TestRun:
     def test_a_chosen_team_is_kept_to_its_size_and_to_new_titles(self, fake_client: FakeClient, tmp_path: Path) -> None:
         queue(
             fake_client,
-            roster("Scientific Critic", "Chemist", "Biologist", "Physicist"),
+            roster("Scientific Critic", "Chemist", " ", "chemist", "Biologist", "Physicist"),
             plan("Task 1"),
             decide("finish", answer="A."),
             review(True),
@@ -200,7 +200,8 @@ class TestRun:
 
         assert [member["title"] for member in report.team] == ["Chemist", "Biologist"]
         why = report.team_changes[0]["why"]
-        assert "Scientific Critic left out, as already on the project" in why
+        assert "Scientific Critic, chemist left out, as already on the project" in why
+        assert "1 left out, as without a title" in why
         assert "Physicist left out, as over the limit" in why
 
 
@@ -243,6 +244,7 @@ class TestDecisions:
             (step("change_team", add_members=[spec("Immunologist")]), "on the project already"),
             (step("change_team", add_members=[spec("Principal Investigator")]), "on the project already"),
             (step("change_team", add_members=[spec("Chemist"), spec("chemist")]), "the same title"),
+            (step("change_team", add_members=[spec("  ")]), "needs a title"),
             (step("change_team", add_members=[spec("Chemist"), spec("Biologist")]), "at most 2"),
             (step("finish", answer=" "), "needs the project's answer"),
             (step("finish", answer="A.").model_copy(update={"plan": []}), "plan was left empty"),
@@ -410,6 +412,24 @@ class TestStopping:
         assert "before its first round" in report.reason
         assert report.rounds == []
         assert fake_client.completions.calls == []
+
+
+    def test_a_run_that_fails_leaves_no_report_and_says_why_in_its_log(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(fake_client, roster("Immunologist"), plan("Task 1"), decide("individual_meeting", participants=["Immunologist"], agenda="One."))
+        assert run(tmp_path, max_rounds=1).status == "out_of_rounds"
+        assert (tmp_path / "report.md").is_file()
+
+        fake_client.completions.responses.append(RuntimeError("The connection dropped."))
+        queue(fake_client, decide("individual_meeting", participants=["Immunologist"], agenda="Two."))
+        with pytest.raises(RuntimeError):
+            run(tmp_path, max_rounds=2)
+
+        assert not (tmp_path / "report.md").exists() and not (tmp_path / "report.json").exists()
+        log = json.loads((tmp_path / "research_log.json").read_text())
+        assert log["status"] == "failed"
+        assert log["error"] == {"type": "RuntimeError", "message": "The connection dropped."}
 
 
 class TestApproval:
@@ -580,7 +600,7 @@ class TestResuming:
         run(tmp_path, max_rounds=1)
         log_path = tmp_path / "research_log.json"
         log = json.loads(log_path.read_text())
-        log["rounds"][0]["proposed"]["agenda"] = "Something else."
+        log["approvals"]["1"]["proposed"]["agenda"] = "Something else."
         log_path.write_text(json.dumps(log))
 
         asked: list[int] = []
@@ -592,6 +612,49 @@ class TestResuming:
         run(tmp_path, max_rounds=1, approve=approve)
 
         assert asked == [1]
+
+    def test_an_approval_is_kept_by_a_run_that_stops_before_its_round(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            decide("individual_meeting", done=2, participants=["Immunologist"], agenda="Two."),
+        )
+        changed = lambda number, decision: decision.model_copy(update={"agenda": f"{decision.agenda} Carefully."})  # noqa: E731
+        run(tmp_path, max_rounds=2, approve=changed)
+        run(tmp_path, max_rounds=1, approve=changed)
+
+        queue(fake_client, decide("finish", done=2, answer="A."), review(True))
+        report = run(tmp_path, max_rounds=3)
+
+        assert report.status == "finished"
+        assert [round_.approved["agenda"] for round_ in report.rounds[:2]] == ["One. Carefully.", "Two. Carefully."]  # type: ignore[index]
+
+    def test_a_decision_taken_without_a_hook_is_not_asked_about_when_one_is_added(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1"),
+            decide("individual_meeting", participants=["Immunologist"], agenda="One."),
+        )
+        run(tmp_path, max_rounds=1)
+
+        asked: list[int] = []
+
+        def approve(number: int, decision: NextStep) -> NextStep:
+            asked.append(number)
+            return decision.model_copy(update={"agenda": "Something else."})
+
+        queue(fake_client, decide("finish", done=1, answer="A."), review(True))
+        report = run(tmp_path, max_rounds=2, approve=approve)
+
+        assert asked == [2]
+        assert report.status == "finished"
 
     def test_a_decision_the_hook_stopped_is_asked_about_again(self, fake_client: FakeClient, tmp_path: Path) -> None:
         queue(fake_client, roster("Immunologist"), plan("Task 1"), decide("finish", answer="A."))
@@ -625,7 +688,11 @@ class TestArguments:
 
     @pytest.mark.parametrize(
         ("team", "problem"),
-        [((member("Chemist"), member("chemist")), "different titles"), ((member("Scientific Critic"),), "critic's title")],
+        [
+            ((member("Chemist"), member("chemist")), "different titles"),
+            ((member("Scientific Critic"),), "critic's title"),
+            ((member(" "),), "needs a title"),
+        ],
     )
     def test_a_given_team_must_have_titles_of_its_own(self, tmp_path: Path, team: tuple[Agent, ...], problem: str) -> None:
         with pytest.raises(ValueError, match=problem):
