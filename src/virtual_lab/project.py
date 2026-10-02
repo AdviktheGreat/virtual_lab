@@ -377,20 +377,22 @@ class Project:
         if done is not None:
             return self._read_meeting(done, arguments.get("output_schema"))
 
+        project_limited = False
         try:
+            limit, project_limited = self._step_limit(own_limit)
             result = hold_meeting(
                 save_dir=self.meetings_dir,
                 save_name=name,
                 chat_models=self.chat_models,
                 client=self.client,
-                max_cost=tightest(own_limit, self.remaining),
+                max_cost=limit,
                 on_usage=self._counter(name, on_usage),
                 before_request=self._guard(before_request),
                 **arguments,
             )
         except BaseException as error:
             self._fail(name, error, {"partial": self.meetings_dir / PARTIAL_MEETING_DIR_NAME / f"{name}.json"})
-            self._raise_for_project(error)
+            self._raise_for_project(error, project_limited)
             raise
 
         files = {
@@ -428,7 +430,7 @@ class Project:
         :raises ProjectBudgetExceededError: If the project has spent its max_cost, before the
             code is run or before a repair request.
         :raises ProjectStateError: If the project already ran code under this name with other
-            inputs, or its record has changed since.
+            inputs, or its record or code has changed since.
         :return: What happened.
         """
         if unknown := sorted(set(options) - REPAIR_OPTIONS):
@@ -445,7 +447,9 @@ class Project:
         if done is not None:
             return self._read_repair(done)
 
+        project_limited = False
         try:
+            limit, project_limited = self._step_limit(own_limit)
             if arguments.get("chat_model") is None:
                 model = arguments.get("model") or author.model
                 retries = {"max_retries": arguments["max_retries"]} if "max_retries" in arguments else {}
@@ -456,7 +460,7 @@ class Project:
             outcome = run_with_repair(
                 save_dir=self.meetings_dir,
                 save_name=name,
-                max_cost=tightest(own_limit, self.remaining),
+                max_cost=limit,
                 on_usage=self._counter(name, on_usage),
                 before_request=self._guard(before_request),
                 **arguments,
@@ -466,10 +470,13 @@ class Project:
             )
         except BaseException as error:
             self._fail(name, error, {"partial": self.meetings_dir / PARTIAL_MEETING_DIR_NAME / EXECUTION_DIR_NAME / f"{name}.json"})
-            self._raise_for_project(error)
+            self._raise_for_project(error, project_limited)
             raise
 
-        self._complete(name, outcome.usage, {"record": record_path})
+        # The code is hashed too, since a later step may run it from these paths
+        code_dir = self.meetings_dir / ARTIFACT_DIR_NAME / name
+        code = {f"code:{path.relative_to(code_dir).as_posix()}": path for path in outcome.paths}
+        self._complete(name, outcome.usage, {"record": record_path, **code})
 
         return outcome
 
@@ -562,16 +569,31 @@ class Project:
         step.elapsed_seconds = round(time.monotonic() - self._started.pop(step.name), 3)
         self._save()
 
-    def _raise_for_project(self, error: BaseException) -> None:
+    def _step_limit(self, own_limit: float | None) -> tuple[float | None, bool]:
+        """The limit a step starts with: the tighter of its own and what the project has left.
+
+        :return: The limit, and whether it is the project's.
+        """
+        remaining = self.remaining
+        project_limited = remaining is not None and (own_limit is None or remaining <= own_limit)
+
+        return tightest(own_limit, remaining), project_limited
+
+    def _raise_for_project(self, error: BaseException, project_limited: bool) -> None:
         """Raises a step's budget error as the project's, if the project's limit is what it reached.
 
         A step is given the project's remaining budget as its own limit, so the step's error is
-        the one that fires first when one step runs at a time.
+        the one that fires first when one step runs at a time. Whether that limit was the
+        project's is known from when the step started, since adding what the step cost back to
+        what was spent before it can come out a rounding error short of the project's limit.
         """
         if isinstance(error, ProjectBudgetExceededError) or not isinstance(error, BudgetExceededError):
             return
 
-        if self.max_cost is not None and (spent := self.spent) is not None and spent >= self.max_cost:
+        if self.max_cost is None or (spent := self.spent) is None:
+            return
+
+        if project_limited or spent >= self.max_cost:
             raise ProjectBudgetExceededError(spent=spent, limit=self.max_cost) from error
 
     def _check_files(self, step: ProjectStep) -> None:

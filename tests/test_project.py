@@ -1,6 +1,7 @@
 """Tests for a project: its ledger, its budget across meetings and repairs, and resuming it."""
 
 import json
+import math
 import threading
 from pathlib import Path
 from typing import Any
@@ -210,6 +211,22 @@ class TestBudget:
         assert step["files"] == {"partial": "meetings/partial/meeting_001.json"}
         assert (tmp_path / "meetings" / "partial" / "meeting_001.json").is_file()
         assert project.spent == pytest.approx(2 * CALL_COST)
+
+    def test_the_projects_limit_is_named_even_when_the_sum_rounds_short_of_it(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
+    ) -> None:
+        first = CALL_COST
+        three_calls = compute_token_cost(TEST_MODEL, 300, 60)
+        # The meeting is given limit - first, which it reaches, but first + what it cost is less
+        limit = math.nextafter(first + three_calls, math.inf)
+        assert three_calls >= limit - first and first + three_calls < limit
+        project = Project(tmp_path, GOAL, max_cost=limit)
+        ask(project, team_member)
+
+        with pytest.raises(ProjectBudgetExceededError):
+            ask(project, team_member, num_rounds=5)
+
+        assert len(fake_client.completions.calls) == 4
 
     def test_a_meetings_own_limit_is_its_own(
         self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
@@ -567,7 +584,10 @@ class TestRepair:
         assert outcome.paths == (tmp_path / "meetings" / "artifacts" / "repair_001" / "analysis.py",)
         step = ledger(tmp_path)["steps"][0]
         assert (step["name"], step["kind"], step["status"]) == ("repair_001", "repair", "completed")
-        assert step["files"] == {"record": "meetings/executions/repair_001.json"}
+        assert step["files"] == {
+            "record": "meetings/executions/repair_001.json",
+            "code:analysis.py": "meetings/artifacts/repair_001/analysis.py",
+        }
         assert project.spent == pytest.approx(CALL_COST)
 
     def test_a_repair_already_run_is_read_back(
@@ -582,6 +602,15 @@ class TestRepair:
         assert read.to_dict() == ran.to_dict()
         assert read.report() == ran.report()
         assert read.paths == ran.paths
+
+    def test_code_changed_since_it_was_run_is_refused(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
+    ) -> None:
+        Project(tmp_path, GOAL).repair(script("print(1)"), team_member, LocalExecutor(warn=False), name="a")
+        (tmp_path / "meetings" / "artifacts" / "a" / "analysis.py").write_text("print('changed')")
+
+        with pytest.raises(ProjectStateError, match="code:analysis.py"):
+            Project(tmp_path, GOAL).repair(script("print(1)"), team_member, LocalExecutor(warn=False), name="a")
 
     def test_other_code_under_the_same_name_is_refused(
         self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
