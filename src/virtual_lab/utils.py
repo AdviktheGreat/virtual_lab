@@ -1,9 +1,11 @@
 """Contains useful utility functions."""
 
 import json
+import os
 import re
+import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -260,15 +262,16 @@ class CostUnknownError(ValueError):
 
 
 class BudgetExceededError(RuntimeError):
-    """Raised before a request that a meeting's spending limit does not leave room for.
+    """Raised before a request that a spending limit does not leave room for.
 
-    :param spent: What the meeting had cost when it stopped, in USD.
-    :param limit: The limit it was given, in USD.
+    :param spent: What had been spent when it stopped, in USD.
+    :param limit: The limit, in USD.
+    :param what: What the limit was on, as the message names it.
     """
 
-    def __init__(self, spent: float, limit: float) -> None:
+    def __init__(self, spent: float, limit: float, what: str = "meeting") -> None:
         super().__init__(
-            f"The meeting has cost ${spent:.4f}, which reaches its limit of ${limit:.4f}, so it "
+            f"The {what} has cost ${spent:.4f}, which reaches its limit of ${limit:.4f}, so it "
             f"was stopped before the next request"
         )
         self.spent = spent
@@ -594,6 +597,22 @@ class MeetingUsage:
             },
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MeetingUsage":
+        """Rebuilds the usage to_dict described.
+
+        :param data: What to_dict returned, as read back from a record.
+        :return: The usage, model by model.
+        """
+        known = {usage_field.name for usage_field in fields(ModelUsage)}
+
+        return cls(
+            per_model={
+                model: ModelUsage(**{name: value for name, value in counts.items() if name in known})
+                for model, counts in data.get("per_model", {}).items()
+            }
+        )
+
     def print_summary(self, elapsed_time: float) -> None:
         """Prints the token usage, cost, and elapsed time.
 
@@ -617,6 +636,54 @@ class MeetingUsage:
             print(f"Warning: {e}")
 
         print(f"Time: {int(elapsed_time // 60)}:{int(elapsed_time % 60):02d}")
+
+
+def combine_usage(usages: Iterable[MeetingUsage]) -> MeetingUsage:
+    """Adds up the usage of several meetings, model by model."""
+    total = MeetingUsage()
+    for usage in usages:
+        for model, model_usage in usage.per_model.items():
+            into = total.per_model.setdefault(model, ModelUsage())
+            for usage_field in fields(ModelUsage):
+                mine, theirs = getattr(into, usage_field.name), getattr(model_usage, usage_field.name)
+                combined = max(mine, theirs) if usage_field.name == "max_input_tokens" else mine + theirs
+                setattr(into, usage_field.name, combined)
+
+    return total
+
+
+class UsageTracker:
+    """Keeps every meeting's usage, each counted once however often it is reported."""
+
+    def __init__(self) -> None:
+        self.usages: list[MeetingUsage] = []
+
+    def count(self, usage: MeetingUsage) -> None:
+        # A meeting reports the same, growing, usage after every response
+        if not any(usage is counted for counted in self.usages):
+            self.usages.append(usage)
+
+    def total(self) -> MeetingUsage:
+        return combine_usage(self.usages)
+
+    def cost(self) -> float:
+        """What it has all cost, in USD.
+
+        :raises CostUnknownError: If that cannot be worked out.
+        """
+        return self.total().compute_cost()
+
+
+def write_atomically(path: Path, data: bytes) -> None:
+    """Writes a file under a temporary name and renames it into place, so it is never partial."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".part")
+    try:
+        with os.fdopen(handle, "wb") as file:
+            file.write(data)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def compute_finetuning_cost(model: str, token_count: int, num_epochs: int = DEFAULT_FINETUNING_EPOCHS) -> float:

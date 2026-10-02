@@ -5,26 +5,35 @@ is tested against actual tracebacks and exit codes rather than against a mock's 
 """
 
 import json
+import math
+from importlib import import_module
 
 import pytest
 
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile
-from virtual_lab.constants import EXECUTION_DIR_NAME
+from virtual_lab.constants import EXECUTION_DIR_NAME, PARTIAL_MEETING_DIR_NAME
 from virtual_lab.execution import DockerExecutor, LocalExecutor
 from virtual_lab.prompts import code_repair_prompt
 from virtual_lab.run_meeting import run_meeting
 from virtual_lab.repair import (
     RepairAttempt,
+    RepairOutcome,
     error_signature,
     merge_artifacts,
     run_with_repair,
     save_execution_record,
 )
 
-from conftest import FakeClient, parsed_response
+from virtual_lab.structured import StructuredOutputError
+from virtual_lab.utils import BudgetExceededError, CostUnknownError, compute_token_cost
+
+from conftest import TEST_MODEL, FakeClient, parsed_response
 
 DOCKER = DockerExecutor()
+
+# What one fake repair costs: 100 input tokens and 20 output
+REPAIR_COST = compute_token_cost(TEST_MODEL, 100, 20)
 
 needs_docker = pytest.mark.skipif(
     not DOCKER.is_available(), reason="Docker daemon is not reachable"
@@ -640,6 +649,217 @@ class TestExecutionRecord:
 
         assert record["final_files"][0]["contents"] == "print('fixed')"
         assert record["author"]["title"] == "Immunologist"
+
+    def test_each_attempt_records_the_code_it_ran(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=script("print('fixed')"))]
+        outcome = run(fake_client, BROKEN, team_member, tmp_path)
+
+        first, second = outcome.to_dict()["attempts"]
+
+        assert first["runs"][0]["contents"] == "raise ValueError('boom')"
+        assert second["runs"][0]["contents"] == "print('fixed')"
+        assert first["runs"][0]["language"] == "python"
+        assert first["runs"][0]["description"] == "Does the analysis."
+
+    def test_an_outcome_is_rebuilt_from_its_record(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=script("print('fixed')"))]
+        outcome = run(fake_client, BROKEN, team_member, tmp_path, max_cost=1.0)
+        path = save_execution_record(
+            save_dir=tmp_path, save_name="discussion", outcome=outcome, author=team_member, executor=local()
+        )
+
+        rebuilt = RepairOutcome.from_dict(json.loads(path.read_text()), paths=outcome.paths)
+
+        assert rebuilt.to_dict() == outcome.to_dict()
+        assert rebuilt.report() == outcome.report()
+        assert rebuilt.paths == outcome.paths
+        assert rebuilt.usage.compute_cost() == pytest.approx(outcome.usage.compute_cost())
+
+
+class TestRepairBudget:
+    def test_no_repair_is_requested_once_the_limit_is_spent(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [
+            parsed_response(parsed=script("raise ValueError('still broken')")),
+            parsed_response(parsed=script("print('fixed')")),
+        ]
+
+        with pytest.raises(BudgetExceededError, match="The repair has cost"):
+            run(fake_client, BROKEN, team_member, tmp_path, max_cost=REPAIR_COST * 0.5)
+
+        assert len(fake_client.completions.parse_calls) == 1
+
+    def test_a_limit_of_nothing_asks_for_nothing(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        with pytest.raises(BudgetExceededError):
+            run(fake_client, BROKEN, team_member, tmp_path, max_cost=0.0)
+
+        assert fake_client.completions.parse_calls == []
+
+    def test_code_that_works_needs_no_budget(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        assert run(fake_client, WORKING, team_member, tmp_path, max_cost=0.0).succeeded
+
+    def test_a_limit_with_room_lets_the_repair_happen(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=script("print('fixed')"))]
+
+        outcome = run(fake_client, BROKEN, team_member, tmp_path, max_cost=REPAIR_COST * 1.5)
+
+        assert outcome.succeeded
+        assert outcome.max_cost == REPAIR_COST * 1.5
+        assert outcome.to_dict()["max_cost"] == REPAIR_COST * 1.5
+
+    def test_a_limit_is_refused_for_an_unpriced_model(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        with pytest.raises(CostUnknownError, match="an-unreleased-model"):
+            run(fake_client, BROKEN, team_member, tmp_path, max_cost=1.0, model="an-unreleased-model")
+
+        # Refused before anything was run
+        assert not (tmp_path / "artifacts").exists()
+
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            ({"max_cost": -1.0}, "max_cost"),
+            ({"max_cost": math.inf}, "max_cost"),
+            ({"max_cost": math.nan}, "max_cost"),
+            ({"max_completion_tokens": 0}, "max_completion_tokens"),
+        ],
+    )
+    def test_a_limit_that_is_not_one_is_refused(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path, options, message
+    ) -> None:
+        with pytest.raises(ValueError, match=message):
+            run(fake_client, BROKEN, team_member, tmp_path, **options)
+
+    def test_usage_is_reported_after_every_repair(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [
+            parsed_response(parsed=script("raise KeyError('another')")),
+            parsed_response(parsed=script("print('fixed')")),
+        ]
+        seen: list[int] = []
+
+        run(fake_client, BROKEN, team_member, tmp_path, on_usage=lambda usage: seen.append(usage.num_calls))
+
+        assert seen == [1, 2]
+
+    def test_a_failed_request_is_still_reported(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=None, refusal="No.")]
+        seen: list[int] = []
+
+        with pytest.raises(StructuredOutputError):
+            run(fake_client, BROKEN, team_member, tmp_path, on_usage=lambda usage: seen.append(usage.num_calls))
+
+        assert seen == [1]
+
+    def test_before_request_can_stop_the_loop_before_a_request(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        class Enough(Exception):
+            pass
+
+        def stop() -> None:
+            raise Enough
+
+        with pytest.raises(Enough):
+            run(fake_client, BROKEN, team_member, tmp_path, before_request=stop)
+
+        assert fake_client.completions.parse_calls == []
+
+    def test_each_repair_is_limited_in_tokens(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [parsed_response(parsed=script("print('fixed')"))]
+
+        run(fake_client, BROKEN, team_member, tmp_path, max_completion_tokens=700)
+
+        assert fake_client.completions.parse_calls[0]["max_completion_tokens"] == 700
+
+
+class TestFailedRepair:
+    def partial(self, tmp_path) -> dict:
+        return json.loads((tmp_path / PARTIAL_MEETING_DIR_NAME / EXECUTION_DIR_NAME / "discussion.json").read_text())
+
+    def test_a_failed_repair_request_keeps_what_was_run(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [
+            parsed_response(parsed=script("raise KeyError('another')")),
+            parsed_response(parsed=None, refusal="No."),
+        ]
+
+        with pytest.raises(StructuredOutputError):
+            run(fake_client, BROKEN, team_member, tmp_path)
+
+        record = self.partial(tmp_path)
+        assert record["error"]["type"] == "StructuredOutputError"
+        assert record["succeeded"] is False
+        assert [attempt["runs"][0]["contents"] for attempt in record["attempts"]] == [
+            "raise ValueError('boom')",
+            "raise KeyError('another')",
+        ]
+        # The code that last ran, not code nobody returned
+        assert record["final_files"][0]["contents"] == "raise KeyError('another')"
+        # Both requests were paid for, the refused one included
+        assert record["usage"]["num_calls"] == 2
+        assert record["author"]["title"] == "Immunologist"
+        assert record["ended_at"] is not None
+
+    def test_a_loop_stopped_by_its_limit_keeps_what_was_run(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        with pytest.raises(BudgetExceededError):
+            run(fake_client, BROKEN, team_member, tmp_path, max_cost=0.0)
+
+        record = self.partial(tmp_path)
+        assert record["error"]["type"] == "BudgetExceededError"
+        assert record["num_attempts"] == 1
+        assert record["max_cost"] == 0.0
+
+    def test_an_interrupted_loop_keeps_what_was_run(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        fake_client.completions.parsed_responses = [KeyboardInterrupt()]
+
+        with pytest.raises(KeyboardInterrupt):
+            run(fake_client, BROKEN, team_member, tmp_path)
+
+        assert self.partial(tmp_path)["error"]["type"] == "KeyboardInterrupt"
+
+    def test_a_record_that_cannot_be_saved_does_not_hide_the_failure(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path, monkeypatch, capsys
+    ) -> None:
+        def cannot_save(**kwargs) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(import_module("virtual_lab.repair"), "save_execution_record", cannot_save)
+
+        with pytest.raises(BudgetExceededError):
+            run(fake_client, BROKEN, team_member, tmp_path, max_cost=0.0)
+
+        assert "disk full" in capsys.readouterr().out
+
+    def test_a_loop_that_finishes_leaves_no_partial_record(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        outcome = run(fake_client, BROKEN, team_member, tmp_path, max_attempts=1)
+
+        assert outcome.error is None
+        assert not (tmp_path / PARTIAL_MEETING_DIR_NAME).exists()
 
 
 class TestNothingToRun:
