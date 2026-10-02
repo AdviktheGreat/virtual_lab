@@ -309,6 +309,31 @@ print(project.spent, project.remaining)
 - Steps are named `meeting_001`, `meeting_002`, and so on, and `repair_001` onwards, in the order they are asked for, unless named. Name every step run from a thread, since that order is not fixed. Meetings and repairs are saved under `meetings/` by name, laid out as `hold_meeting` and `run_with_repair` lay them out.
 - Options given to `Project` apply to every meeting, under those given to a meeting. `session`, `chat_models`, and `client` are the project's own, and are used for repairs too. A session does not survive the process, so meetings read back on a later run leave nothing in its interpreter; the files they wrote in its directory remain. Only one process should use a project's directory at a time.
 
+### Letting the principal investigator run the project
+
+`run_project` hands the deciding to the team lead. The team lead chooses a team, unless one is given, the team makes a plan, and then every round the team lead reads what the project has done and decides one next step, restating the plan with each task's status:
+
+- `team_meeting`: a discussion it leads, with the team members and critic it names.
+- `individual_meeting`: one team member, or the team lead, works on an agenda, with the critic critiquing.
+- `write_code`: one of them writes code, which is run with `executor` and repaired if it fails. Offered only with an executor.
+- `change_team`: scientists are brought onto the team, up to `max_team_size`, or let go.
+- `finish`: the team lead gives the project's answer. The critic reviews it against the goal and the work done, and the project ends only if the critic agrees; otherwise its objections are what the next round goes on.
+
+```python
+from virtual_lab import DockerExecutor, Project, run_project
+
+project = Project(Path("results/kp3"), goal="Design nanobodies against KP.3.", max_cost=20.0)
+report = run_project(project, max_rounds=12, executor=DockerExecutor())
+print(report.status, report.reason)
+print(report.answer)
+```
+
+- A run ends `finished` when the critic accepts an answer, `out_of_budget` when the project's `max_cost` runs out, `out_of_rounds` after `max_rounds` rounds, `stalled` after `max_stalled_rounds` rounds in a row without one more of the plan's tasks done, or `stopped` by the approve hook. Running out of budget ends it with a report, not an error.
+- Every meeting is told the goal, the team, and the plan as it stands, and is given the summaries of the work so far. A decision that cannot be carried out, such as one naming someone not on the team, is recorded and the team lead is told why in the next round.
+- `approve` is called with each round's number and decision before it is carried out, and returns the decision to carry out, which it may change, or `None` to stop the project. With none, the project runs on its own.
+- `research_log.json` records every round, with the decision as proposed and as carried out, and every change to the team, and is saved after every round. The run ends with `report.json` and `report.md`: the answer, or the last one the critic did not accept and its objections, the team, the plan, every round, and the cost. A run that fails with any other error leaves no report, and the log says what the error was.
+- Every step is a step of the project, so a run that stopped is carried on by running it again on the same directory: the steps it took are read back for nothing. Nothing a step is asked depends on `max_cost`, `max_rounds`, or `max_stalled_rounds`, so they can be raised to carry a project on. For the same reason, the team lead is not told how many rounds or how much money is left. Every decision carried out, whether the approve hook changed it or there was no hook, is kept in the log and not asked about again, however far a later run gets before it stops; one the hook stopped is asked about again.
+
 
 ## Measuring an agent or a team on Biomni's benchmarks
 
