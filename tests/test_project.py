@@ -3,6 +3,7 @@
 import json
 import math
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStat
 from virtual_lab.provenance import MeetingRecord
 from virtual_lab.resources import KnowHow, Resources
 from virtual_lab.run_meeting import hold_meeting
-from virtual_lab.tools import Tool
+from virtual_lab.tools import Tool, inspect_data_file, show_data_files
 from virtual_lab.utils import BudgetExceededError, CostUnknownError, MeetingUsage, compute_token_cost
 
 from conftest import TEST_MODEL, FakeClient, parsed_response, text_response
@@ -476,6 +477,14 @@ class TestResuming:
 
         with pytest.raises(ProjectStateError, match="tools"):
             ask(Project(tmp_path, GOAL), team_member, tools=(tool("Looks a protein up."),))
+
+    def test_a_tool_is_compared_by_the_function_a_partial_wraps_not_what_it_binds(self, tmp_path: Path) -> None:
+        def fingerprint(function: Any) -> dict[str, str]:
+            tool = Tool(name="t", description="Does it.", parameters={"type": "object"}, function=function)
+            return fingerprint_inputs(hold_meeting, {"tools": (tool,)})
+
+        assert fingerprint(partial(show_data_files, tmp_path / "a")) == fingerprint(partial(show_data_files, tmp_path / "b"))
+        assert fingerprint(partial(show_data_files, tmp_path)) != fingerprint(partial(inspect_data_file, tmp_path))
 
     def test_resources_with_other_contents_are_another_input(self) -> None:
         def resources(content: str) -> Resources:

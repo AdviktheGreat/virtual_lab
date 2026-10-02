@@ -22,6 +22,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, fields, replace
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -146,7 +147,11 @@ def describe_input(name: str, value: Any) -> Any:
         return describe_executor(value)
     # A record names tools and resources, but what the agents are told of them is what counts
     if isinstance(value, Tool):
+        # What a partial binds, such as the directory a tool works in, is not what the agents
+        # are told, and can differ from one run to the next
         function = value.function
+        while isinstance(function, partial):
+            function = function.func
         return {
             "name": value.name,
             "description": value.description,
