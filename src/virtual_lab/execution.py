@@ -225,6 +225,20 @@ class ExecutionResult:
             "stderr": self.stderr,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "ExecutionResult":
+        """Rebuilds a result from what to_dict returned, with its duration as rounded there."""
+        return cls(
+            command=tuple(data["command"]),
+            exit_code=data["exit_code"],
+            stdout=data["stdout"],
+            stderr=data["stderr"],
+            duration=data["duration"],
+            timed_out=data["timed_out"],
+            produced_files=tuple(data["produced_files"]),
+            sandboxed=data["sandboxed"],
+        )
+
 
 class Executor(Protocol):
     """Something that can run a command in a directory."""

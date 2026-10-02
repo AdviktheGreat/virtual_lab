@@ -15,15 +15,13 @@ from virtual_lab.evaluation import (
     SingleAgent,
     SolverContext,
     TeamMeeting,
-    UsageTracker,
-    combine_usage,
     describe_solver,
     run_benchmark,
     transcript_text,
 )
 from virtual_lab.session import LocalSession
 from virtual_lab.tools import PUBMED_TOOL
-from virtual_lab.utils import CostUnknownError, MeetingUsage, compute_token_cost
+from virtual_lab.utils import CostUnknownError, MeetingUsage, UsageTracker, combine_usage, compute_token_cost
 
 from conftest import TEST_MODEL, FakeClient, make_usage, parsed_response, text_response
 

@@ -463,6 +463,70 @@ class TestUsageCallback:
         assert partial_record(tmp_path)["usage"]["num_calls"] == 2
 
 
+class TestBeforeRequest:
+    def test_it_is_called_before_every_request(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        seen: list[int] = []
+
+        def before() -> None:
+            seen.append(len(fake_client.completions.calls))
+
+        fake_client.completions.parsed_responses = [parsed_response(parsed=Verdict(decision="go"))]
+        individual(team_member, tmp_path, num_rounds=1, before_request=before, output_schema=Verdict)
+
+        # Before each of the three turns and the structured output, with nothing sent yet each time
+        assert seen == [0, 1, 2, 3]
+
+    def test_it_is_called_before_each_tool_iteration(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        tool = Tool(
+            name="lookup",
+            description="Looks something up.",
+            parameters={"type": "object", "properties": {}},
+            function=lambda: "found it",
+        )
+        fake_client.completions.responses = [tool_call_response("lookup"), text_response("Done.")]
+        seen: list[int] = []
+
+        individual(team_member, tmp_path, tools=(tool,), before_request=lambda: seen.append(1))
+
+        assert len(seen) == 2
+
+    def test_raising_stops_the_meeting_before_the_request_and_keeps_what_it_did(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        class Enough(Exception):
+            pass
+
+        def stop_before_third() -> None:
+            if len(fake_client.completions.calls) == 2:
+                raise Enough
+
+        with pytest.raises(Enough):
+            individual(team_member, tmp_path, num_rounds=2, before_request=stop_before_third)
+
+        assert len(fake_client.completions.calls) == 2
+        assert partial_record(tmp_path)["usage"]["num_calls"] == 2
+
+    def test_the_meetings_own_limit_is_checked_first(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path
+    ) -> None:
+        seen: list[int] = []
+
+        with pytest.raises(BudgetExceededError):
+            individual(
+                team_member,
+                tmp_path,
+                num_rounds=2,
+                max_cost=ONE_RESPONSE * 1.5,
+                before_request=lambda: seen.append(1),
+            )
+
+        assert len(seen) == 2
+
+
 class TestTeamMeetingWithoutDiscussion:
     def test_team_lead_answers_the_agenda_alone(
         self, fake_client: FakeClient, team_lead: Agent, team_member: Agent, tmp_path

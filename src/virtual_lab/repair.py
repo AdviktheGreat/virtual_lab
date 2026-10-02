@@ -11,10 +11,12 @@ the number of them is capped and recorded rather than left to run until somethin
 """
 
 import json
+import math
 import platform
 import re
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,13 +36,14 @@ from virtual_lab.constants import (
     DEFAULT_MAX_RETRIES,
     EXECUTION_DIR_NAME,
     MAX_REPORTED_OUTPUT_CHARS,
+    PARTIAL_MEETING_DIR_NAME,
 )
 from virtual_lab.execution import ExecutionResult, Executor, run_files
 from virtual_lab.llm import resolve_chat_models
 from virtual_lab.prompts import code_repair_prompt
 from virtual_lab.provenance import describe_agent, utc_timestamp
 from virtual_lab.structured import StructuredOutputError, request_structured_output
-from virtual_lab.utils import MeetingUsage
+from virtual_lab.utils import BudgetExceededError, CostUnknownError, MeetingUsage, compute_token_cost
 
 # Parts of an error message that change between two runs of the same code. Kept to forms that
 # cannot be mistaken for content: a hexadecimal address, and a date and time together.
@@ -142,9 +145,35 @@ class RepairAttempt:
             "attempt": self.index,
             "succeeded": self.succeeded,
             "runs": [
-                {"filename": file.filename, **result.to_dict()} for file, result in self.results
+                {
+                    "filename": file.filename,
+                    "language": file.language,
+                    "description": file.description,
+                    "contents": file.contents,
+                    **result.to_dict(),
+                }
+                for file, result in self.results
             ],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RepairAttempt":
+        """Rebuilds an attempt from what to_dict returned."""
+        return cls(
+            index=data["attempt"],
+            results=tuple(
+                (
+                    CodeFile(
+                        filename=run["filename"],
+                        language=run["language"],
+                        description=run["description"],
+                        contents=run["contents"],
+                    ),
+                    ExecutionResult.from_dict(run),
+                )
+                for run in data["runs"]
+            ),
+        )
 
 
 @dataclass
@@ -156,6 +185,8 @@ class RepairOutcome:
     :param paths: The files written for the final attempt.
     :param stopped_early: Whether the loop gave up because an attempt reproduced the same error.
     :param usage: What the repair requests cost. Executions themselves cost nothing.
+    :param max_cost: The most the repair requests were allowed to cost, in USD, or None.
+    :param error: What stopped the loop partway, as its type and message, or None if nothing did.
     """
 
     artifacts: CodeArtifacts
@@ -166,6 +197,8 @@ class RepairOutcome:
     started_at: str = field(default_factory=utc_timestamp)
     ended_at: str | None = None
     elapsed_seconds: float | None = None
+    max_cost: float | None = None
+    error: dict[str, str] | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -237,6 +270,8 @@ class RepairOutcome:
             "num_attempts": self.num_attempts,
             "was_repaired": self.was_repaired,
             "stopped_early": self.stopped_early,
+            "error": self.error,
+            "max_cost": self.max_cost,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "elapsed_seconds": self.elapsed_seconds,
@@ -253,6 +288,27 @@ class RepairOutcome:
             ],
         }
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], paths: tuple[Path, ...] = ()) -> "RepairOutcome":
+        """Rebuilds an outcome from what to_dict returned, as save_execution_record wrote it.
+
+        :param data: The record.
+        :param paths: Where the final files were written, which the record does not hold.
+        :return: The outcome.
+        """
+        return cls(
+            artifacts=CodeArtifacts(files=[CodeFile(**file) for file in data["final_files"]]),
+            attempts=tuple(RepairAttempt.from_dict(attempt) for attempt in data["attempts"]),
+            paths=paths,
+            stopped_early=data["stopped_early"],
+            usage=MeetingUsage.from_dict(data["usage"]),
+            started_at=data["started_at"],
+            ended_at=data["ended_at"],
+            elapsed_seconds=data["elapsed_seconds"],
+            max_cost=data.get("max_cost"),
+            error=data.get("error"),
+        )
+
 
 def run_with_repair(
     artifacts: CodeArtifacts,
@@ -267,6 +323,10 @@ def run_with_repair(
     timeout: float | None = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
     chat_model: BaseChatModel | None = None,
+    max_cost: float | None = None,
+    on_usage: Callable[[MeetingUsage], None] | None = None,
+    before_request: Callable[[], None] | None = None,
+    max_completion_tokens: int | None = None,
 ) -> RepairOutcome:
     """Writes a meeting's code, runs it, and asks its author to fix it when it fails.
 
@@ -287,74 +347,134 @@ def run_with_repair(
     :param max_retries: Retries for failed API calls, used only if a chat model is built here.
     :param chat_model: The LangChain chat model to ask for repairs. With neither this nor a
         client, one is built with get_llm from the model's name.
-    :raises ValueError: If max_attempts is less than one.
+    :param max_cost: The most the repair requests may cost, in USD. It is checked before each
+        one, so it can be overrun by the cost of one request; max_completion_tokens bounds that.
+        The repair model must be priced for the limit to mean anything.
+    :param on_usage: Called with the repairs' usage so far after every repair request, so that a
+        caller can keep a running total. An exception it raises stops the loop.
+    :param before_request: Called before every repair request, once max_cost has been checked.
+        An exception it raises stops the loop before the request is sent.
+    :param max_completion_tokens: The most tokens any one repair may use, or None for the
+        model's own limit.
+    :raises ValueError: If max_attempts is less than one, or max_cost or max_completion_tokens
+        is not a limit.
+    :raises BudgetExceededError: Before a repair request, if the repairs have already cost
+        max_cost.
+    :raises CostUnknownError: If max_cost is given and the repair model's cost, or a response's
+        usage, cannot be known.
     :raises StructuredOutputError: If the author does not return usable corrected files.
+    :raises Exception: Whatever else stopped the loop. Every attempt run before it, and what the
+        repairs cost, are recorded under save_dir/partial/executions/ before it propagates.
     :return: What happened, whether or not the code was made to work.
     """
     if max_attempts < 1:
         raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
 
+    if max_cost is not None and not (math.isfinite(max_cost) and max_cost >= 0):
+        raise ValueError(f"max_cost must be a finite amount, zero or more, not {max_cost}")
+
+    if max_completion_tokens is not None and max_completion_tokens < 1:
+        raise ValueError(f"max_completion_tokens must be at least 1, not {max_completion_tokens}")
+
     repair_model = model or author.model
+
+    # An unpriced model would be free as far as the limit could tell
+    if max_cost is not None:
+        try:
+            compute_token_cost(repair_model, 0, 0)
+        except CostUnknownError as error:
+            raise CostUnknownError(f"{error}, so a max_cost cannot be enforced") from error
+
     llm = resolve_chat_models([repair_model], chat_models=chat_model, client=client, max_retries=max_retries)[
         repair_model
     ]
 
-    outcome = RepairOutcome(artifacts=artifacts)
+    outcome = RepairOutcome(artifacts=artifacts, max_cost=max_cost)
     attempts: list[RepairAttempt] = []
     current = artifacts
     directory = save_dir / ARTIFACT_DIR_NAME / save_name
     start_time = time.time()
 
-    for index in range(1, max_attempts + 1):
-        outcome.paths = save_artifacts(
-            save_dir=save_dir, save_name=save_name, artifacts=current
-        )
-        attempt = RepairAttempt(
-            index=index,
-            results=run_files(
-                directory=directory, files=current.files, executor=executor, timeout=timeout
-            ),
-        )
-        attempts.append(attempt)
+    def finish(error: BaseException | None) -> None:
+        outcome.artifacts = current
+        outcome.attempts = tuple(attempts)
+        outcome.ended_at = utc_timestamp()
+        outcome.elapsed_seconds = time.time() - start_time
+        if error is not None:
+            outcome.error = {"type": type(error).__name__, "message": str(error)}
 
-        if attempt.succeeded:
-            break
+    try:
+        for index in range(1, max_attempts + 1):
+            outcome.paths = save_artifacts(
+                save_dir=save_dir, save_name=save_name, artifacts=current
+            )
+            attempt = RepairAttempt(
+                index=index,
+                results=run_files(
+                    directory=directory, files=current.files, executor=executor, timeout=timeout
+                ),
+            )
+            attempts.append(attempt)
 
-        # Having spent the last attempt, there is no point paying for a correction nobody will run
-        if index == max_attempts:
-            break
-
-        if len(attempts) >= 2:
-            latest, previous = attempts[-1].failure, attempts[-2].failure
-            if (
-                latest is not None
-                and previous is not None
-                and failure_signature(latest) == failure_signature(previous)
-            ):
-                outcome.stopped_early = True
+            if attempt.succeeded:
                 break
 
-        failed_file, failed_result = attempt.failure  # type: ignore[misc]
-        current = merge_artifacts(
-            previous=current,
-            repaired=request_repair(
-                llm=llm,
-                author=author,
-                model=repair_model,
-                files=current.files,
-                filename=failed_file.filename,
-                report=failed_result.report(),
-                attempt=index,
-                max_attempts=max_attempts,
-                temperature=temperature,
-                usage=outcome.usage,
-            ),
-        )
+            # Having spent the last attempt, there is no point paying for a correction nobody will run
+            if index == max_attempts:
+                break
 
-    outcome.artifacts = current
-    outcome.attempts = tuple(attempts)
-    outcome.ended_at = utc_timestamp()
-    outcome.elapsed_seconds = time.time() - start_time
+            if len(attempts) >= 2:
+                latest, previous = attempts[-1].failure, attempts[-2].failure
+                if (
+                    latest is not None
+                    and previous is not None
+                    and failure_signature(latest) == failure_signature(previous)
+                ):
+                    outcome.stopped_early = True
+                    break
+
+            if max_cost is not None and (spent := outcome.usage.compute_cost()) >= max_cost:
+                raise BudgetExceededError(spent=spent, limit=max_cost, what="repair")
+
+            if before_request is not None:
+                before_request()
+
+            failed_file, failed_result = attempt.failure  # type: ignore[misc]
+            try:
+                repaired = request_repair(
+                    llm=llm,
+                    author=author,
+                    model=repair_model,
+                    files=current.files,
+                    filename=failed_file.filename,
+                    report=failed_result.report(),
+                    attempt=index,
+                    max_attempts=max_attempts,
+                    temperature=temperature,
+                    usage=outcome.usage,
+                    max_completion_tokens=max_completion_tokens,
+                )
+            finally:
+                # A request that failed may still have been paid for
+                if on_usage is not None:
+                    on_usage(outcome.usage)
+
+            current = merge_artifacts(previous=current, repaired=repaired)
+    # BaseException, so that a loop interrupted from the keyboard still records what it ran and
+    # what it spent, as a meeting does
+    except BaseException as error:
+        finish(error)
+        partial_dir = save_dir / PARTIAL_MEETING_DIR_NAME
+        try:
+            path = save_execution_record(
+                save_dir=partial_dir, save_name=save_name, outcome=outcome, author=author, executor=executor
+            )
+            print(f"Repair failed. What was run before the failure is recorded in {path}")
+        except Exception as save_error:
+            print(f"Warning: the record of the failed repair could not be saved: {save_error}")
+        raise
+
+    finish(None)
 
     return outcome
 
@@ -370,6 +490,7 @@ def request_repair(
     max_attempts: int,
     temperature: float,
     usage: MeetingUsage,
+    max_completion_tokens: int | None = None,
 ) -> CodeArtifacts:
     """Asks an agent to fix code of its own that failed.
 
@@ -386,6 +507,7 @@ def request_repair(
     :param max_attempts: The most attempts allowed.
     :param temperature: The sampling temperature.
     :param usage: The usage to add this call's cost to.
+    :param max_completion_tokens: The most tokens the answer may use, or None for no limit.
     :raises StructuredOutputError: If the agent does not return usable corrected files.
     :return: The files the agent returned, which may not include every original file.
     """
@@ -409,6 +531,7 @@ def request_repair(
             ],
             schema=CodeArtifacts,
             temperature=temperature,
+            max_completion_tokens=max_completion_tokens,
         )
     except StructuredOutputError as error:
         usage.add(model=model, usage=error.usage)

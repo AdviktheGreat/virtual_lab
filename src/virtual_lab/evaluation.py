@@ -28,23 +28,22 @@ from pydantic import BaseModel
 from tqdm import tqdm
 
 from virtual_lab.agent import Agent
-from virtual_lab.benchmarks import Benchmark, Question, write_atomically
+from virtual_lab.benchmarks import Benchmark, Question
 from virtual_lab.completions import check_temperature
 from virtual_lab.constants import DEFAULT_MAX_RETRIES, EXTRACTION_TEMPERATURE
 from virtual_lab.llm import ModelSource, resolve_chat_models
-from virtual_lab.provenance import describe_agent
-from virtual_lab.resources import Resources
+from virtual_lab.provenance import describe_agent, describe_value
 from virtual_lab.run_meeting import hold_meeting
 from virtual_lab.session import Session
 from virtual_lab.structured import StructuredOutputError, request_structured_output
-from virtual_lab.tools import Tool
 from virtual_lab.utils import (
     BudgetExceededError,
     CostUnknownError,
     MeetingUsage,
-    ModelUsage,
+    UsageTracker,
     check_context_length,
     compute_token_cost,
+    write_atomically,
 )
 
 # Biomni's words, from result_formatting in biomni/agent/a1.py at commit
@@ -102,42 +101,6 @@ class Attempt:
     transcript_path: Path | None = None
 
 
-def combine_usage(usages: Iterable[MeetingUsage]) -> MeetingUsage:
-    """Adds up the usage of several meetings, model by model."""
-    total = MeetingUsage()
-    for usage in usages:
-        for model, model_usage in usage.per_model.items():
-            into = total.per_model.setdefault(model, ModelUsage())
-            for usage_field in fields(ModelUsage):
-                mine, theirs = getattr(into, usage_field.name), getattr(model_usage, usage_field.name)
-                combined = max(mine, theirs) if usage_field.name == "max_input_tokens" else mine + theirs
-                setattr(into, usage_field.name, combined)
-
-    return total
-
-
-class UsageTracker:
-    """Keeps every meeting's usage, each counted once however often it is reported."""
-
-    def __init__(self) -> None:
-        self.usages: list[MeetingUsage] = []
-
-    def count(self, usage: MeetingUsage) -> None:
-        # A meeting reports the same, growing, usage after every response
-        if not any(usage is counted for counted in self.usages):
-            self.usages.append(usage)
-
-    def total(self) -> MeetingUsage:
-        return combine_usage(self.usages)
-
-    def cost(self) -> float:
-        """What it has all cost, in USD.
-
-        :raises CostUnknownError: If that cannot be worked out.
-        """
-        return self.total().compute_cost()
-
-
 @dataclass
 class SolverContext:
     """What a solver is given to answer a question with.
@@ -186,27 +149,6 @@ Solver = Callable[[Question, SolverContext], "Attempt | str"]
 def transcript_text(discussion: Sequence[dict[str, str]]) -> str:
     """A meeting's transcript as one text, turn after turn, as Biomni gives its agent's log."""
     return "\n\n".join(f"{turn['agent']}: {turn['message']}" for turn in discussion)
-
-
-def describe_value(value: Any) -> Any:
-    """Describes a meeting option in JSON, the same way each time it is described."""
-    if value is None or isinstance(value, bool | int | float | str):
-        return value
-    if isinstance(value, Agent):
-        return describe_agent(value)
-    if isinstance(value, Tool):
-        return value.name
-    if isinstance(value, Resources):
-        return {"resources": value.names()}
-    if isinstance(value, type):
-        return f"{value.__module__}.{value.__qualname__}"
-    if isinstance(value, list | tuple):
-        return [describe_value(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): describe_value(item) for key, item in value.items()}
-
-    # Not its repr, which can hold an address in memory and so differ from one run to the next
-    return f"{type(value).__module__}.{type(value).__qualname__}"
 
 
 def check_meeting_options(options: dict[str, Any]) -> None:

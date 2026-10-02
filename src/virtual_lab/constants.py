@@ -321,6 +321,11 @@ MAX_RECORDED_RETRIEVAL_CHARS = 2_000
 # meeting's record says which cells each turn ran; this holds their code and output.
 SESSION_LOG_DIR_NAME = "sessions"
 
+# A project's ledger of every step it took, in its directory, and the subdirectory its meetings
+# and repairs are saved in, each under the step's name.
+PROJECT_FILE_NAME = "project.json"
+PROJECT_MEETINGS_DIR_NAME = "meetings"
+
 # Identifies this library to the services it queries. NCBI and EMBL-EBI both ask clients to say
 # who they are, and an unidentified client is the first to be throttled.
 WEB_USER_AGENT = "virtual-lab (https://github.com/zou-group/virtual_lab)"

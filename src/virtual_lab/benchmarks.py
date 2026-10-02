@@ -21,7 +21,6 @@ import ast
 import hashlib
 import importlib
 import json
-import os
 import tempfile
 import zipfile
 from collections.abc import Iterable, Iterator, Sequence
@@ -40,6 +39,7 @@ from virtual_lab.constants import (
     BIOMNI_RELEASE_URL,
 )
 from virtual_lab.environment import fetch_file
+from virtual_lab.utils import write_atomically
 
 
 class BenchmarkError(ValueError):
@@ -83,18 +83,6 @@ class BenchmarkDownload:
     directory: Path
     downloaded: list[str] = field(default_factory=list)
     present: list[str] = field(default_factory=list)
-
-
-def write_atomically(path: Path, data: bytes) -> None:
-    """Writes a file under a temporary name and renames it into place, so it is never partial."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".part")
-    try:
-        with os.fdopen(handle, "wb") as file:
-            file.write(data)
-        os.replace(temporary, path)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
 
 
 def download_benchmarks(

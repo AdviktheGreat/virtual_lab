@@ -8,7 +8,7 @@ a sidecar file so that the transcript itself stays in the format existing reader
 import json
 import platform
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,8 @@ import openai
 from virtual_lab.__about__ import __version__
 from virtual_lab.agent import Agent
 from virtual_lab.constants import METADATA_DIR_NAME
+from virtual_lab.resources import Resources
+from virtual_lab.tools import Tool
 from virtual_lab.utils import MeetingUsage
 
 
@@ -41,6 +43,27 @@ def describe_agent(agent: Agent) -> dict[str, str]:
         "goal": agent.goal,
         "role": agent.role,
     }
+
+
+def describe_value(value: Any) -> Any:
+    """Describes a meeting option in JSON, the same way each time it is described."""
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, Agent):
+        return describe_agent(value)
+    if isinstance(value, Tool):
+        return value.name
+    if isinstance(value, Resources):
+        return {"resources": value.names()}
+    if isinstance(value, type):
+        return f"{value.__module__}.{value.__qualname__}"
+    if isinstance(value, list | tuple):
+        return [describe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): describe_value(item) for key, item in value.items()}
+
+    # Not its repr, which can hold an address in memory and so differ from one run to the next
+    return f"{type(value).__module__}.{type(value).__qualname__}"
 
 
 @dataclass
@@ -201,6 +224,21 @@ class MeetingRecord:
             "prices": self.prices,
             "turns": [turn.to_dict() for turn in self.turns],
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "MeetingRecord":
+        """Rebuilds a record from what to_dict returned, leaving out the versions it adds.
+
+        :param data: The record, as read back from its file.
+        :return: The record.
+        """
+        names = {item.name for item in fields(cls)} - {"turns"}
+        turn_names = {item.name for item in fields(TurnRecord)}
+
+        return cls(
+            **{name: value for name, value in data.items() if name in names},
+            turns=[TurnRecord(**{name: value for name, value in turn.items() if name in turn_names}) for turn in data.get("turns", [])],
+        )
 
 
 def save_record(save_dir: Path, save_name: str, record: MeetingRecord) -> Path:

@@ -82,6 +82,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError, ProjectStep
 from virtual_lab.records import DatabaseError, RecordNotFoundError
 from virtual_lab.repair import (
     RepairAttempt,
@@ -221,6 +222,10 @@ __all__ = [
     "PUBCHEM_LOOKUP_TOOL",
     "PUBMED_TOOL",
     "PredictedStructure",
+    "Project",
+    "ProjectBudgetExceededError",
+    "ProjectStateError",
+    "ProjectStep",
     "Preprint",
     "PreprintResults",
     "Protein",

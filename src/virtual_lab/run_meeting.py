@@ -145,6 +145,7 @@ def hold_meeting(
     chat_models: ModelSource | None = None,
     max_cost: float | None = None,
     on_usage: Callable[[MeetingUsage], None] | None = None,
+    before_request: Callable[[], None] | None = None,
     max_completion_tokens: int | None = None,
     session: Session | None = None,
     code_actions: Literal["tool", "tags"] = "tool",
@@ -192,6 +193,9 @@ def hold_meeting(
     :param on_usage: Called with the meeting's usage so far after every response, so that a
         caller can keep a running total across meetings. An exception it raises stops the
         meeting the way any other failure does.
+    :param before_request: Called before every request, once max_cost has been checked. An
+        exception it raises stops the meeting before the request is sent, the way any other
+        failure does, which lets a caller stop several meetings that share one budget.
     :param max_completion_tokens: The most tokens any one response may use, reasoning included,
         or None for the model's own limit.
     :param session: A session for the agents to run code in, shared by all of them, as in
@@ -349,13 +353,11 @@ def hold_meeting(
 
     def check_budget() -> None:
         """Stops the meeting before a request it has no money left for."""
-        if max_cost is None:
-            return
-
-        spent = usage.compute_cost()
-
-        if spent >= max_cost:
+        if max_cost is not None and (spent := usage.compute_cost()) >= max_cost:
             raise BudgetExceededError(spent=spent, limit=max_cost)
+
+        if before_request is not None:
+            before_request()
 
     def count_usage(model: str, reported, turn_usage: MeetingUsage) -> None:  # type: ignore[no-untyped-def]
         """Adds a response's usage to the meeting and the turn, and tells the caller."""
