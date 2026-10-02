@@ -26,6 +26,9 @@ class TestTokenize:
     def test_a_joined_word_is_kept_whole_and_in_its_parts(self) -> None:
         assert tokenize("KP.3 and SARS-CoV-2") == ["kp.3", "kp", "3", "sars-cov-2", "sars", "cov", "2"]
 
+    def test_letters_of_any_script_are_words(self) -> None:
+        assert tokenize("TNF-α, IL_1β") == ["tnf-α", "tnf", "α", "il", "1β"]
+
     def test_punctuation_around_a_word_is_not_part_of_it(self) -> None:
         assert tokenize("(KP.3).") == ["kp.3", "kp", "3"]
 

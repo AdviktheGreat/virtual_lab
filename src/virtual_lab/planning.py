@@ -226,7 +226,7 @@ class ProjectReport:
         lines += ["## Plan", "", *(f"- {marks[task['status']]} {task['task']}" for task in self.plan), ""]
 
         if self.findings:
-            lines += ["## Findings", "", *(f"- [{finding['id']}] {finding['claim']}" for finding in self.findings), ""]
+            lines += ["## Findings", "", *(f"- [{finding['id']}] {' '.join(finding['claim'].split())}" for finding in self.findings), ""]
 
         lines += ["## Rounds", "", "| Round | Decision | Outcome |", "| --- | --- | --- |"]
         for round_ in self.rounds:

@@ -769,6 +769,21 @@ class TestMemory:
         assert [finding["id"] for finding in saved["findings"]] == ["F1", "F2"]
         assert json.loads((tmp_path / "research_log.json").read_text())["memory"] == "pick"
 
+    def test_a_claim_over_several_lines_is_one_item_of_the_reports_list(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1"),
+            decide("individual_meeting", participants=["Immunologist"], agenda="Measure them."),
+            found("A binds\n\nweakly."),
+        )
+
+        report = run(tmp_path, max_rounds=1)
+
+        assert "- [F1] A binds weakly.\n" in report.to_markdown()
+
     def test_before_any_findings_the_team_lead_is_told_there_are_none(
         self, fake_client: FakeClient, tmp_path: Path
     ) -> None:

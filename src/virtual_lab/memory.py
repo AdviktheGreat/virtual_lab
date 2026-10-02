@@ -92,7 +92,8 @@ def tokenize(text: str) -> list[str]:
     parts, so that it matches itself more strongly than it matches anything sharing one part.
     """
     words = []
-    for word in re.findall(r"[a-z0-9]+(?:[.\-][a-z0-9]+)*", text.lower()):
+    # Letters of any script count, so that TNF-α and TNF-β are told apart
+    for word in re.findall(r"[^\W_]+(?:[.\-][^\W_]+)*", text.lower()):
         parts = re.split(r"[.\-]", word)
         words += [word, *parts] if len(parts) > 1 else [word]
 
@@ -102,8 +103,9 @@ def tokenize(text: str) -> list[str]:
 def bm25_scores(query: str, documents: list[str]) -> list[float]:
     """How well each document matches the query, by Okapi BM25.
 
-    The inverse document frequency is BM25+'s, which stays positive, so a term found in most
-    documents still counts for a little rather than counting against them.
+    The inverse document frequency is Lucene's, log(1 + (N - n + 0.5) / (n + 0.5)), which stays
+    positive, so a term found in most documents still counts for a little rather than counting
+    against them.
     """
     tokenized = [tokenize(document) for document in documents]
     if not tokenized:
