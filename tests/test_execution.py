@@ -281,7 +281,17 @@ class TestExecutionResult:
 
         assert restored["command"] == ["docker", "run"]
         assert restored["succeeded"] is True
-        assert restored["duration"] == 1.234 or restored["duration"] == 1.235
+        assert restored["duration"] == 1.2345
+
+    def test_a_rebuilt_result_reports_what_the_result_did(self) -> None:
+        import json
+
+        # Rounded once to save and again to report, 0.0499 would report as 0.1 seconds
+        result = ExecutionResult(command=("python",), exit_code=0, stdout="", stderr="", duration=0.0499)
+        rebuilt = ExecutionResult.from_dict(json.loads(json.dumps(result.to_dict())))
+
+        assert rebuilt == result
+        assert rebuilt.report() == result.report()
 
 
 class TestDockerUnavailable:

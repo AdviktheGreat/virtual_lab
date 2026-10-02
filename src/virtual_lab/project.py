@@ -42,8 +42,10 @@ from virtual_lab.execution import Executor
 from virtual_lab.llm import ModelSource, resolve_chat_models
 from virtual_lab.provenance import MeetingRecord, describe_value, utc_timestamp
 from virtual_lab.repair import RepairOutcome, describe_executor, run_with_repair, save_execution_record
+from virtual_lab.resources import Resources
 from virtual_lab.run_meeting import MeetingResult, hold_meeting
 from virtual_lab.session import Session
+from virtual_lab.tools import Tool
 from virtual_lab.utils import BudgetExceededError, CostUnknownError, MeetingUsage, write_atomically
 
 SAFE_NAME = re.compile(r"[A-Za-z0-9_.-]+")
@@ -142,6 +144,19 @@ def describe_input(name: str, value: Any) -> Any:
         return value.model_dump(mode="json")
     if name == "executor":
         return describe_executor(value)
+    # A record names tools and resources, but what the agents are told of them is what counts
+    if isinstance(value, Tool):
+        function = value.function
+        return {
+            "name": value.name,
+            "description": value.description,
+            "parameters": describe_value(value.parameters),
+            "function": f"{getattr(function, '__module__', None)}.{getattr(function, '__qualname__', type(function).__qualname__)}",
+        }
+    if isinstance(value, Resources):
+        return describe_value(asdict(value))
+    if isinstance(value, list | tuple):
+        return [describe_input(name, item) for item in value]
 
     return describe_value(value)
 
