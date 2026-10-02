@@ -82,6 +82,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.planning import NextStep, PlanTask, ProjectReport, ProjectRound, ResearchPlan, Review, run_project
 from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError, ProjectStep
 from virtual_lab.records import DatabaseError, RecordNotFoundError
 from virtual_lab.repair import (
@@ -218,12 +219,16 @@ __all__ = [
     "LocalExecutor",
     "LocalSession",
     "MeetingResult",
+    "NextStep",
     "PDB_LOOKUP_TOOL",
     "PUBCHEM_LOOKUP_TOOL",
     "PUBMED_TOOL",
+    "PlanTask",
     "PredictedStructure",
     "Project",
     "ProjectBudgetExceededError",
+    "ProjectReport",
+    "ProjectRound",
     "ProjectStateError",
     "ProjectStep",
     "Preprint",
@@ -234,9 +239,11 @@ __all__ = [
     "RecordNotFoundError",
     "RepairAttempt",
     "RepairOutcome",
+    "ResearchPlan",
     "Resource",
     "Resources",
     "ResponseTooLargeError",
+    "Review",
     "SANDBOX_LIBRARIES",
     "SANDBOX_PLATFORM",
     "SearchHits",
@@ -290,6 +297,7 @@ __all__ = [
     "run_benchmark",
     "run_files",
     "run_meeting",
+    "run_project",
     "run_with_repair",
     "sandbox_image",
     "save_artifacts",

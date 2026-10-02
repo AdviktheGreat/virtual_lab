@@ -326,6 +326,12 @@ SESSION_LOG_DIR_NAME = "sessions"
 PROJECT_FILE_NAME = "project.json"
 PROJECT_MEETINGS_DIR_NAME = "meetings"
 
+# What a project run to its goal records of each round, and the report it ends with, in the
+# project's directory
+RESEARCH_LOG_FILE_NAME = "research_log.json"
+REPORT_FILE_NAME = "report.json"
+REPORT_MARKDOWN_FILE_NAME = "report.md"
+
 # Identifies this library to the services it queries. NCBI and EMBL-EBI both ask clients to say
 # who they are, and an unidentified client is the first to be throttled.
 WEB_USER_AGENT = "virtual-lab (https://github.com/zou-group/virtual_lab)"
