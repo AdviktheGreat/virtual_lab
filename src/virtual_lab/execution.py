@@ -218,7 +218,8 @@ class ExecutionResult:
             "exit_code": self.exit_code,
             "succeeded": self.succeeded,
             "timed_out": self.timed_out,
-            "duration": round(self.duration, 3),
+            # Unrounded, so a result rebuilt from its record reports what the result did
+            "duration": self.duration,
             "sandboxed": self.sandboxed,
             "produced_files": list(self.produced_files),
             "stdout": self.stdout,
@@ -227,7 +228,7 @@ class ExecutionResult:
 
     @classmethod
     def from_dict(cls, data: dict) -> "ExecutionResult":
-        """Rebuilds a result from what to_dict returned, with its duration as rounded there."""
+        """Rebuilds a result from what to_dict returned."""
         return cls(
             command=tuple(data["command"]),
             exit_code=data["exit_code"],

@@ -3,6 +3,7 @@
 import json
 import math
 import threading
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +13,11 @@ from pydantic import BaseModel
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile
 from virtual_lab.execution import LocalExecutor
-from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError
+from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError, fingerprint_inputs
 from virtual_lab.provenance import MeetingRecord
+from virtual_lab.resources import KnowHow, Resources
+from virtual_lab.run_meeting import hold_meeting
+from virtual_lab.tools import Tool, inspect_data_file, show_data_files
 from virtual_lab.utils import BudgetExceededError, CostUnknownError, MeetingUsage, compute_token_cost
 
 from conftest import TEST_MODEL, FakeClient, parsed_response, text_response
@@ -457,6 +461,40 @@ class TestResuming:
 
         with pytest.raises(ProjectStateError, match="team_member"):
             ask(Project(tmp_path, GOAL), team_member.with_model("gpt-4o-mini"))
+
+    def test_a_tool_described_differently_is_another_input(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
+    ) -> None:
+        def lookup(query: str) -> str:
+            return query
+
+        def tool(description: str) -> Tool:
+            return Tool(name="lookup", description=description, parameters={"type": "object"}, function=lookup)
+
+        ask(Project(tmp_path, GOAL), team_member, tools=(tool("Looks a gene up."),))
+        ask(Project(tmp_path, GOAL), team_member, tools=(tool("Looks a gene up."),))
+        assert len(fake_client.completions.calls) == 1
+
+        with pytest.raises(ProjectStateError, match="tools"):
+            ask(Project(tmp_path, GOAL), team_member, tools=(tool("Looks a protein up."),))
+
+    def test_a_tool_is_compared_by_the_function_a_partial_wraps_not_what_it_binds(self, tmp_path: Path) -> None:
+        def fingerprint(function: Any) -> dict[str, str]:
+            tool = Tool(name="t", description="Does it.", parameters={"type": "object"}, function=function)
+            return fingerprint_inputs(hold_meeting, {"tools": (tool,)})
+
+        assert fingerprint(partial(show_data_files, tmp_path / "a")) == fingerprint(partial(show_data_files, tmp_path / "b"))
+        assert fingerprint(partial(show_data_files, tmp_path)) != fingerprint(partial(inspect_data_file, tmp_path))
+
+    def test_resources_with_other_contents_are_another_input(self) -> None:
+        def resources(content: str) -> Resources:
+            return Resources(know_how=(KnowHow("guide", "A Guide", "How to.", content),))
+
+        def fingerprint(given: Resources) -> dict[str, str]:
+            return fingerprint_inputs(hold_meeting, {"resources": given})
+
+        assert fingerprint(resources("Do this.")) == fingerprint(resources("Do this."))
+        assert fingerprint(resources("Do this.")) != fingerprint(resources("Do that."))
 
     def test_a_schema_that_changed_is_another_input(
         self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
