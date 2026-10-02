@@ -9,6 +9,7 @@ import pytest
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile
 from virtual_lab.execution import LocalExecutor
+from virtual_lab.memory import Finding, Findings
 from virtual_lab.planning import NextStep, PlanTask, ResearchPlan, Review, run_project
 from virtual_lab.project import Project, ProjectStateError
 from virtual_lab.prompts import PRINCIPAL_INVESTIGATOR, SCIENTIFIC_CRITIC
@@ -54,6 +55,7 @@ def step(action: str, done: int = 0, **fields: Any) -> NextStep:
         "participants": [],
         "agenda": "",
         "agenda_questions": [],
+        "findings": [],
         "add_members": [],
         "remove_members": [],
         "answer": "",
@@ -63,6 +65,10 @@ def step(action: str, done: int = 0, **fields: Any) -> NextStep:
 
 def decide(action: str, done: int = 0, **fields: Any) -> Any:
     return parsed_response(parsed=step(action, done, **fields))
+
+
+def found(*claims: str) -> Any:
+    return parsed_response(parsed=Findings(findings=[Finding(claim=claim, evidence=f"Shown for {claim}") for claim in claims]))
 
 
 def review(met: bool, *objections: str) -> Any:
@@ -106,7 +112,9 @@ class TestRun:
             roster("Immunologist"),
             plan("Task 1", "Task 2"),
             decide("team_meeting", participants=["Immunologist"], agenda="Compare the binding data."),
+            found(),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Check the affinities."),
+            found(),
             decide("finish", done=2, answer="Nanobody A binds better."),
             review(True),
         )
@@ -147,6 +155,7 @@ class TestRun:
             roster("Immunologist"),
             plan("Task 1", "Task 2"),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Check the affinities."),
+            found(),
             decide("finish", done=2, answer="A."),
             review(True),
         )
@@ -215,6 +224,7 @@ class TestDecisions:
             plan("Task 1", "Task 2"),
             decide("individual_meeting", participants=["Virologist"], agenda="Check it."),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Check it."),
+            found(),
             decide("finish", done=2, answer="A."),
             review(True),
         )
@@ -284,6 +294,7 @@ class TestDecisions:
             decide("finish", done=1, answer="A, probably."),
             review(False, "No affinity was measured."),
             decide("individual_meeting", done=2, participants=["Immunologist"], agenda="Measure the affinity."),
+            found(),
             decide("finish", done=2, answer="A, at 2 nM."),
             review(True),
         )
@@ -308,6 +319,7 @@ class TestDecisions:
             plan("Task 1", "Task 2"),
             decide("change_team", add_members=[spec("Virologist")], remove_members=["chemist"], rationale="Need virology."),
             decide("individual_meeting", done=1, participants=["Virologist"], agenda="Check escape."),
+            found(),
             decide("finish", done=2, answer="A."),
             review(True),
         )
@@ -330,14 +342,15 @@ class TestDecisions:
             plan("Task 1", "Task 2"),
             decide("write_code", done=1, participants=["Immunologist"], agenda="Compare the affinities."),
             code("print('A binds at 2 nM')"),
+            found(),
             decide("finish", done=2, answer="A."),
             review(True),
         )
 
         report = run(tmp_path, executor=LocalExecutor(warn=False))
 
-        assert report.rounds[0].steps == ["round_01_code", "round_01_run"]
-        assert ledger(tmp_path)[3:5] == ["round_01_code", "round_01_run"]
+        assert report.rounds[0].steps == ["round_01_code", "round_01_run", "round_01_findings"]
+        assert ledger(tmp_path)[3:6] == ["round_01_code", "round_01_run", "round_01_findings"]
         decision = calls_mentioning(fake_client, "This is round 2 of the project")[0]
         assert "A binds at 2 nM" in sent(decision)
         assert "The code ran successfully" in sent(decision)
@@ -361,7 +374,9 @@ class TestStopping:
             roster("Immunologist"),
             plan("Task 1", "Task 2"),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            found(),
             decide("individual_meeting", done=2, participants=["Immunologist"], agenda="Two."),
+            found(),
         )
 
         report = run(tmp_path, max_rounds=2)
@@ -376,7 +391,9 @@ class TestStopping:
             roster("Immunologist"),
             plan("Task 1", "Task 2"),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            found(),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Two."),
+            found(),
             decide("finish", done=1, answer="A."),
             review(False, "Task 2 is not done."),
         )
@@ -417,7 +434,13 @@ class TestStopping:
     def test_a_run_that_fails_leaves_no_report_and_says_why_in_its_log(
         self, fake_client: FakeClient, tmp_path: Path
     ) -> None:
-        queue(fake_client, roster("Immunologist"), plan("Task 1"), decide("individual_meeting", participants=["Immunologist"], agenda="One."))
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1"),
+            decide("individual_meeting", participants=["Immunologist"], agenda="One."),
+            found(),
+        )
         assert run(tmp_path, max_rounds=1).status == "out_of_rounds"
         assert (tmp_path / "report.md").is_file()
 
@@ -439,6 +462,7 @@ class TestApproval:
             roster("Immunologist"),
             plan("Task 1"),
             decide("individual_meeting", participants=["Immunologist"], agenda="Guess."),
+            found(),
             decide("finish", done=1, answer="A."),
             review(True),
         )
@@ -507,6 +531,7 @@ class TestResuming:
             roster("Immunologist"),
             plan("Task 1", "Task 2"),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            found(),
         )
         assert run(tmp_path, max_rounds=1).status == "out_of_rounds"
         calls = len(fake_client.completions.calls)
@@ -529,7 +554,7 @@ class TestResuming:
         team = ()
         assert run(tmp_path, project=Project(tmp_path, GOAL, max_cost=7.5 * CALL_COST), team=team).status == "out_of_budget"
 
-        queue(fake_client, decide("finish", done=1, answer="A."), review(True))
+        queue(fake_client, found(), decide("finish", done=1, answer="A."), review(True))
         report = run(tmp_path, project=Project(tmp_path, GOAL, max_cost=100 * CALL_COST), team=team)
 
         assert report.status == "finished"
@@ -541,6 +566,7 @@ class TestResuming:
             roster("Immunologist"),
             plan("Task 1"),
             decide("individual_meeting", participants=["Immunologist"], agenda="Guess."),
+            found(),
         )
         changed = lambda number, decision: decision.model_copy(update={"agenda": "Measure instead."})  # noqa: E731
         run(tmp_path, max_rounds=1, approve=changed)
@@ -584,7 +610,7 @@ class TestResuming:
             asked.append(number)
             return decision
 
-        queue(fake_client, decide("finish", done=1, answer="A."), review(True))
+        queue(fake_client, found(), decide("finish", done=1, answer="A."), review(True))
         report = run(tmp_path, approve=approve)
 
         assert asked == [2]
@@ -596,6 +622,7 @@ class TestResuming:
             roster("Immunologist"),
             plan("Task 1"),
             decide("individual_meeting", participants=["Immunologist"], agenda="Guess."),
+            found(),
         )
         run(tmp_path, max_rounds=1)
         log_path = tmp_path / "research_log.json"
@@ -621,7 +648,9 @@ class TestResuming:
             roster("Immunologist"),
             plan("Task 1", "Task 2"),
             decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            found(),
             decide("individual_meeting", done=2, participants=["Immunologist"], agenda="Two."),
+            found(),
         )
         changed = lambda number, decision: decision.model_copy(update={"agenda": f"{decision.agenda} Carefully."})  # noqa: E731
         run(tmp_path, max_rounds=2, approve=changed)
@@ -641,6 +670,7 @@ class TestResuming:
             roster("Immunologist"),
             plan("Task 1"),
             decide("individual_meeting", participants=["Immunologist"], agenda="One."),
+            found(),
         )
         run(tmp_path, max_rounds=1)
 
@@ -701,3 +731,257 @@ class TestArguments:
     def test_an_unknown_repair_option_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(TypeError, match="bogus"):
             run(tmp_path, repair_options={"bogus": 1})
+
+
+def work_calls(fake_client: FakeClient, agenda: str) -> list[str]:
+    """What the step with this agenda was sent, the team lead's decisions aside."""
+    return [sent(call) for call in calls_mentioning(fake_client, agenda) if "This is round" not in sent(call)]
+
+
+class TestMemory:
+    def test_what_a_meeting_finds_is_kept_and_listed_for_the_team_lead(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Measure them."),
+            found("A binds at 2 nM.", " ", "B binds at 9 nM."),
+            decide("finish", done=2, answer="A.", findings=["F1", "f2"]),
+            review(True),
+        )
+
+        report = run(tmp_path)
+
+        assert report.rounds[0].found == ["F1", "F2"]
+        assert report.rounds[1].findings == ["F1", "F2"]
+        assert [(finding["id"], finding["claim"], finding["source"], finding["round"]) for finding in report.findings] == [
+            ("F1", "A binds at 2 nM.", "round_01_meeting", 1),
+            ("F2", "B binds at 9 nM.", "round_01_meeting", 1),
+        ]
+        decision = sent(calls_mentioning(fake_client, "This is round 2 of the project")[0])
+        assert "[F1] A binds at 2 nM.\n[F2] B binds at 9 nM." in decision
+        assert "Findings: F1, F2" in decision
+        assert "name the ones the step needs" in decision
+        assert "- [F1] A binds at 2 nM." in report.to_markdown()
+        saved = json.loads((tmp_path / "memory.json").read_text())
+        assert [finding["id"] for finding in saved["findings"]] == ["F1", "F2"]
+        assert json.loads((tmp_path / "research_log.json").read_text())["memory"] == "pick"
+
+    def test_before_any_findings_the_team_lead_is_told_there_are_none(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(fake_client, roster("Immunologist"), plan("Task 1"), decide("finish", answer="A."), review(True))
+
+        run(tmp_path)
+
+        decision = sent(calls_mentioning(fake_client, "This is round 1 of the project")[0])
+        assert "no findings yet" in decision
+        assert "listed above by id" not in decision
+        assert "findings so far" not in decision
+
+    def test_a_step_is_given_the_findings_the_team_lead_names_and_no_others(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Measure them."),
+            found("A binds at 2 nM.", "B binds at 9 nM."),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Explain the gap.", findings=["F2"]),
+            found(),
+            decide("finish", done=2, answer="A.", findings=["F1"]),
+            review(True),
+        )
+
+        report = run(tmp_path)
+
+        meeting = work_calls(fake_client, "Explain the gap.")
+        assert meeting
+        assert all("[F2] B binds at 9 nM.\n\nEvidence: Shown for B binds at 9 nM." in text for text in meeting)
+        assert not any("A binds at 2 nM." in text for text in meeting)
+        # Nor is it given the summary of the meeting before it, which its findings stand in for
+        assert not any("Immunologist worked on: Measure them." in text for text in meeting)
+        assert report.rounds[1].findings == ["F2"]
+
+        review_call = sent(calls_mentioning(fake_client, "proposes to end the project")[0])
+        assert "[F1] A binds at 2 nM.\n\nEvidence:" in review_call
+        assert "[F2] B binds at 9 nM.\n\nEvidence:" not in review_call
+        # The critic is still shown every finding by its claim
+        assert "[F2] B binds at 9 nM.\n" in review_call
+
+    def test_the_team_lead_is_told_of_earlier_work_by_its_findings_and_the_latest_in_full(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            found("A binds."),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Two."),
+            found(),
+            decide("finish", done=2, answer="A."),
+            review(True),
+        )
+
+        run(tmp_path)
+
+        second = sent(calls_mentioning(fake_client, "This is round 2 of the project")[0])
+        third = sent(calls_mentioning(fake_client, "This is round 3 of the project")[0])
+        assert "Immunologist worked on: One.\n\nA response.\n\nFindings: F1" in second
+        assert "Immunologist worked on: One.\n\nFindings: F1" in third
+        assert "Immunologist worked on: Two.\n\nA response.\n\nFindings: none" in third
+
+    def test_a_finding_id_that_was_never_made_is_refused(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1"),
+            decide("individual_meeting", participants=["Immunologist"], agenda="Measure them."),
+            found("A binds."),
+            decide("finish", done=1, answer="A.", findings=["F1", "F9"]),
+        )
+
+        report = run(tmp_path, max_rounds=2)
+
+        assert report.rounds[1].outcome == "invalid"
+        assert report.rounds[1].note == "No finding has the id F9. The findings: F1."
+
+    def test_a_change_to_the_team_needs_no_findings(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1"),
+            decide("change_team", add_members=[spec("Chemist")], findings=["F9"]),
+        )
+
+        report = run(tmp_path, max_rounds=1)
+
+        assert report.rounds[0].outcome == "done"
+
+    def test_code_that_was_run_is_turned_into_findings_by_its_author(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("write_code", done=1, participants=["Immunologist"], agenda="Compare the affinities."),
+            code("print('A binds at 2 nM')"),
+            found("A binds at 2 nM, as the comparison printed."),
+            decide("finish", done=2, answer="A.", findings=["F1"]),
+            review(True),
+        )
+
+        report = run(tmp_path, executor=LocalExecutor(warn=False))
+
+        stated = sent(calls_mentioning(fake_client, "The code you wrote for this agenda was run")[0])
+        assert "Compare the affinities." in stated and "A binds at 2 nM" in stated
+        assert report.rounds[0].found == ["F1"]
+        assert report.findings[0]["source"] == "round_01_findings"
+        assert "round_01_findings" in ledger(tmp_path)
+
+    def test_with_bm25_a_step_is_given_the_findings_that_match_its_agenda(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Measure them."),
+            found("Nanobody A escapes KP.3.", "Nanobody B is soluble.", "KP.3 escape is common."),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Why the KP.3 escape?"),
+            found(),
+            decide("finish", done=2, answer="A, and B is soluble."),
+            review(True),
+        )
+
+        report = run(tmp_path, memory="bm25", findings_per_step=1)
+
+        meeting = work_calls(fake_client, "Why the KP.3 escape?")
+        assert meeting and all("[F3] KP.3 escape is common.\n\nEvidence:" in text for text in meeting)
+        assert not any("\n\nEvidence: Shown for Nanobody A" in text for text in meeting)
+        assert report.rounds[1].findings == ["F3"]
+        # A finish is matched by its answer
+        assert report.rounds[2].findings == ["F2"]
+        assert "Leave findings empty" in sent(calls_mentioning(fake_client, "This is round 1 of the project")[0])
+
+    def test_with_bm25_named_findings_are_not_checked(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        queue(fake_client, roster("Immunologist"), plan("Task 1"), decide("finish", answer="A.", findings=["F9"]), review(True))
+
+        assert run(tmp_path, memory="bm25").status == "finished"
+
+    def test_with_summaries_each_step_is_given_every_summary_and_no_findings_are_kept(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("write_code", done=1, participants=["Immunologist"], agenda="Compare the affinities."),
+            code("print('A binds at 2 nM')"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Explain it."),
+            decide("finish", done=2, answer="A.", findings=["F9"]),
+            review(True),
+        )
+
+        report = run(tmp_path, memory="summaries", executor=LocalExecutor(warn=False))
+
+        assert report.status == "finished"
+        assert report.rounds[0].steps == ["round_01_code", "round_01_run"]
+        assert report.findings == []
+        meeting = work_calls(fake_client, "Explain it.")
+        assert meeting and all("A binds at 2 nM" in text and "The plan the team made" in text for text in meeting)
+        assert not calls_mentioning(fake_client, "findings")
+        assert json.loads((tmp_path / "memory.json").read_text()) == {"findings": []}
+
+    def test_a_project_carried_on_remembers_what_it_found(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1", "Task 2"),
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="One."),
+            found("A binds.", "B binds."),
+        )
+        assert run(tmp_path, max_rounds=1).status == "out_of_rounds"
+
+        queue(
+            fake_client,
+            decide("individual_meeting", done=1, participants=["Immunologist"], agenda="Two.", findings=["F2"]),
+            found("C binds."),
+            decide("finish", done=2, answer="A.", findings=["F3"]),
+            review(True),
+        )
+        report = run(tmp_path, max_rounds=3)
+
+        assert report.status == "finished"
+        assert [finding["id"] for finding in report.findings] == ["F1", "F2", "F3"]
+        assert all("[F2] B binds.\n\nEvidence:" in text for text in work_calls(fake_client, "Two."))
+
+    def test_a_project_carried_on_with_another_memory_is_refused(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(
+            fake_client,
+            roster("Immunologist"),
+            plan("Task 1"),
+            decide("individual_meeting", participants=["Immunologist"], agenda="One."),
+            found("A binds."),
+        )
+        run(tmp_path, max_rounds=1)
+
+        with pytest.raises(ProjectStateError):
+            run(tmp_path, max_rounds=1, memory="summaries")
+
+
+class TestMemoryArguments:
+    def test_an_unknown_memory_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="memory must be"):
+            run(tmp_path, memory="everything")
+
+    def test_findings_per_step_below_one_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="findings_per_step"):
+            run(tmp_path, findings_per_step=0)
