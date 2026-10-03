@@ -379,6 +379,24 @@ class TestCheckInstalled:
         # Looking for xml.dom would have imported xml
         assert "xml.dom" not in sys.modules
 
+    def test_what_is_in_the_working_directory_is_not_software(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        # As in a session, whose working directory is first on the path
+        (tmp_path / "output_folder_xyz").mkdir()
+        (tmp_path / "package_xyz").mkdir()
+        (tmp_path / "package_xyz" / "__init__.py").write_text("")
+        (tmp_path / "script_xyz.py").write_text("")
+        monkeypatch.chdir(tmp_path)
+        # Through a link, as the same directory can be reached by another path
+        (tmp_path.parent / f"{tmp_path.name}-link").symlink_to(tmp_path)
+        monkeypatch.syspath_prepend(str(tmp_path.parent / f"{tmp_path.name}-link"))
+
+        report_installed(["output_folder_xyz", "package_xyz", "script_xyz", "_pytest", "sys"], {}, [], 60)
+
+        found = json.loads(capsys.readouterr().out.strip()[len(INSTALLED_MARKER) :])
+        assert found["libraries"] == ["_pytest", "sys"]
+
     def test_with_no_modules_none_are_imported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
@@ -399,6 +417,14 @@ class TestCheckInstalled:
 
         assert check_installed(session, ["mine"], [], what="the software added to it") is None
         assert "could not check which of the software added to it the session has" in capsys.readouterr().out
+
+    def test_a_folder_the_code_made_is_not_software_in_the_session(self, tmp_path: Path) -> None:
+        with LocalSession(tmp_path / "work", warn=False) as session:
+            session.run("import os\nos.makedirs('fastqc_xyz')")
+
+            checked = check_installed(session, ["fastqc_xyz", "pytest"], [])
+
+        assert checked == ({"fastqc_xyz"}, {})
 
     def test_the_marker_is_the_one_printed(self) -> None:
         # The function's source runs in the session, where it cannot see this module's constant

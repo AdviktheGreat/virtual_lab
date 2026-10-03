@@ -257,6 +257,7 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
     """
     import importlib.util
     import json
+    import os
     import re
     import shutil
     import subprocess
@@ -274,9 +275,18 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
         if not name.isidentifier():
             return False
         try:
-            return importlib.util.find_spec(name) is not None
+            spec = importlib.util.find_spec(name)
         except (ImportError, ValueError):
             return False
+        # The working directory is on the path, so a directory there, such as the output folder
+        # of the program being looked for, is found as a namespace package, and a file there as
+        # a module. Neither is the software.
+        if spec is None or spec.origin is None:
+            return False
+        if spec.origin in ("built-in", "frozen"):
+            return True
+        here = os.path.realpath(os.getcwd())
+        return not os.path.realpath(spec.origin).startswith(here + os.sep)
 
     r_packages: set[str] | None = set()
     if shutil.which("Rscript"):
