@@ -83,6 +83,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.mcp_tools import MCPServerError, MCPToolError, MCPTools, connect_mcp
 from virtual_lab.memory import Finding, Findings, LabMemory, MemoryEntry
 from virtual_lab.planning import NextStep, PlanTask, ProjectReport, ProjectRound, ResearchPlan, Review, run_project
 from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError, ProjectStep
@@ -224,6 +225,9 @@ __all__ = [
     "LabMemory",
     "LocalExecutor",
     "LocalSession",
+    "MCPServerError",
+    "MCPToolError",
+    "MCPTools",
     "MeetingResult",
     "MemoryEntry",
     "NextStep",
@@ -280,6 +284,7 @@ __all__ = [
     "biomni_tools",
     "build_sandbox_image",
     "commercial_data_lake",
+    "connect_mcp",
     "data_file_tools",
     "describe_table",
     "detect_source",

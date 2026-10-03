@@ -50,6 +50,8 @@ cd virtual_lab
 pip install -e .
 ```
 
+Tools from MCP servers need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`.
+
 
 ## Models and API keys
 
@@ -535,6 +537,43 @@ Biomni lists a file it was given by its name alone, and leaves the agent to find
 Software is not installed for you: it must be in the image, or in the `python` a `LocalSession` runs. A meeting first looks for each piece in the session, as a Python distribution, a module Python can find, an R package, or a command. Anything it cannot find is warned about and noted in the record as `software_not_found`, and the agents are still told of it, but as not found, since a name can differ from anything the check looks for.
 
 The data and software are listed after the session's own tools, ahead of Biomni's resources, as added for this work and to be preferred, as Biomni lists what is added to its agent. Changing them changes the inputs of every project step held with the session. Data counts by name and description, not by where it is on your machine or what the files hold, so a project resumed with different contents under the same name does not notice the change.
+
+### Tools from MCP servers
+
+`connect_mcp` makes tools of the tools of [MCP](https://modelcontextprotocol.io) servers, as Biomni's `add_mcp` does, from the same YAML config, or from the JSON config that Claude Desktop, Claude Code, Cursor, and others write. It needs the MCP SDK: `pip install "virtual-lab[mcp]"`.
+
+```yaml
+mcp_servers:                      # or mcpServers, as Claude Desktop's config has it
+  genes:                          # started here, and spoken to over its stdin and stdout
+    command: ["python", "-m", "gene_server"]
+    env: {GENE_API_KEY: "${GENE_API_KEY}"}
+  search:                         # reached at a URL, over streamable HTTP
+    url: "https://search.example.org/mcp"
+    headers: {Authorization: "Bearer ${SEARCH_TOKEN}"}
+```
+
+```python
+from virtual_lab import connect_mcp
+
+with connect_mcp("mcp_config.yaml") as mcp:
+    hold_meeting(..., tools=mcp.tools)                   # the agents call them as tools
+    with DockerSession(Path("results/session"), tools=mcp.tools) as session:
+        hold_meeting(..., session=session)               # or code in the session calls them
+```
+
+Each tool is named after its server and itself, `genes_lookup` for the tool `lookup` of the server `genes`, so that two servers' tools never share a name, with anything other than letters, digits, and `_` made `_`, so that code can call it. Its description and parameters are the ones the server gives it, and the server checks the arguments. `mcp.servers["genes"]` holds one server's tools.
+
+A command is a list of the program and its arguments, as Biomni's config has it, or a program with its `args`, as Claude's has it. A server started here gets `env` as its environment, with a few variables of this process, such as `PATH` and `HOME`, and not the rest, so an API key reaches only the servers given it; `cwd` is where it starts. A server at a URL gets `headers` with every request, and one whose `type` is `sse`, or whose URL ends in `/sse`, is spoken to over the older SSE transport. `${NAME}` anywhere in these is replaced with the environment variable `NAME`, and `${NAME:-default}` with the default where it is not set. Errors, and what a server wrote to stderr, show `${NAME}` where its value would be, so a key in a URL or a header is not repeated in a traceback; what a tool returns is left as it is. A server with `enabled: false` or `disabled: true` is left out, and `connect_mcp(config, servers=["genes"])` connects to only the servers named. `tools: [lookup, search]` offers only those of a server's tools; an entry in Biomni's form, with `biomni_name` and `description`, gives that tool its description, and the parameters it lists are not used, since the server declares them.
+
+Biomni starts a server again for every call to one of its tools, over stdio only, and returns the first piece of whatever the tool returned, an error included. Here:
+
+- **A server is started once**, and kept running until the tools are closed, so what it loads stays loaded, and calls to it run at the same time. Any left open are closed when Python exits.
+- **What a tool returns is given back whole.** Where the server gives a structured result, that is what code receives, such as a dict, and otherwise its text. An image, a recording, or a file in it is described, since none can be shown as text. A model is shown either as text.
+- **A failure is a failure.** A tool the server says failed raises `MCPToolError` with what the server said, which the agent is told as an error, and can correct its call from. A call that takes longer than `timeout`, 300 seconds unless given, raises `TimeoutError`, and the server is kept.
+- **A server that stops is started again**, or connected to again, at the next call to one of its tools, with a warning, since whatever it held is gone. Only a call that was running when it stopped fails, raising `MCPServerError`.
+- **A config that cannot work fails at once.** A variable that is not set is an error, rather than an empty value, and so is a server that does not start, or a tool asked for that a server does not have. What a server writes to stderr is kept out of the way, and its end is shown when the server fails. Where one server fails, those already started are stopped again.
+
+A server's tools run wherever the server does: one started here runs on your machine, with your permissions, on arguments a model chose, even when the code calling it is in a sandbox, so give a session only the servers you would let that code use. Changing a server's tools, or what it says of them, changes the inputs of every project step held with them.
 
 ### What these services will tell you that is not true
 
