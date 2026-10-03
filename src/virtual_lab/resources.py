@@ -279,14 +279,17 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
         except (ImportError, ValueError):
             return False
         # The working directory is on the path, so a directory there, such as the output folder
-        # of the program being looked for, is found as a namespace package, and a file there as
-        # a module. Neither is the software.
+        # of the program being looked for, is found as a namespace package, and a file or
+        # package there as a module. Neither is the software. What is installed further down,
+        # as in a virtual environment kept in the working directory, is.
         if spec is None or spec.origin is None:
             return False
         if spec.origin in ("built-in", "frozen"):
             return True
-        here = os.path.realpath(os.getcwd())
-        return not os.path.realpath(spec.origin).startswith(here + os.sep)
+        found_in = os.path.dirname(spec.origin)
+        if spec.submodule_search_locations is not None:
+            found_in = os.path.dirname(found_in)
+        return os.path.realpath(found_in) != os.path.realpath(os.getcwd())
 
     r_packages: set[str] | None = set()
     if shutil.which("Rscript"):
