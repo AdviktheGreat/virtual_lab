@@ -503,6 +503,30 @@ class TestResuming:
         assert fingerprint(tool("Looks a gene up.")) != fingerprint(tool("Looks a protein up."))
         assert fingerprint(tool("Looks a gene up.")) != fingerprint()
 
+    def test_a_sessions_data_and_software_are_part_of_the_input_by_name_and_description(
+        self, tmp_path: Path
+    ) -> None:
+        from virtual_lab.session import LocalSession
+
+        for place in ("here", "there"):
+            (tmp_path / place).mkdir()
+            (tmp_path / place / "counts.csv").write_text(place)
+
+        def fingerprint(**added: object) -> dict[str, str]:
+            session = LocalSession(tmp_path / "work", warn=False, **added)  # type: ignore[arg-type]
+            return fingerprint_inputs(hold_meeting, {"session": session})
+
+        here = fingerprint(data={tmp_path / "here" / "counts.csv": "Counts."})
+        # Where the data is on this machine is not what the agents are told
+        assert here == fingerprint(data={tmp_path / "there" / "counts.csv": "Counts."})
+        assert here != fingerprint(data={tmp_path / "here" / "counts.csv": "Other counts."})
+        assert here != fingerprint(data={tmp_path / "here": "Counts."})
+        assert here != fingerprint()
+        software = fingerprint(software={"pydeseq2": "Differential expression."})
+        assert software != fingerprint(software={"pydeseq2": "Something else."})
+        assert software != fingerprint()
+        assert software != here
+
     def test_resources_with_other_contents_are_another_input(self) -> None:
         def resources(content: str) -> Resources:
             return Resources(know_how=(KnowHow("guide", "A Guide", "How to.", content),))

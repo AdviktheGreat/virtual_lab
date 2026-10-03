@@ -423,6 +423,7 @@ class DockerExecutor:
         command: Sequence[str],
         container_name: str,
         interactive: bool = False,
+        mounts: Sequence[tuple[Path, str]] = (),
     ) -> tuple[str, ...]:
         """Builds the docker command that runs code under every restriction this class applies.
 
@@ -431,7 +432,10 @@ class DockerExecutor:
         :param container_name: The name to give the container, so a timeout can kill it.
         :param interactive: Whether to keep the container's standard input open, for a
             session that is sent code as it goes rather than given a command to finish.
-        :raises ExecutionError: If the directory's path cannot be passed to --mount intact.
+        :param mounts: Further host files or directories for the code to read, each with where
+            to mount it, read-only; see mount_arguments.
+        :raises ExecutionError: If the directory's path cannot be passed to --mount intact, or a
+            mount cannot be made.
         :return: The full command, as an argument list.
         """
         check_mountable(directory, "Save the meeting under another directory.")
@@ -453,6 +457,7 @@ class DockerExecutor:
             "--mount",
             f"type=bind,source={directory},target={SANDBOX_WORK_DIR}",
             *self.data_lake_arguments(directory),
+            *self.mount_arguments(directory, mounts),
             *(["--platform", self.platform] if self.platform is not None else []),
             "--workdir",
             SANDBOX_WORK_DIR,
@@ -525,6 +530,33 @@ class DockerExecutor:
             "--env",
             f"BIOMNI_DATA_LAKE={SANDBOX_DATA_LAKE_DIR}",
         ]
+
+    def mount_arguments(self, directory: Path, mounts: Sequence[tuple[Path, str]]) -> list[str]:
+        """The read-only mounts that give code further files or directories.
+
+        :param directory: The host directory mounted as the working directory.
+        :param mounts: Each host path, with where to mount it.
+        :raises ExecutionError: If a path is missing, cannot be mounted, or overlaps the working
+            directory.
+        """
+        work = Path(directory).resolve()
+        arguments = []
+        for path, target in mounts:
+            source = Path(path).resolve()
+            if not source.exists():
+                raise ExecutionError(f"{source}, given to the code to read, is not there any more")
+            check_mountable(source, "Move it under another directory.")
+            check_mountable(Path(target), "Give it another name.")
+            # Inside the working directory it would be writable through that mount after all,
+            # and around it, everything else in the directory containing it would be visible
+            if source.is_relative_to(work) or work.is_relative_to(source):
+                raise ExecutionError(
+                    f"{source}, given to the code to read, overlaps the directory code runs in, {work}. "
+                    "Keep what the code reads outside the session's directory, and the session outside it."
+                )
+            arguments += ["--mount", f"type=bind,source={source},target={target},readonly"]
+
+        return arguments
 
     def biomni_arguments(self) -> list[str]:
         """The mount and variables that let code import Biomni's tools, if asked for.

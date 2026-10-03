@@ -251,7 +251,11 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
     nothing outside itself and imports only the standard library. The modules are imported in a
     process of their own: importing all of Biomni's holds most of a gigabyte that the analysis
     may never need. A part of the check that cannot be done is reported as None.
+
+    A piece of software is installed if it is a Python distribution, a module Python can find,
+    an R package, or a command, under its name or, for a command, an alias.
     """
+    import importlib.util
     import json
     import re
     import shutil
@@ -263,6 +267,16 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
         return re.sub(r"[-_.]+", "-", name).lower()
 
     distributions = {normalized(d.metadata["Name"]) for d in metadata.distributions() if d.metadata["Name"]}
+
+    def importable(name: str) -> bool:
+        # Only a top-level name is looked for: finding a.b would import a, in the analysis's
+        # interpreter
+        if not name.isidentifier():
+            return False
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):
+            return False
 
     r_packages: set[str] | None = set()
     if shutil.which("Rscript"):
@@ -283,6 +297,7 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
             name
             for name in libraries
             if normalized(name) in distributions
+            or importable(name)
             or name in r_packages
             or any(shutil.which(command) for command in [name, name.lower(), *commands.get(name, [])])
         ]
@@ -299,21 +314,24 @@ def report_installed(libraries: list[str], commands: dict[str, list[str]], modul
         f"print({marker!r} + json.dumps(failed))\n"
     )
     failed = None
-    try:
-        imported = subprocess.run(
-            [sys.executable, "-c", script, *modules], capture_output=True, text=True, timeout=timeout
-        )
-        lines = [line for line in imported.stdout.splitlines() if line.startswith(marker)]
-        if lines:
-            failed = json.loads(lines[-1][len(marker) :])
-    except (OSError, subprocess.SubprocessError, ValueError):
-        failed = None
+    if not modules:
+        failed = {}
+    else:
+        try:
+            imported = subprocess.run(
+                [sys.executable, "-c", script, *modules], capture_output=True, text=True, timeout=timeout
+            )
+            lines = [line for line in imported.stdout.splitlines() if line.startswith(marker)]
+            if lines:
+                failed = json.loads(lines[-1][len(marker) :])
+        except (OSError, subprocess.SubprocessError, ValueError):
+            failed = None
 
     print("VIRTUAL_LAB_INSTALLED " + json.dumps({"libraries": installed, "failed_modules": failed}))
 
 
 def check_installed(
-    session: Any, libraries: list[str], modules: list[str]
+    session: Any, libraries: list[str], modules: list[str], what: str = "Biomni's software and tools"
 ) -> tuple[set[str], dict[str, str]] | None:
     """Finds which of Biomni's software a session has, and which of its tool modules import.
 
@@ -324,6 +342,7 @@ def check_installed(
     :param session: The session, which is started if it is not running.
     :param libraries: The software to look for, by the names Biomni gives it.
     :param modules: The tool modules to import, such as biomni.tool.genomics.
+    :param what: What is being looked for, for the warning if it cannot be.
     :return: The software that is missing, and each module that fails to import with its error;
         or None, with a warning, if the check could not be done.
     """
@@ -354,8 +373,7 @@ def check_installed(
     ):
         detail = result.error or "it did not report what it found"
         print(
-            f"Warning: could not check which of Biomni's software and tools the session has, so all "
-            f"of them are listed: {detail}"
+            f"Warning: could not check which of {what} the session has, so all of them are listed: {detail}"
         )
         return None
 

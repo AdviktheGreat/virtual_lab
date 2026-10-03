@@ -362,6 +362,44 @@ class TestCheckInstalled:
             after = session.run("print(kept, 'report_installed' in globals())")
             assert after.output.strip() == "42 False"
 
+    def test_finds_modules_by_name_without_importing_anything(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        import types
+
+        # A module whose spec cannot be read makes find_spec raise rather than answer
+        monkeypatch.setitem(sys.modules, "spec_less_xyz", types.ModuleType("spec_less_xyz"))
+        monkeypatch.delitem(sys.modules, "xml.dom", raising=False)
+
+        report_installed(["_pytest", "xml.dom", "spec_less_xyz", "not_a_real_module_xyz"], {}, [], 60)
+
+        found = json.loads(capsys.readouterr().out.strip()[len(INSTALLED_MARKER) :])
+        # _pytest is no distribution's name, only a module's
+        assert found["libraries"] == ["_pytest"]
+        # Looking for xml.dom would have imported xml
+        assert "xml.dom" not in sys.modules
+
+    def test_with_no_modules_none_are_imported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        import subprocess
+
+        ran: list[object] = []
+        monkeypatch.setenv("PATH", str(tmp_path))
+        monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: ran.append(args))
+
+        report_installed(["pytest"], {}, [], 60)
+
+        found = json.loads(capsys.readouterr().out.strip()[len(INSTALLED_MARKER) :])
+        assert found == {"libraries": ["pytest"], "failed_modules": {}}
+        assert ran == []
+
+    def test_a_check_that_fails_says_what_it_was_for(self, capsys: pytest.CaptureFixture) -> None:
+        session = FakeSession(report=reported("nothing\n"))
+
+        assert check_installed(session, ["mine"], [], what="the software added to it") is None
+        assert "could not check which of the software added to it the session has" in capsys.readouterr().out
+
     def test_the_marker_is_the_one_printed(self) -> None:
         # The function's source runs in the session, where it cannot see this module's constant
         assert repr(INSTALLED_MARKER)[1:-1] in inspect.getsource(report_installed)

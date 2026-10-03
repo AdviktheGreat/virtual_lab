@@ -231,6 +231,9 @@ SANDBOX_BIOMNI_PATH = "/biomni_data"
 # from biomni.tool.genomics import ...
 SANDBOX_BIOMNI_PACKAGE_DIR = "/opt/biomni_package"
 
+# Where the data given to a session is mounted in the sandbox, read-only, each under its file name
+SANDBOX_USER_DATA_DIR = "/data"
+
 # Where the meeting's files are mounted inside the container. Model-authored code sees only
 # this directory, so paths it writes into its own output are relative to here.
 SANDBOX_WORK_DIR = "/workspace"

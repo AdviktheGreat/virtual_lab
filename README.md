@@ -516,6 +516,26 @@ with DockerSession(Path("results/session"), tools=(tool,)) as session:
 
 The function runs on your machine, outside the container. When code in the sandbox calls it, the call comes out over the session's own connection as JSON, the function runs here, and what it returns goes back the same way. A tool can therefore use what the sandbox does not have: the network when the session has none, an API key the sandbox is never given, a GPU, a licensed program, or files outside the session's directory. That is also the risk: a tool can do whatever the function does, with your permissions, on arguments that code written by a model chose. Give a session only tools you would let that code call. Arguments and results are JSON. NumPy arrays, sets, and paths are converted, and anything else is refused with advice to convert it or pass a file instead. A failure in the tool raises `HostToolError` in the code. A call counts towards the time limit of the code that made it: code stopped at its limit while a tool runs keeps its session, and the tool is left to finish, its result unused. Each call is recorded with the cell that made it: the tool, its arguments, how it ended, and how long it took. The tools are listed to a meeting's agents ahead of Biomni's resources, as functions added for this work that they should prefer, again as Biomni lists the tools added to its agent. Changing a session's tools changes the inputs of every project step held with it. R and bash code cannot call them, and a tool cannot run code in the session whose code called it.
 
+### Your own data and software
+
+A session can also be given data and software of your own, in the form Biomni's `add_data` and `add_software` take them: a dict of each path, or each name, with what it is.
+
+```python
+with DockerSession(
+    Path("results/session"),
+    data={"inputs/counts.csv": "Read counts per gene and sample, from the 2024 RNA-seq run.",
+          "inputs/images": "Microscopy of the knockout lines, one TIFF per field."},
+    software={"pydeseq2": "Differential expression, a Python port of DESeq2."},
+) as session:
+    hold_meeting(..., session=session)
+```
+
+Biomni lists a file it was given by its name alone, and leaves the agent to find it. Here each file or directory is mounted read-only in the container at `/data/` and its name, `/data/counts.csv` and `/data/images` above, and the agents are told that path. A `LocalSession` reads the data where it is, and tells the agents that path instead. The data must exist when the session is made, no two pieces may share a file name, and in a `DockerSession` none may be in the session's directory, where code could change it, or hold it.
+
+Software is not installed for you: it must be in the image, or in the `python` a `LocalSession` runs. A meeting first looks for each piece in the session, as a Python distribution, a module Python can find, an R package, or a command. Anything it cannot find is warned about and noted in the record as `software_not_found`, and the agents are still told of it, but as not found, since a name can differ from anything the check looks for.
+
+The data and software are listed after the session's own tools, ahead of Biomni's resources, as added for this work and to be preferred, as Biomni lists what is added to its agent. Changing them changes the inputs of every project step held with the session. Data counts by name and description, not by where it is on your machine or what the files hold, so a project resumed with different contents under the same name does not notice the change.
+
 ### What these services will tell you that is not true
 
 Each lookup refuses a particular confident wrong answer, because every one of these arrives as a successful response rather than as an error:

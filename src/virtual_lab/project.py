@@ -161,13 +161,20 @@ def describe_input(name: str, value: Any) -> Any:
     if isinstance(value, Resources):
         return describe_value(asdict(value))
     # Which session it is, and where it runs, can differ from one run to the next; the tools its
-    # code can call are part of what the agents are told. A session without any is described as
-    # it was before sessions had tools, so that a project's earlier steps still match.
-    if isinstance(value, Session) and value.tools:
-        return {
+    # code can call, and the data and software added to it, are part of what the agents are told.
+    # Data is described by name, not by where it is on this machine. A session without any of
+    # them is described as it was before sessions had them, so that a project's earlier steps
+    # still match.
+    if isinstance(value, Session) and (value.tools or value.data or value.software):
+        described: dict[str, Any] = {
             "session": f"{type(value).__module__}.{type(value).__qualname__}",
             "tools": [describe_input(name, tool) for tool in value.tools],
         }
+        if value.data:
+            described["data"] = [{"name": item.name, "description": item.description} for item in value.data]
+        if value.software:
+            described["software"] = dict(value.software)
+        return described
     if isinstance(value, list | tuple):
         return [describe_input(name, item) for item in value]
 

@@ -48,12 +48,13 @@ from virtual_lab.records import truncate_text
 from virtual_lab.resources import (
     Resources,
     available_resources,
+    check_installed,
     parse_retrieval,
     resources_prompt,
     retrieval_prompt,
     select_resources,
 )
-from virtual_lab.session import CODE_TOOL_NAME, Session, session_tool, session_tools_prompt
+from virtual_lab.session import CODE_TOOL_NAME, Session, own_resources_prompt, session_tool
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
@@ -203,7 +204,9 @@ def hold_meeting(
     :param session: A session for the agents to run code in, shared by all of them, as in
         DockerSession or LocalSession. It is started before the first request and left running
         afterwards, so that the next meeting can use what this one computed; close it when done.
-        The session's own tools, which its code can call, are listed to the agents in full.
+        The session's own tools, which its code can call, and its own data and software, are
+        listed to the agents first and in full; its software is looked for in it first, and
+        any not found is warned of, and marked as such to the agents.
         The code the meeting ran, and what came of it, is saved under save_dir/sessions/.
     :param code_actions: How the agents run code in the session: "tool" to call the run_code
         tool, or "tags" to write it between <execute> and </execute> in their replies, as
@@ -399,9 +402,20 @@ def hold_meeting(
     # run code for an earlier meeting; only what this one runs is its own.
     first_cell = 0
     catalog: Resources | None = None
+    software_not_found: list[str] | None = None
     if session is not None:
         session.start()
         first_cell = len(session.history)
+        if session.software:
+            checked = check_installed(session, list(session.software), [], what="the software added to it")
+            if checked is not None:
+                software_not_found = [name for name in session.software if name in checked[0]]
+                if software_not_found:
+                    print(
+                        f"Warning: the session does not have {', '.join(software_not_found)}: not as a "
+                        "Python distribution or module, an R package, or a command. The agents are "
+                        "told of it anyway, as not found."
+                    )
         if isinstance(resources, Resources):
             catalog = resources
             if catalog.data_lake and catalog.data_lake_path is None:
@@ -485,6 +499,7 @@ def hold_meeting(
                 "code_actions": code_actions,
                 "cells_run": len(session.history) - first_cell,
                 "log": log.relative_to(directory).as_posix(),
+                **({"software_not_found": software_not_found} if session.software else {}),
             }
         except Exception as error:
             print(f"Warning: the log of the code this meeting ran could not be saved: {error}")
@@ -515,8 +530,8 @@ def hold_meeting(
                 network=session.can_reach_network(),
                 data_lake=session.data_lake_path(),
             )
-            if own_tools := session_tools_prompt(session.tools):
-                session_prompt = f"{session_prompt}\n\n{own_tools}"
+            if own := own_resources_prompt(session, software_not_found or ()):
+                session_prompt = f"{session_prompt}\n\n{own}"
             retrieved = record.resources is not None and bool((record.resources["retrieval"] or {}).get("understood"))
             if selected is not None and (listed := resources_prompt(selected, code_actions, retrieved=retrieved)):
                 session_prompt = f"{session_prompt}\n\n{listed}"
