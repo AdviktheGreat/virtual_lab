@@ -260,6 +260,16 @@ def innermost(function: Callable[..., Any]) -> Callable[..., Any]:
     return function
 
 
+def bound_keywords(function: Callable[..., Any]) -> set[str]:
+    """The arguments that a functools.partial, or partials of partials, binds by name."""
+    names: set[str] = set()
+    while isinstance(function, functools.partial):
+        names.update(function.keywords)
+        function = function.func
+
+    return names
+
+
 def what_is_called(function: Callable[..., Any]) -> Any:
     """What runs when the callable is called: itself, a class's __init__, or an object's __call__."""
     target = innermost(function)
@@ -403,6 +413,12 @@ def tool_from_function(
     except (TypeError, ValueError) as error:
         raise TypeError(f"Cannot read the parameters of {tool_name}: {error}") from error
 
+    # A partial's signature keeps what it binds by name as parameters defaulting to the bound
+    # values, which are the partial's to give, so neither a model nor code may see or replace them
+    bound = bound_keywords(function)
+    signature = signature.replace(
+        parameters=[parameter for parameter in signature.parameters.values() if parameter.name not in bound]
+    )
     hints = type_hints(function, tool_name)
     parameters = [
         parameter

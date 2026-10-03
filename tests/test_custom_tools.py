@@ -200,6 +200,29 @@ class TestSchema:
         assert tool.parameters["required"] == ["query"]
         assert tool.name == "spread"
 
+    def test_arguments_bound_by_name_are_left_out_and_cannot_be_replaced(self) -> None:
+        seen = []
+
+        def search(query: str, workdir: str, limit: int = 5) -> str:
+            """Search.
+
+            :param query: What to look for.
+            :param workdir: Where to look.
+            :param limit: How many to find.
+            """
+            seen.append((query, workdir, limit))
+            return "found"
+
+        tool = tool_from_function(partial(partial(search, workdir="/secret"), limit=3))
+
+        assert list(tool.parameters["properties"]) == ["query"]
+        assert tool.parameters["required"] == ["query"]
+        assert "/secret" not in json.dumps(tool.parameters)
+        assert tool.function(query="cells") == "found"
+        with pytest.raises(ValueError, match="workdir"):
+            tool.function(query="cells", workdir="/other")
+        assert seen == [("cells", "/secret", 3)]
+
     def test_a_default_that_is_not_json_is_left_out_of_the_schema(self) -> None:
         marker = object()
 
