@@ -12,7 +12,9 @@ DockerExecutor applies; LocalSession runs it on this machine with none of them.
 
 A session can be given tools, which code in it calls like any function, but which run here,
 outside the sandbox, the way Biomni's agent calls the tools added to it. The code's call comes
-back over the same pipe as its output, the tool is run, and what it returns is sent back.
+back over the same pipe as its output, the tool is run, and what it returns is sent back. It can
+be given data and software too, as Biomni's agent is with add_data and add_software, and the
+agents are told of all three first.
 """
 
 import json
@@ -26,7 +28,7 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -51,6 +53,7 @@ from virtual_lab.constants import (
     SANDBOX_DATA_LAKE_DIR,
     SANDBOX_IMAGE_NAME,
     SANDBOX_PLATFORM,
+    SANDBOX_USER_DATA_DIR,
     SANDBOX_WORK_DIR,
     SESSION_CLOSE_TIMEOUT,
     SESSION_GRACE_SECONDS,
@@ -68,6 +71,7 @@ from virtual_lab.execution import (
 )
 from virtual_lab.records import truncate_text
 from virtual_lab.repair import describe_executor
+from virtual_lab.resources import format_item_with_description
 from virtual_lab.tools import Tool
 
 KERNEL_SOURCE = (files("virtual_lab") / "kernel.py").read_text(encoding="utf-8")
@@ -216,6 +220,85 @@ def check_session_tools(tools: Iterable[Tool]) -> tuple[Tool, ...]:
     return checked
 
 
+@dataclass(frozen=True)
+class SessionData:
+    """A file or directory given to a session's code to read.
+
+    :param name: Its file name, as it was given, which it is found by.
+    :param source: Where it is on this machine, with any symbolic link followed.
+    :param description: What it is, as the agents are told.
+    """
+
+    name: str
+    source: Path
+    description: str
+
+
+def check_description(description: Any, what: str) -> str:
+    if not isinstance(description, str):
+        raise TypeError(f"What {what} is must be said in a str, not {type(description).__name__}")
+    if not description.strip():
+        raise ValueError(f"Say what {what} is: its description is empty")
+
+    return description.strip()
+
+
+def check_session_data(data: Mapping[str | os.PathLike[str], str] | None) -> tuple[SessionData, ...]:
+    """Reads a session's data as Biomni's add_data takes it: each path, with what is there."""
+    if data is None:
+        return ()
+    if not isinstance(data, Mapping):
+        raise TypeError(
+            "A session's data is a dict of each file or directory's path to what it is, such as "
+            f"{{'expression.csv': 'Gene expression of ...'}}, not {type(data).__name__}"
+        )
+
+    checked = []
+    for path, description in data.items():
+        if not isinstance(path, str | os.PathLike):
+            raise TypeError(f"A session's data is given by its path, not {type(path).__name__}")
+        # Named as it was given, so that a link called latest.csv is found as latest.csv, not
+        # under the name of the file it points to
+        given = Path(os.path.abspath(Path(path).expanduser()))
+        source = given.resolve()
+        if not source.exists():
+            raise FileNotFoundError(f"The session's data {str(path)!r} is not there: {source} does not exist")
+        if not given.name:
+            raise ValueError(f"{given} cannot be a session's data: give the files or directories in it instead")
+        checked.append(SessionData(given.name, source, check_description(description, f"the data {given}")))
+
+    names = [item.name for item in checked]
+    if repeated := sorted({name for name in names if names.count(name) > 1}):
+        raise ValueError(
+            f"A session's data is found by its file name, and {', '.join(repeated)} names more than one of "
+            "it: give each a name of its own, or the directories holding them instead"
+        )
+
+    return tuple(checked)
+
+
+def check_session_software(software: Mapping[str, str] | None) -> dict[str, str]:
+    """Reads a session's software as Biomni's add_software takes it: each name, with what it does."""
+    if software is None:
+        return {}
+    if not isinstance(software, Mapping):
+        raise TypeError(
+            "A session's software is a dict of each library or program's name to what it does, such as "
+            f"{{'pydeseq2': 'Differential expression with DESeq2'}}, not {type(software).__name__}"
+        )
+
+    checked = {}
+    for name, description in software.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"A session's software is given by its name, not {name!r}")
+        checked[name.strip()] = check_description(description, f"the software {name.strip()}")
+
+    if len(checked) < len(software):
+        raise ValueError("A session's software is given twice under the same name")
+
+    return checked
+
+
 def call_parameters(tool: Tool) -> list[dict[str, Any]]:
     """How code calls a tool: its parameters in the order its schema lists them.
 
@@ -314,6 +397,48 @@ def session_tools_prompt(tools: tuple[Tool, ...]) -> str:
     )
 
 
+def own_resources_prompt(session: "Session", software_not_found: Iterable[str] = ()) -> str:
+    """Tells a meeting what was added to its session for this work: tools, data, and software.
+
+    They are listed before Biomni's resources, as Biomni lists what is added to its agent under
+    its priority custom resources. Unlike Biomni, which lists a file it was given by name alone,
+    each piece of data is listed by the path the code reads it at.
+
+    :param session: The session.
+    :param software_not_found: Software the session was found not to have, which is listed
+        anyway, since it was added, but marked as not found.
+    :return: The prompt, or an empty string if nothing was added.
+    """
+    sections = [session_tools_prompt(session.tools)] if session.tools else []
+
+    if session.data:
+        changed = " but not change" if session.sandboxed else ""
+        items = "\n".join(
+            format_item_with_description(session.data_path(item), item.description) for item in session.data
+        )
+        sections.append(
+            f"- Data added for this work, which the session's code can read{changed}. Prefer it to "
+            "other data where it fits. Each is listed by the path code reads it at, with what it is.\n"
+            f"----\n{items}\n----"
+        )
+
+    if session.software:
+        missing = set(software_not_found)
+        items = "\n".join(
+            format_item_with_description(
+                name, f"{description} (not found in the session: check that it is there before relying on it)"
+                if name in missing else description
+            )
+            for name, description in session.software.items()
+        )
+        sections.append(
+            "- Software added for this work, for the session's code to use. Prefer it where it fits. "
+            f"Each is listed with what it does.\n----\n{items}\n----"
+        )
+
+    return "\n\n".join(sections)
+
+
 def jsonable(value: Any) -> Any:
     """Converts what a tool returned to JSON's types, writing out what JSON has none for as text."""
     try:
@@ -347,6 +472,12 @@ class Session:
         import, which run here rather than in the session; see tool_from_function. A call
         takes up the time of the code that made it, and one still running when that code
         stops at its limit is left to finish, its result unused.
+    :param data: Files and directories for the code to read, each by its path here, with what
+        it is, as Biomni's add_data takes them: {"counts.csv": "Read counts of ..."}. Each is
+        found by its file name, so no two may share one.
+    :param software: Libraries and programs the code can use, each by its name, with what it
+        does, as Biomni's add_software takes them. They must be installed where the code runs;
+        a meeting checks that they are, and warns of any it cannot find.
     """
 
     sandboxed = True
@@ -357,8 +488,12 @@ class Session:
         timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         start_timeout: float = SESSION_START_TIMEOUT,
         tools: Iterable[Tool] = (),
+        data: Mapping[str | os.PathLike[str], str] | None = None,
+        software: Mapping[str, str] | None = None,
     ) -> None:
         self.tools = check_session_tools(tools)
+        self.data = check_session_data(data)
+        self.software = check_session_software(software)
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
@@ -744,11 +879,25 @@ class Session:
             "starts": self.starts,
             "cells": len(self.history),
             "tools": [tool.name for tool in self.tools],
+            "data": [
+                {
+                    "name": item.name,
+                    "source": str(item.source),
+                    "path": self.data_path(item),
+                    "description": item.description,
+                }
+                for item in self.data
+            ],
+            "software": dict(self.software),
         }
 
     def where_code_runs(self) -> str:
         """The working directory as the code sees it."""
         return str(self.directory)
+
+    def data_path(self, item: SessionData) -> str:
+        """Where a piece of the session's data is, as the code sees it."""
+        return str(item.source)
 
     def can_reach_network(self) -> bool:
         """Whether the code can reach the internet."""
@@ -835,6 +984,10 @@ class DockerSession(Session):
     :param start_timeout: Seconds to wait for the interpreter to start.
     :param tools: Tools for code in the session to call, which run here, outside the container,
         with this machine's network, files, and keys; see Session.
+    :param data: Files and directories for the code to read, as Session takes them, each
+        mounted read-only at /data/ and its file name. None may be in the
+        session's directory, where the code could change it, or hold it.
+    :param software: Software installed in the image, for the code to use; see Session.
     """
 
     def __init__(
@@ -844,6 +997,8 @@ class DockerSession(Session):
         timeout: float | None = None,
         start_timeout: float = SESSION_START_TIMEOUT,
         tools: Iterable[Tool] = (),
+        data: Mapping[str | os.PathLike[str], str] | None = None,
+        software: Mapping[str, str] | None = None,
     ) -> None:
         self.executor = executor if executor is not None else session_executor()
         super().__init__(
@@ -851,7 +1006,15 @@ class DockerSession(Session):
             timeout=self.executor.timeout if timeout is None else timeout,
             start_timeout=start_timeout,
             tools=tools,
+            data=data,
+            software=software,
         )
+        # Refused now rather than when the session first starts, in the middle of a meeting
+        self.executor.mount_arguments(self.directory, self.mounts())
+
+    def mounts(self) -> list[tuple[Path, str]]:
+        """The session's data, each with where it is mounted."""
+        return [(item.source, self.data_path(item)) for item in self.data]
 
     def spawn(self) -> tuple[list[str], dict[str, Any], Callable[[subprocess.Popen], None]]:
         self.executor.check_available()
@@ -873,6 +1036,7 @@ class DockerSession(Session):
             command=("python3", "-u", "-c", KERNEL_SOURCE),
             container_name=name,
             interactive=True,
+            mounts=self.mounts(),
         )
 
         kill = self.executor.kill
@@ -885,6 +1049,9 @@ class DockerSession(Session):
 
     def where_code_runs(self) -> str:
         return SANDBOX_WORK_DIR
+
+    def data_path(self, item: SessionData) -> str:
+        return f"{SANDBOX_USER_DATA_DIR}/{item.name}"
 
     def can_reach_network(self) -> bool:
         return self.executor.allow_network
@@ -921,6 +1088,8 @@ class LocalSession(Session):
     :param environment: Variables to set, such as BIOMNI_LLM. They are recorded, so they are not
         for secrets.
     :param tools: Tools for code in the session to call, which run in this process; see Session.
+    :param data: Files and directories for the code to read, where they are; see Session.
+    :param software: Software installed for python, for the code to use; see Session.
     """
 
     sandboxed = False
@@ -937,6 +1106,8 @@ class LocalSession(Session):
         forward_env: tuple[str, ...] = (),
         environment: dict[str, str] | None = None,
         tools: Iterable[Tool] = (),
+        data: Mapping[str | os.PathLike[str], str] | None = None,
+        software: Mapping[str, str] | None = None,
     ) -> None:
         if warn:
             warnings.warn(
@@ -945,7 +1116,9 @@ class LocalSession(Session):
                 UserWarning,
                 stacklevel=2,
             )
-        super().__init__(directory, timeout=timeout, start_timeout=start_timeout, tools=tools)
+        super().__init__(
+            directory, timeout=timeout, start_timeout=start_timeout, tools=tools, data=data, software=software
+        )
         self.python = python or sys.executable
         self.max_file_bytes = max_file_bytes
         self.biomni_tools = biomni_tools

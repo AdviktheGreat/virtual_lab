@@ -622,3 +622,69 @@ class TestSessionTools:
             individual(team_member, tmp_path, tools=(gene_length,))
 
         assert fake_client.completions.calls == []
+
+
+class TestSessionDataAndSoftware:
+    def test_the_agents_are_told_of_the_sessions_data_and_software(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        counts = tmp_path / "inputs" / "counts.csv"
+        counts.parent.mkdir()
+        counts.write_text("gene,count\nTP53,5\n")
+        fake_client.completions.responses = [text_response("Done.")]
+
+        with LocalSession(
+            tmp_path / "work",
+            warn=False,
+            data={counts: "Read counts per gene."},
+            software={"pytest": "Tests Python.", "nowhere-xyz": "Not installed."},
+        ) as opened:
+            individual(team_member, tmp_path, session=opened)
+
+        prompt = sent_messages(fake_client, 0)[-1]["content"]
+        assert f"{counts.resolve()}: Read counts per gene." in prompt
+        assert "pytest: Tests Python.\n" in prompt
+        assert "nowhere-xyz: Not installed. (not found in the session: check that it is there before relying on it)" in " ".join(prompt.split())
+        assert "Warning: the session does not have nowhere-xyz" in capsys.readouterr().out
+
+        record = saved_record(tmp_path)
+        assert record["session"]["software_not_found"] == ["nowhere-xyz"]
+        assert record["session"]["data"][0]["name"] == "counts.csv"
+        assert record["session"]["software"] == {"pytest": "Tests Python.", "nowhere-xyz": "Not installed."}
+
+    def test_software_that_cannot_be_checked_is_listed_unmarked(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        from importlib import import_module
+
+        run_meeting_module = import_module("virtual_lab.run_meeting")
+
+        monkeypatch.setattr(run_meeting_module, "check_installed", lambda *args, **kwargs: None)
+        fake_client.completions.responses = [text_response("Done.")]
+
+        with LocalSession(tmp_path / "work", warn=False, software={"nowhere-xyz": "Not installed."}) as opened:
+            individual(team_member, tmp_path, session=opened)
+
+        assert "nowhere-xyz: Not installed.\n" in sent_messages(fake_client, 0)[-1]["content"]
+        assert "Warning: the session does not have" not in capsys.readouterr().out
+        assert saved_record(tmp_path)["session"]["software_not_found"] is None
+
+    def test_a_session_with_nothing_added_checks_and_says_nothing(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from importlib import import_module
+
+        run_meeting_module = import_module("virtual_lab.run_meeting")
+
+        checked: list[object] = []
+        monkeypatch.setattr(run_meeting_module, "check_installed", lambda *args, **kwargs: checked.append(args))
+        fake_client.completions.responses = [text_response("Done.")]
+
+        with LocalSession(tmp_path / "work", warn=False) as opened:
+            individual(team_member, tmp_path, session=opened)
+
+        prompt = sent_messages(fake_client, 0)[-1]["content"]
+        assert "added for this work" not in prompt
+        assert checked == []
+        assert "software_not_found" not in saved_record(tmp_path)["session"]

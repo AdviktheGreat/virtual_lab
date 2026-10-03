@@ -24,10 +24,11 @@ from virtual_lab.constants import (
     DEFAULT_SESSION_MEMORY_LIMIT,
     SANDBOX_DATA_LAKE_DIR,
     SANDBOX_PLATFORM,
+    SANDBOX_USER_DATA_DIR,
     SANDBOX_WORK_DIR,
 )
 from virtual_lab.environment import sandbox_image
-from virtual_lab.execution import DockerExecutor
+from virtual_lab.execution import DockerExecutor, ExecutionError
 from virtual_lab.custom_tools import tool_from_function
 from virtual_lab.session import (
     KERNEL_SOURCE,
@@ -37,8 +38,11 @@ from virtual_lab.session import (
     SessionError,
     call_parameters,
     call_signature,
+    check_session_data,
+    check_session_software,
     check_session_tools,
     describe_type,
+    own_resources_prompt,
     read_responses,
     session_executor,
     session_tool,
@@ -958,3 +962,258 @@ class TestToolsPrompt:
 
     def test_no_tools_no_prompt(self) -> None:
         assert session_tools_prompt(()) == ""
+
+
+def own_data(tmp_path: Path) -> Path:
+    """A directory of data to give a session, outside any session's directory."""
+    data = tmp_path / "inputs"
+    (data / "images").mkdir(parents=True)
+    (data / "images" / "field1.txt").write_text("cells\n")
+    (data / "counts.csv").write_text("gene,count\nTP53,5\n")
+    return data
+
+
+class TestSessionData:
+    def test_a_local_session_reads_the_data_where_it_is(self, tmp_path: Path) -> None:
+        data = own_data(tmp_path)
+
+        with LocalSession(
+            tmp_path / "work",
+            warn=False,
+            data={data / "counts.csv": " Read counts per gene. ", str(data / "images"): "Microscopy."},
+        ) as opened:
+            counts, images = opened.data
+            result = opened.run(
+                f"print(open({opened.data_path(counts)!r}).read().split()[1])\n"
+                f"print(open({opened.data_path(images)!r} + '/field1.txt').read().strip())"
+            )
+            described = opened.describe()["data"]
+
+        assert result.output.split() == ["TP53,5", "cells"]
+        assert (counts.name, counts.source, counts.description) == (
+            "counts.csv",
+            (data / "counts.csv").resolve(),
+            "Read counts per gene.",
+        )
+        assert opened.data_path(counts) == str((data / "counts.csv").resolve())
+        assert described == [
+            {
+                "name": "counts.csv",
+                "source": str((data / "counts.csv").resolve()),
+                "path": str((data / "counts.csv").resolve()),
+                "description": "Read counts per gene.",
+            },
+            {
+                "name": "images",
+                "source": str((data / "images").resolve()),
+                "path": str((data / "images").resolve()),
+                "description": "Microscopy.",
+            },
+        ]
+
+    def test_paths_are_read_from_where_the_session_is_made(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        data = own_data(tmp_path)
+        monkeypatch.chdir(data)
+
+        (item,) = check_session_data({"counts.csv": "Counts."})
+        (parent,) = check_session_data({"images/..": "Everything."})
+
+        assert item.source == (data / "counts.csv").resolve()
+        assert (parent.name, parent.source) == ("inputs", data.resolve())
+
+    def test_a_link_is_found_by_its_own_name(self, tmp_path: Path) -> None:
+        data = own_data(tmp_path)
+        (data / "latest.csv").symlink_to(data / "counts.csv")
+
+        (item,) = check_session_data({data / "latest.csv": "The latest counts."})
+
+        assert (item.name, item.source) == ("latest.csv", (data / "counts.csv").resolve())
+
+    def test_none_is_nothing(self, tmp_path: Path) -> None:
+        opened = LocalSession(tmp_path / "work", warn=False)
+
+        assert opened.data == () and opened.software == {}
+        assert opened.describe()["data"] == [] and opened.describe()["software"] == {}
+        assert check_session_data(None) == () and check_session_software(None) == {}
+
+    @pytest.mark.parametrize(
+        ("given", "error", "message"),
+        [
+            (["counts.csv"], TypeError, "dict of each file or directory's path"),
+            ({3: "Three."}, TypeError, "given by its path, not int"),
+            ({"counts.csv": None}, TypeError, "said in a str, not NoneType"),
+            ({"counts.csv": "  "}, ValueError, "its description is empty"),
+            ({"missing.csv": "Gone."}, FileNotFoundError, "'missing.csv' is not there"),
+            ({"/": "Everything."}, ValueError, "give the files or directories in it instead"),
+        ],
+    )
+    def test_data_must_be_paths_that_exist_with_what_they_are(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, given: object, error: type, message: str
+    ) -> None:
+        monkeypatch.chdir(own_data(tmp_path))
+
+        with pytest.raises(error, match=message):
+            check_session_data(given)  # type: ignore[arg-type]
+
+    def test_no_two_pieces_of_data_may_share_a_name(self, tmp_path: Path) -> None:
+        data = own_data(tmp_path)
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "counts.csv").write_text("x\n")
+
+        with pytest.raises(ValueError, match="counts.csv names more than one"):
+            LocalSession(
+                tmp_path / "work",
+                warn=False,
+                data={data / "counts.csv": "Counts.", tmp_path / "other" / "counts.csv": "Others."},
+            )
+
+    @pytest.mark.parametrize(
+        ("given", "error", "message"),
+        [
+            (["pydeseq2"], TypeError, "dict of each library or program's name"),
+            ({"": "Nothing."}, ValueError, "given by its name, not ''"),
+            ({3: "Three."}, ValueError, "given by its name, not 3"),
+            ({"pydeseq2": 2}, TypeError, "said in a str, not int"),
+            ({"pydeseq2": ""}, ValueError, "its description is empty"),
+            ({"pydeseq2": "One.", " pydeseq2 ": "Two."}, ValueError, "given twice"),
+        ],
+    )
+    def test_software_must_be_names_with_what_they_do(self, given: object, error: type, message: str) -> None:
+        with pytest.raises(error, match=message):
+            check_session_software(given)  # type: ignore[arg-type]
+
+    def test_software_is_kept_by_name_and_recorded(self, tmp_path: Path) -> None:
+        opened = LocalSession(tmp_path / "work", warn=False, software={" pydeseq2 ": " Differential expression. "})
+
+        assert opened.software == {"pydeseq2": "Differential expression."}
+        assert opened.describe()["software"] == {"pydeseq2": "Differential expression."}
+
+
+class TestDockerData:
+    def test_each_piece_is_mounted_read_only_under_its_name(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        data = own_data(tmp_path)
+        monkeypatch.setattr(DockerExecutor, "check_available", lambda self: None)
+        opened = DockerSession(
+            tmp_path / "work", executor=DockerExecutor(), data={data / "counts.csv": "Counts.", data / "images": "Images."}
+        )
+
+        command, _, _ = opened.spawn()
+
+        mounted = [command[index + 1] for index, item in enumerate(command) if item == "--mount"]
+        assert f"type=bind,source={(data / 'counts.csv').resolve()},target={SANDBOX_USER_DATA_DIR}/counts.csv,readonly" in mounted
+        assert f"type=bind,source={(data / 'images').resolve()},target={SANDBOX_USER_DATA_DIR}/images,readonly" in mounted
+        assert [opened.data_path(item) for item in opened.data] == ["/data/counts.csv", "/data/images"]
+        assert opened.describe()["data"][0]["path"] == "/data/counts.csv"
+        assert opened.describe()["data"][0]["source"] == str((data / "counts.csv").resolve())
+
+    @pytest.mark.parametrize("where", ["inside", "around"])
+    def test_data_in_or_around_the_sessions_directory_is_refused(self, tmp_path: Path, where: str) -> None:
+        data = own_data(tmp_path)
+        directory = data / "work" if where == "around" else tmp_path / "work"
+        given = data if where == "around" else tmp_path / "work" / "mine.csv"
+        given.parent.mkdir(parents=True, exist_ok=True)
+        if where == "inside":
+            given.write_text("x\n")
+
+        with pytest.raises(ExecutionError, match="overlaps the directory code runs in"):
+            DockerSession(directory, executor=DockerExecutor(), data={given: "Mine."})
+
+    @pytest.mark.parametrize("odd", ["in a,b/counts.csv", "a,b.csv"])
+    def test_data_whose_path_cannot_be_mounted_is_refused(self, tmp_path: Path, odd: str) -> None:
+        # The second is a link to a file whose path can be mounted, under a name that cannot
+        clean = tmp_path / "clean.csv"
+        clean.write_text("x\n")
+        given = tmp_path / odd
+        given.parent.mkdir(parents=True, exist_ok=True)
+        if "/" in odd:
+            given.write_text("x\n")
+        else:
+            given.symlink_to(clean)
+
+        with pytest.raises(ExecutionError, match="cannot mount a path containing a comma"):
+            DockerSession(tmp_path / "work", executor=DockerExecutor(), data={given: "Odd."})
+
+    def test_data_gone_before_the_session_starts_is_reported(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        data = own_data(tmp_path)
+        monkeypatch.setattr(DockerExecutor, "check_available", lambda self: None)
+        opened = DockerSession(tmp_path / "work", executor=DockerExecutor(), data={data / "counts.csv": "Counts."})
+        (data / "counts.csv").unlink()
+
+        with pytest.raises(ExecutionError, match="counts.csv, given to the code to read, is not there any more"):
+            opened.spawn()
+
+    def test_without_data_nothing_more_is_mounted(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(DockerExecutor, "check_available", lambda self: None)
+
+        command, _, _ = DockerSession(tmp_path / "work", executor=DockerExecutor()).spawn()
+
+        assert [command[index + 1] for index, item in enumerate(command) if item == "--mount"] == [
+            f"type=bind,source={(tmp_path / 'work').resolve()},target={SANDBOX_WORK_DIR}"
+        ]
+
+    @pytest.mark.skipif(not DockerExecutor().is_available(), reason="Docker daemon is not reachable")
+    def test_a_container_reads_the_data_and_cannot_change_it(self, tmp_path: Path) -> None:
+        data = own_data(tmp_path)
+
+        with DockerSession(
+            tmp_path / "work",
+            executor=DockerExecutor(),
+            timeout=60,
+            data={data / "counts.csv": "Counts.", data / "images": "Images."},
+        ) as opened:
+            read = opened.run(
+                "import os\n"
+                "print(sorted(os.listdir('/data')), open('/data/counts.csv').read().split()[1], "
+                "open('/data/images/field1.txt').read().strip())"
+            )
+            written = opened.run("open('/data/images/new.txt', 'w').write('x')")
+
+        assert read.output.strip() == "['counts.csv', 'images'] TP53,5 cells"
+        assert written.status == "error" and "Read-only file system" in written.error
+        assert not (data / "images" / "new.txt").exists()
+
+
+class TestOwnResourcesPrompt:
+    def test_data_is_listed_by_the_path_code_reads_it_at(self, tmp_path: Path) -> None:
+        data = own_data(tmp_path)
+        given = {data / "counts.csv": "Read counts per gene."}
+
+        local = own_resources_prompt(LocalSession(tmp_path / "work", warn=False, data=given))
+        docker = own_resources_prompt(DockerSession(tmp_path / "work", executor=DockerExecutor(), data=given))
+
+        assert local.startswith("- Data added for this work, which the session's code can read. Prefer it")
+        assert f"----\n{(data / 'counts.csv').resolve()}: Read counts per gene.\n----" in local
+        assert docker.startswith("- Data added for this work, which the session's code can read but not change.")
+        assert "----\n/data/counts.csv: Read counts per gene.\n----" in docker
+
+    def test_software_is_listed_and_what_was_not_found_is_marked(self, tmp_path: Path) -> None:
+        opened = LocalSession(tmp_path / "work", warn=False, software={"pytest": "Tests.", "nowhere-xyz": "Missing."})
+
+        prompt = own_resources_prompt(opened, ["nowhere-xyz"])
+
+        assert prompt.startswith("- Software added for this work, for the session's code to use. Prefer it")
+        assert (
+            "----\npytest: Tests.\nnowhere-xyz: Missing. (not found in the session: check that it is there "
+            "before relying on it)\n----"
+        ) in prompt
+        assert "not found" not in own_resources_prompt(opened)
+
+    def test_tools_come_first_then_data_then_software(self, tmp_path: Path) -> None:
+        data = own_data(tmp_path)
+        opened = LocalSession(
+            tmp_path / "work",
+            warn=False,
+            tools=HOST_TOOLS[:1],
+            data={data / "counts.csv": "Counts."},
+            software={"pytest": "Tests."},
+        )
+
+        prompt = own_resources_prompt(opened)
+
+        sections = prompt.split("\n\n- ")
+        assert len(sections) == 3
+        assert sections[0] == session_tools_prompt(HOST_TOOLS[:1])
+        assert sections[1].startswith("Data added") and sections[2].startswith("Software added")
+
+    def test_nothing_added_says_nothing(self, tmp_path: Path) -> None:
+        assert own_resources_prompt(LocalSession(tmp_path / "work", warn=False)) == ""
