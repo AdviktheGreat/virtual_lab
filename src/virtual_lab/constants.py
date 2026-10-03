@@ -273,6 +273,13 @@ SESSION_CLOSE_TIMEOUT = 5
 # so an answer past this is not one the interpreter wrote, and ends the session.
 MAX_SESSION_RESPONSE_BYTES = 2 * 1024**2
 
+# Most bytes of JSON a session's tool may return to the code that called it. A tool's arguments
+# are bounded by MAX_SESSION_RESPONSE_BYTES, since they come back the way answers do.
+MAX_HOST_TOOL_RESULT_BYTES = 16 * 1024**2
+
+# Most characters of a tool call's arguments kept in a session's record of it
+MAX_RECORDED_ARGUMENT_CHARS = 10_000
+
 # Most output that is kept from an execution, per stream, in bytes. Untrusted code can print
 # without bound, so output is read as it arrives and only this much of its tail is held; none of
 # it is written to disk, where a program printing in a loop would otherwise fill the host.

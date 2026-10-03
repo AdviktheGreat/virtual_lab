@@ -15,6 +15,8 @@ from typing import Any
 
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from openai.types.chat.chat_completion_message_tool_call import ChatCompletionMessageToolCall
+from pydantic import BaseModel
+from pydantic_core import to_jsonable_python
 
 from virtual_lab.chemistry import (
     get_activities,
@@ -58,8 +60,9 @@ class Tool:
     :param name: The name the model uses to call the tool.
     :param description: What the tool does, used by the model to decide when to call it.
     :param parameters: A JSON Schema object describing the tool's arguments.
-    :param function: The callable that runs the tool. Its return value is sent to the model,
-        so it should be a string or convertible to one.
+    :param function: The callable that runs the tool. Its return value is sent to the model
+        as text: a string as it is, a dict, list, or pydantic model as JSON, and anything else
+        as str() writes it.
     """
 
     name: str
@@ -785,6 +788,21 @@ def all_tools(save_dir: Path | None = None, save_name: str = "discussion") -> tu
     return DATABASE_TOOLS + (structure_file_tool(work_dir),) + data_file_tools(work_dir)
 
 
+def tool_output_text(value: Any) -> str:
+    """Writes what a tool returned as the text a model is shown."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, BaseModel):
+        return value.model_dump_json()
+    if isinstance(value, dict | list | tuple):
+        try:
+            return json.dumps(to_jsonable_python(value, fallback=str), ensure_ascii=False)
+        except (TypeError, ValueError):
+            pass
+
+    return str(value)
+
+
 def run_tool_calls(
     tool_calls: list[ChatCompletionMessageToolCall],
     tools: tuple[Tool, ...],
@@ -825,7 +843,7 @@ def run_tool_calls(
         else:
             try:
                 arguments = json.loads(function.arguments)
-                output = str(tool.function(**arguments))
+                output = tool_output_text(tool.function(**arguments))
             except Exception as e:
                 problem = truncate_text(f"{type(e).__name__}: {e}", MAX_TOOL_ERROR_CHARACTERS)
                 output = f'Error running tool "{shown}": {problem}'

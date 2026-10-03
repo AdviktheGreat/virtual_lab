@@ -9,9 +9,14 @@ can be run in it too, each as a fresh process, as Biomni runs them.
 The interpreter is virtual_lab/kernel.py, started in the sandbox with "python3 -c", so the
 image needs nothing but a Python 3. DockerSession runs it under every restriction
 DockerExecutor applies; LocalSession runs it on this machine with none of them.
+
+A session can be given tools, which code in it calls like any function, but which run here,
+outside the sandbox, the way Biomni's agent calls the tools added to it. The code's call comes
+back over the same pipe as its output, the tool is run, and what it returns is sent back.
 """
 
 import json
+import keyword
 import os
 import queue
 import signal
@@ -21,12 +26,14 @@ import threading
 import time
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
 from typing import IO, Any
 from uuid import uuid4
+
+from pydantic_core import to_jsonable_python
 
 from virtual_lab.constants import (
     DEFAULT_EXECUTION_TIMEOUT,
@@ -34,9 +41,12 @@ from virtual_lab.constants import (
     DEFAULT_SESSION_MEMORY_LIMIT,
     DEFAULT_SESSION_PIDS_LIMIT,
     DEFAULT_SESSION_TMPFS_SIZE,
+    MAX_HOST_TOOL_RESULT_BYTES,
+    MAX_RECORDED_ARGUMENT_CHARS,
     MAX_REPORTED_FILES,
     MAX_REPORTED_OUTPUT_CHARS,
     MAX_SESSION_RESPONSE_BYTES,
+    MAX_TOOL_ERROR_CHARACTERS,
     MAX_WRITTEN_FILE_BYTES,
     SANDBOX_DATA_LAKE_DIR,
     SANDBOX_IMAGE_NAME,
@@ -56,6 +66,7 @@ from virtual_lab.execution import (
     list_files,
     truncate_tail,
 )
+from virtual_lab.records import truncate_text
 from virtual_lab.repair import describe_executor
 from virtual_lab.tools import Tool
 
@@ -98,6 +109,9 @@ class CellResult:
     :param start: Which start of the session ran it. A number higher than the last one's means
         the session was restarted in between, and nothing defined before is still there.
     :param sandboxed: Whether it ran in a container.
+    :param tool_calls: Each call it made to one of the session's tools: the tool, its arguments
+        as JSON, how it ended ("ok", "error", or "running" if the code finished first), the
+        error if there was one, and how many seconds it took.
     """
 
     language: str
@@ -111,6 +125,7 @@ class CellResult:
     output_dropped: int = 0
     start: int = 1
     sandboxed: bool = True
+    tool_calls: tuple[dict[str, Any], ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -160,6 +175,10 @@ class CellResult:
             "output_dropped": self.output_dropped,
             "start": self.start,
             "sandboxed": self.sandboxed,
+            "tool_calls": [
+                {**call, "duration": None if call["duration"] is None else round(call["duration"], 3)}
+                for call in self.tool_calls
+            ],
         }
 
 
@@ -173,6 +192,134 @@ def read_responses(stream: IO[bytes], answers: queue.Queue) -> None:
                 break
             answers.put(line)
     answers.put(None)
+
+
+def check_session_tools(tools: Iterable[Tool]) -> tuple[Tool, ...]:
+    """Refuses tools that code could not call by name, or that two would share a name."""
+    checked = tuple(tools)
+    for tool in checked:
+        if not isinstance(tool, Tool):
+            raise TypeError(
+                f"A session's tools are Tools, not {type(tool).__name__}: make one of a function with "
+                "tool_from_function"
+            )
+        if not tool.name.isidentifier() or keyword.iskeyword(tool.name):
+            raise ValueError(
+                f"Code calls a session's tools by name, and {tool.name!r} is not a name Python can call: use "
+                "letters, digits, and '_', not starting with a digit"
+            )
+
+    names = [tool.name for tool in checked]
+    if repeated := sorted({name for name in names if names.count(name) > 1}):
+        raise ValueError(f"A session's tools need names of their own: {', '.join(repeated)} is given twice")
+
+    return checked
+
+
+def call_parameters(tool: Tool) -> list[dict[str, Any]]:
+    """How code calls a tool: its parameters in the order its schema lists them.
+
+    Each can be passed by position until a required parameter follows an optional one, which
+    Python cannot express, so from there on each must be passed by name. A parameter that is
+    optional is left out of the call unless given, so the tool applies its own default.
+    """
+    schema = tool.parameters if isinstance(tool.parameters, dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = set(schema.get("required") or [])
+
+    parameters = []
+    keyword_only = optional_seen = False
+    for name, item in properties.items():
+        is_required = name in required
+        keyword_only = keyword_only or (is_required and optional_seen)
+        optional_seen = optional_seen or not is_required
+        parameter: dict[str, Any] = {"name": name, "required": is_required, "keyword_only": keyword_only}
+        if not is_required and isinstance(item, dict) and "default" in item:
+            parameter["default"] = repr(item["default"])
+        parameters.append(parameter)
+
+    return parameters
+
+
+def call_signature(tool: Tool) -> str:
+    """The tool's signature as code calls it, such as "(gene, limit=10, *, organism)"."""
+    shown = []
+    marked = False
+    for parameter in call_parameters(tool):
+        if parameter["keyword_only"] and not marked:
+            shown.append("*")
+            marked = True
+        name = parameter["name"]
+        shown.append(name if parameter["required"] else f"{name}={parameter.get('default', '...')}")
+
+    return f"({', '.join(shown)})"
+
+
+def describe_type(schema: Any) -> str:
+    """Says in a few words what a JSON Schema accepts."""
+    if not isinstance(schema, dict) or not schema:
+        return "any"
+    if "enum" in schema:
+        return "one of " + ", ".join(json.dumps(value) for value in schema["enum"])
+    for options in ("anyOf", "oneOf"):
+        if isinstance(schema.get(options), list):
+            return " or ".join(dict.fromkeys(describe_type(option) for option in schema[options]))
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        return " or ".join(str(item) for item in kind)
+    if kind == "array" and isinstance(schema.get("items"), dict):
+        return f"array of {describe_type(schema['items'])}"
+    if kind:
+        return str(kind)
+    if isinstance(schema.get("$ref"), str):
+        return schema["$ref"].rsplit("/", 1)[-1]
+
+    return "object" if "properties" in schema else "any"
+
+
+def session_tools_prompt(tools: tuple[Tool, ...]) -> str:
+    """Tells a meeting which functions code in its session can call that run outside it.
+
+    They are listed first and in full, as Biomni lists the tools added to its agent under its
+    priority custom resources, since they were added for this work.
+
+    :param tools: The session's tools.
+    :return: The prompt, or an empty string if there are none.
+    """
+    if not tools:
+        return ""
+
+    entries = []
+    for tool in tools:
+        lines = [f"{tool.name}{call_signature(tool)}"]
+        lines.extend(f"  {line}" if line.strip() else "" for line in tool.description.strip().splitlines())
+        properties = tool.parameters.get("properties") or {}
+        required = set(tool.parameters.get("required") or [])
+        for name, item in properties.items():
+            item = item if isinstance(item, dict) else {}
+            detail = f"{describe_type(item)}, {'required' if name in required else 'optional'}"
+            note = f": {item['description']}" if item.get("description") else ""
+            default = f" [Default: {json.dumps(item['default'])}]" if "default" in item else ""
+            lines.append(f"    - {name} ({detail}){note}{default}")
+        entries.append("\n".join(lines))
+
+    return (
+        "- Functions added for this work, already defined in the session. Prefer them where they "
+        "fit. Call them from Python code like any other function, without importing them; R and "
+        "bash code cannot call them. They run outside the session, on the machine holding the "
+        "meeting, so they can reach what the session's code cannot, and what they return is "
+        "handed back to the code. Their arguments and results are passed as JSON, so pass "
+        "numbers, strings, lists, and dicts, and a function that fails raises HostToolError.\n"
+        "----\n" + "\n\n".join(entries) + "\n----"
+    )
+
+
+def jsonable(value: Any) -> Any:
+    """Converts what a tool returned to JSON's types, writing out what JSON has none for as text."""
+    try:
+        return to_jsonable_python(value, fallback=str)
+    except Exception:
+        return str(value)
 
 
 def stop_process(process: subprocess.Popen, stop: Callable[[subprocess.Popen], None]) -> None:
@@ -196,6 +343,10 @@ class Session:
         there, figures included, stay after the session ends.
     :param timeout: Seconds each piece of code may run, unless it is given its own limit.
     :param start_timeout: Seconds to wait for the interpreter to start.
+    :param tools: Tools for code in the session to call by name, as functions it need not
+        import, which run here rather than in the session; see tool_from_function. A call
+        takes up the time of the code that made it, and one still running when that code
+        stops at its limit is left to finish, its result unused.
     """
 
     sandboxed = True
@@ -205,7 +356,9 @@ class Session:
         directory: Path,
         timeout: float = DEFAULT_EXECUTION_TIMEOUT,
         start_timeout: float = SESSION_START_TIMEOUT,
+        tools: Iterable[Tool] = (),
     ) -> None:
+        self.tools = check_session_tools(tools)
         self.directory = Path(directory).resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
@@ -220,6 +373,10 @@ class Session:
         self._finalizer: weakref.finalize | None = None
         self._requests = 0
         self._lock = threading.Lock()
+        # Replies to tools' calls are written from the threads that run them
+        self._write_lock = threading.Lock()
+        self._calls_lock = threading.Lock()
+        self._tool_threads: set[int] = set()
         self._closed = False
 
     def spawn(self) -> tuple[list[str], dict[str, Any], Callable[[subprocess.Popen], None]]:
@@ -275,6 +432,117 @@ class Session:
 
         self.python_version = str(greeting.get("python"))
 
+        if self.tools:
+            self.define_tools()
+
+    def define_tools(self) -> None:
+        """Defines the session's tools in the interpreter, which it forgets when restarted."""
+        self._requests += 1
+        request = {
+            "id": self._requests,
+            "tools": [
+                {"name": tool.name, "description": tool.description, "parameters": call_parameters(tool)}
+                for tool in self.tools
+            ],
+            "max_call_bytes": MAX_SESSION_RESPONSE_BYTES,
+        }
+        deadline = time.monotonic() + self.start_timeout
+        answer: dict | None | bool = None
+        if self.write(self._process, json.dumps(request)):  # type: ignore[arg-type]
+            answer = self.next_answer(deadline)
+            while isinstance(answer, dict) and answer.get("id") != request["id"]:
+                answer = self.next_answer(deadline)
+
+        if not (isinstance(answer, dict) and answer.get("status") == "ok"):
+            if isinstance(answer, dict):
+                detail = str(answer.get("error"))
+            elif answer is False:
+                detail = "it did not answer"
+            else:
+                detail = self.why_it_stopped()
+            self.shut_down()
+            raise SessionError(f"The session's tools could not be defined in its interpreter: {detail}")
+
+    def write(self, process: subprocess.Popen, line: str) -> bool:
+        """Writes a line to an interpreter, returning whether it could be."""
+        with self._write_lock:
+            try:
+                process.stdin.write((line + "\n").encode("utf-8"))  # type: ignore[union-attr]
+                process.stdin.flush()  # type: ignore[union-attr]
+            except (OSError, ValueError):
+                return False
+
+        return True
+
+    def answer_call(self, call: dict, request: int, calls: list[dict[str, Any]]) -> None:
+        """Runs a tool that code called, in a thread of its own, which writes back its reply.
+
+        The thread lets the code's time limit stand: if the code is stopped while the tool runs,
+        the session is answered and moves on, and the tool's reply, when it comes, is dropped.
+        """
+        name = call.get("tool")
+        arguments = call.get("arguments")
+        tool = next((tool for tool in self.tools if tool.name == name), None)
+        record: dict[str, Any] = {
+            "tool": str(name),
+            "arguments": truncate_text(json.dumps(arguments), MAX_RECORDED_ARGUMENT_CHARS),
+            "status": "running",
+            "error": None,
+            "duration": None,
+        }
+        with self._calls_lock:
+            calls.append(record)
+
+        problem = None
+        if call.get("request") != request:
+            problem = "the code that called it had finished"
+        elif tool is None:
+            problem = f"the session has no tool called {truncate_text(str(name), 100)}"
+        elif not isinstance(arguments, dict):
+            problem = "its arguments were not given by name"
+
+        process = self._process
+        if problem is not None or tool is None or not isinstance(arguments, dict):
+            with self._calls_lock:
+                record.update(status="error", error=problem, duration=0.0)
+            self.write(process, json.dumps({"reply": call.get("call"), "error": problem}))  # type: ignore[arg-type]
+            return
+
+        threading.Thread(
+            target=self.run_call,
+            args=(process, call.get("call"), tool, arguments, record),
+            name=f"virtual-lab-tool-{tool.name}",
+            daemon=True,
+        ).start()
+
+    def run_call(
+        self, process: subprocess.Popen, call: Any, tool: Tool, arguments: dict, record: dict[str, Any]
+    ) -> None:
+        started = time.monotonic()
+        error = None
+        self._tool_threads.add(threading.get_ident())
+        try:
+            line = json.dumps({"reply": call, "result": jsonable(tool.function(**arguments))})
+            if len(line) > MAX_HOST_TOOL_RESULT_BYTES:
+                error = (
+                    f"it returned {len(line):,} bytes of JSON, more than the {MAX_HOST_TOOL_RESULT_BYTES:,} a "
+                    "call can return. Have it write what it found to a file the session can read, and "
+                    "return the file's path."
+                )
+        except BaseException as exception:
+            error = truncate_text(f"{type(exception).__name__}: {exception}", MAX_TOOL_ERROR_CHARACTERS)
+        finally:
+            self._tool_threads.discard(threading.get_ident())
+
+        if error is not None:
+            line = json.dumps({"reply": call, "error": error})
+        with self._calls_lock:
+            record.update(
+                status="ok" if error is None else "error", error=error, duration=time.monotonic() - started
+            )
+        # To the interpreter that made the call, which may since have been replaced
+        self.write(process, line)
+
     def next_answer(self, deadline: float) -> dict | None | bool:
         """Waits for the interpreter's next answer.
 
@@ -317,6 +585,12 @@ class Session:
 
         return f"{reason}. {truncate_tail(errors, 1_000)}".strip() if errors else f"{reason}."
 
+    def refuse_from_tool(self) -> None:
+        """Refuses to run code for one of the session's own tools, which a call from the session's
+        code is running: the code waits on the tool, so the tool would wait on the code."""
+        if threading.get_ident() in self._tool_threads:
+            raise SessionError("A session's tool cannot use the session whose code called it")
+
     def run(self, code: str, language: str = "python", timeout: float | None = None) -> CellResult:
         """Runs a piece of code in the session.
 
@@ -332,6 +606,7 @@ class Session:
         if normalized is None:
             raise ValueError(f"Cannot run {language!r} code: use python, r, or bash.")
 
+        self.refuse_from_tool()
         with self._lock:
             result = self.execute(code, normalized, self.timeout if timeout is None else timeout)
             self.history.append(result)
@@ -349,6 +624,7 @@ class Session:
         :raises SessionError: If the session was closed or cannot be started.
         :return: What happened.
         """
+        self.refuse_from_tool()
         with self._lock:
             return self.execute(code, "python", self.timeout if timeout is None else timeout)
 
@@ -359,19 +635,17 @@ class Session:
         started = time.monotonic()
         self._requests += 1
         request = {"id": self._requests, "language": normalized, "code": code, "timeout": limit}
-        answer: dict | None | bool
+        answer: dict | None | bool = None
+        calls: list[dict[str, Any]] = []
 
-        try:
-            self._process.stdin.write((json.dumps(request) + "\n").encode("utf-8"))  # type: ignore[union-attr]
-            self._process.stdin.flush()  # type: ignore[union-attr]
-        except (BrokenPipeError, OSError):
-            answer = None
-        else:
+        if self.write(self._process, json.dumps(request)):  # type: ignore[arg-type]
             deadline = started + limit + SESSION_GRACE_SECONDS
             answer = self.next_answer(deadline)
-            # An answer to some other request is not this one's, and is not a reason to
-            # give up on the session while this one's may still come
+            # A call to a tool is answered, and an answer to some other request is not this
+            # one's, and is not a reason to give up on the session while this one's may still come
             while isinstance(answer, dict) and answer.get("id") != request["id"]:
+                if "call" in answer:
+                    self.answer_call(answer, request["id"], calls)
                 answer = self.next_answer(deadline)
 
         if isinstance(answer, dict) and answer.get("id") == request["id"]:
@@ -397,7 +671,12 @@ class Session:
                 sandboxed=self.sandboxed,
             )
 
-        return replace(result, produced_files=tuple(sorted(list_files(self.directory) - before)))
+        with self._calls_lock:
+            tool_calls = tuple(dict(call) for call in calls)
+
+        return replace(
+            result, produced_files=tuple(sorted(list_files(self.directory) - before)), tool_calls=tool_calls
+        )
 
     def result_from(self, answer: dict, language: str, code: str, duration: float) -> CellResult:
         """Reads the interpreter's answer, trusting none of its types."""
@@ -418,6 +697,7 @@ class Session:
 
     def restart(self) -> None:
         """Starts the interpreter afresh, discarding every variable it held."""
+        self.refuse_from_tool()
         with self._lock:
             self.shut_down()
             self.start()
@@ -442,6 +722,7 @@ class Session:
 
     def close(self) -> None:
         """Stops the interpreter for good. Files it wrote are kept."""
+        self.refuse_from_tool()
         with self._lock:
             self.shut_down()
             self._closed = True
@@ -462,6 +743,7 @@ class Session:
             "python_version": self.python_version,
             "starts": self.starts,
             "cells": len(self.history),
+            "tools": [tool.name for tool in self.tools],
         }
 
     def where_code_runs(self) -> str:
@@ -551,6 +833,8 @@ class DockerSession(Session):
         environment, with the network on.
     :param timeout: Seconds each piece of code may run, defaulting to the executor's.
     :param start_timeout: Seconds to wait for the interpreter to start.
+    :param tools: Tools for code in the session to call, which run here, outside the container,
+        with this machine's network, files, and keys; see Session.
     """
 
     def __init__(
@@ -559,12 +843,14 @@ class DockerSession(Session):
         executor: DockerExecutor | None = None,
         timeout: float | None = None,
         start_timeout: float = SESSION_START_TIMEOUT,
+        tools: Iterable[Tool] = (),
     ) -> None:
         self.executor = executor if executor is not None else session_executor()
         super().__init__(
             directory,
             timeout=self.executor.timeout if timeout is None else timeout,
             start_timeout=start_timeout,
+            tools=tools,
         )
 
     def spawn(self) -> tuple[list[str], dict[str, Any], Callable[[subprocess.Popen], None]]:
@@ -634,6 +920,7 @@ class LocalSession(Session):
         Biomni's tools use.
     :param environment: Variables to set, such as BIOMNI_LLM. They are recorded, so they are not
         for secrets.
+    :param tools: Tools for code in the session to call, which run in this process; see Session.
     """
 
     sandboxed = False
@@ -649,6 +936,7 @@ class LocalSession(Session):
         biomni_tools: bool = False,
         forward_env: tuple[str, ...] = (),
         environment: dict[str, str] | None = None,
+        tools: Iterable[Tool] = (),
     ) -> None:
         if warn:
             warnings.warn(
@@ -657,7 +945,7 @@ class LocalSession(Session):
                 UserWarning,
                 stacklevel=2,
             )
-        super().__init__(directory, timeout=timeout, start_timeout=start_timeout)
+        super().__init__(directory, timeout=timeout, start_timeout=start_timeout, tools=tools)
         self.python = python or sys.executable
         self.max_file_bytes = max_file_bytes
         self.biomni_tools = biomni_tools

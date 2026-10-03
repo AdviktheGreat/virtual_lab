@@ -53,7 +53,7 @@ from virtual_lab.resources import (
     retrieval_prompt,
     select_resources,
 )
-from virtual_lab.session import CODE_TOOL_NAME, Session, session_tool
+from virtual_lab.session import CODE_TOOL_NAME, Session, session_tool, session_tools_prompt
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
 from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
 from virtual_lab.utils import (
@@ -175,7 +175,9 @@ def hold_meeting(
         and the record says so.
     :param pubmed_search: Whether to include a PubMed search tool. Shorthand for passing
         PUBMED_TOOL in tools.
-    :param tools: Additional tools the agents may call during the meeting.
+    :param tools: Additional tools the agents may call during the meeting. Make one of a
+        function of your own with tool_from_function. To have code in a session call it instead,
+        give it to the session.
     :param output_schema: A pydantic model for the meeting's conclusions. When given, the agent who
         closed the meeting is asked to restate them against the schema in one additional call, and
         the result is saved under save_dir/outputs/. Note that the API makes every field of the
@@ -201,6 +203,7 @@ def hold_meeting(
     :param session: A session for the agents to run code in, shared by all of them, as in
         DockerSession or LocalSession. It is started before the first request and left running
         afterwards, so that the next meeting can use what this one computed; close it when done.
+        The session's own tools, which its code can call, are listed to the agents in full.
         The code the meeting ran, and what came of it, is saved under save_dir/sessions/.
     :param code_actions: How the agents run code in the session: "tool" to call the run_code
         tool, or "tags" to write it between <execute> and </execute> in their replies, as
@@ -242,6 +245,11 @@ def hold_meeting(
 
     if code_actions not in ("tool", "tags"):
         raise ValueError(f'code_actions must be "tool" or "tags", not {code_actions!r}')
+
+    if not_tools := [type(tool).__name__ for tool in tools if not isinstance(tool, Tool)]:
+        raise TypeError(
+            f"A meeting's tools are Tools, not {', '.join(not_tools)}: make one of a function with tool_from_function"
+        )
 
     if code_actions == "tags" and session is None:
         raise ValueError('code_actions="tags" runs code in a session, so it needs a session')
@@ -507,6 +515,8 @@ def hold_meeting(
                 network=session.can_reach_network(),
                 data_lake=session.data_lake_path(),
             )
+            if own_tools := session_tools_prompt(session.tools):
+                session_prompt = f"{session_prompt}\n\n{own_tools}"
             retrieved = record.resources is not None and bool((record.resources["retrieval"] or {}).get("understood"))
             if selected is not None and (listed := resources_prompt(selected, code_actions, retrieved=retrieved)):
                 session_prompt = f"{session_prompt}\n\n{listed}"

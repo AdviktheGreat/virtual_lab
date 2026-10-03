@@ -574,3 +574,51 @@ class TestTagsMode:
 
         assert (saved / "discussion.json").exists()
         assert json.loads((saved / METADATA_DIR_NAME / "discussion.json").read_text())["session"] is None
+
+
+def gene_length(gene: str) -> int:
+    """How long a gene's protein is, in residues.
+
+    :param gene: A gene symbol, such as TP53.
+    """
+    return {"TP53": 393}[gene]
+
+
+class TestSessionTools:
+    def test_the_agents_are_told_of_the_sessions_tools_and_their_code_calls_them(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
+    ) -> None:
+        from virtual_lab.custom_tools import tool_from_function
+
+        fake_client.completions.responses = [
+            tool_call_response("run_code", {"code": "gene_length('TP53')"}),
+            text_response("It is 393 residues long."),
+        ]
+
+        with LocalSession(tmp_path / "work", warn=False, tools=(tool_from_function(gene_length),)) as opened:
+            individual(team_member, tmp_path, session=opened)
+
+        first_prompt = sent_messages(fake_client, 0)[-1]["content"]
+        assert "Functions added for this work, already defined in the session" in first_prompt
+        assert "gene_length(gene)\n  How long a gene's protein is, in residues." in first_prompt
+        # Called from code, not offered to the model as a tool of its own
+        assert sent_tools(fake_client, 0) == ["run_code"]
+        assert "393" in sent_messages(fake_client, 1)[-1]["content"]
+
+        record = saved_record(tmp_path)
+        assert record["session"]["tools"] == ["gene_length"]
+        log = json.loads((tmp_path / record["session"]["log"]).read_text())
+        assert log["cells"][0]["tool_calls"][0]["tool"] == "gene_length"
+
+    def test_a_session_without_tools_says_nothing_of_them(
+        self, fake_client: FakeClient, team_member: Agent, session: Session, tmp_path: Path
+    ) -> None:
+        individual(team_member, tmp_path, session=session)
+
+        assert "Functions added for this work" not in sent_messages(fake_client, 0)[-1]["content"]
+
+    def test_a_meeting_is_given_tools_not_functions(self, fake_client: FakeClient, team_member: Agent, tmp_path: Path) -> None:
+        with pytest.raises(TypeError, match="tool_from_function"):
+            individual(team_member, tmp_path, tools=(gene_length,))
+
+        assert fake_client.completions.calls == []

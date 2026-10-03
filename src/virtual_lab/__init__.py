@@ -29,6 +29,7 @@ from virtual_lab.chemistry import (
     search_drugs,
     search_targets,
 )
+from virtual_lab.custom_tools import tool_from_function
 from virtual_lab.databases import (
     Chain,
     DownloadedFile,
@@ -117,6 +118,7 @@ from virtual_lab.session import (
     SessionError,
     session_executor,
     session_tool,
+    session_tools_prompt,
 )
 from virtual_lab.structured import StructuredOutputError
 from virtual_lab.tables import (
@@ -315,6 +317,8 @@ __all__ = [
     "select_resources",
     "session_executor",
     "session_tool",
+    "session_tools_prompt",
     "structure_file_tool",
+    "tool_from_function",
     "tools_for",
 ]

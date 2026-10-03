@@ -486,6 +486,23 @@ class TestResuming:
         assert fingerprint(partial(show_data_files, tmp_path / "a")) == fingerprint(partial(show_data_files, tmp_path / "b"))
         assert fingerprint(partial(show_data_files, tmp_path)) != fingerprint(partial(inspect_data_file, tmp_path))
 
+    def test_a_sessions_tools_are_part_of_the_input_and_a_session_without_any_is_as_before(
+        self, tmp_path: Path
+    ) -> None:
+        from virtual_lab.session import LocalSession
+
+        def tool(description: str) -> Tool:
+            return Tool(name="lookup", description=description, parameters={"type": "object"}, function=show_data_files)
+
+        def fingerprint(*tools: Tool, directory: str = "a") -> dict[str, str]:
+            session = LocalSession(tmp_path / directory, warn=False, tools=tools)
+            return fingerprint_inputs(hold_meeting, {"session": session})
+
+        assert fingerprint() == fingerprint_inputs(hold_meeting, {"session": "virtual_lab.session.LocalSession"})
+        assert fingerprint(tool("Looks a gene up.")) == fingerprint(tool("Looks a gene up."), directory="b")
+        assert fingerprint(tool("Looks a gene up.")) != fingerprint(tool("Looks a protein up."))
+        assert fingerprint(tool("Looks a gene up.")) != fingerprint()
+
     def test_resources_with_other_contents_are_another_input(self) -> None:
         def resources(content: str) -> Resources:
             return Resources(know_how=(KnowHow("guide", "A Guide", "How to.", content),))
