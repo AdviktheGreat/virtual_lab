@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, Self
-from urllib.parse import urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 from virtual_lab.__about__ import __version__
 from virtual_lab.constants import (
@@ -74,6 +74,10 @@ STREAMABLE_HTTP_TYPES = frozenset({"http", "streamable-http", "streamable_http",
 # ${NAME}, or ${NAME:-default} for a value to use where NAME is not set
 VARIABLE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
+# The shortest value of a variable that messages hide. A shorter one could hardly be a secret,
+# and hiding everywhere it appears would garble the message
+MIN_HIDDEN_CHARS = 4
+
 # The longest name a tool may have, which is what OpenAI's API accepts
 MAX_TOOL_NAME_CHARS = 64
 
@@ -108,20 +112,37 @@ class MCPServerConfig:
     :param tools: The names of the tools to offer, or None for all of them.
     :param descriptions: Descriptions the config gives some of them, by name, in place of the
         server's.
+    :param hidden: The values of the environment variables that replaced ${NAME} in the
+        config, each with the ${NAME} it replaced, which messages show in its place.
     """
 
     name: str
     prefix: str
     transport: str
     shown: str
-    command: str | None = None
-    args: tuple[str, ...] = ()
+    command: str | None = field(default=None, repr=False)
+    args: tuple[str, ...] = field(default=(), repr=False)
     env: dict[str, str] = field(default_factory=dict, repr=False)
     cwd: str | None = None
     url: str | None = field(default=None, repr=False)
     headers: dict[str, str] = field(default_factory=dict, repr=False)
     tools: tuple[str, ...] | None = None
     descriptions: dict[str, str] = field(default_factory=dict)
+    hidden: dict[str, str] = field(default_factory=dict, repr=False)
+
+    def redact(self, text: str) -> str:
+        """The text with each value of a variable the config used, as it is or as it appears
+        in a URL, replaced with the ${NAME} it took the place of."""
+        forms: dict[str, str] = {}
+        for value, reference in self.hidden.items():
+            if len(value) >= MIN_HIDDEN_CHARS:
+                for form in (value, quote(value), quote(value, safe=""), quote_plus(value)):
+                    forms.setdefault(form, reference)
+        # Longest first, so that a value inside another is not replaced in it first
+        for form in sorted(forms, key=len, reverse=True):
+            text = text.replace(form, forms[form])
+
+        return text
 
 
 def read_config(config: str | os.PathLike[str] | Mapping[str, Any]) -> dict[str, Any]:
@@ -174,13 +195,19 @@ def read_config(config: str | os.PathLike[str] | Mapping[str, Any]) -> dict[str,
     return dict(servers)
 
 
-def substitute(text: str, server: str) -> str:
+def substitute(text: str, server: str, hidden: dict[str, str] | None = None) -> str:
     """Replaces each ${NAME} with the environment variable NAME, or ${NAME:-default} with its
-    default where NAME is not set."""
+    default where NAME is not set.
+
+    :param hidden: Where to record each variable's value with the ${NAME} it replaced, for
+        messages to show in its place.
+    """
 
     def value(match: re.Match[str]) -> str:
         name, default = match[1], match[2]
         if name in os.environ:
+            if hidden is not None:
+                hidden.setdefault(os.environ[name], f"${{{name}}}")
             return os.environ[name]
         if default is not None:
             return default
@@ -203,7 +230,7 @@ def scalar(value: Any, server: str, what: str) -> str:
     raise TypeError(f"The {what} of the MCP server {server} must be text or a number, not {type(value).__name__}")
 
 
-def text_mapping(value: Any, server: str, what: str) -> dict[str, str]:
+def text_mapping(value: Any, server: str, what: str, hidden: dict[str, str]) -> dict[str, str]:
     if value is None:
         return {}
     if not isinstance(value, Mapping):
@@ -212,7 +239,7 @@ def text_mapping(value: Any, server: str, what: str) -> dict[str, str]:
     for key, item in value.items():
         if not isinstance(key, str) or not key:
             raise ValueError(f"The {what} of the MCP server {server} are named by text, not {key!r}")
-        mapping[key] = substitute(scalar(item, server, f"{what} {key}"), server)
+        mapping[key] = substitute(scalar(item, server, f"{what} {key}"), server, hidden)
 
     return mapping
 
@@ -316,6 +343,7 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
         raise ValueError(f'The MCP server {name} has the type {transport!r}: use "stdio", "http", or "sse"')
 
     tools, descriptions = tool_selection(entry.get("tools"), name)
+    hidden: dict[str, str] = {}
 
     if transport == "stdio":
         if command is None:
@@ -334,16 +362,17 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
                 raise TypeError(f"The args of the MCP server {name} are a list, not {type(args).__name__}")
             parts.extend(scalar(part, name, "args") for part in args)
         shown = " ".join(parts)
-        parts = [substitute(part, name) for part in parts]
+        parts = [substitute(part, name, hidden) for part in parts]
         if not parts[0].strip():
             raise ValueError(f"The command of the MCP server {name} is empty")
         cwd = entry.get("cwd")
         if cwd is not None:
             if not isinstance(cwd, str):
                 raise TypeError(f"The cwd of the MCP server {name} is a path, not {type(cwd).__name__}")
-            cwd = str(Path(substitute(cwd, name)).expanduser())
+            cwd = str(Path(substitute(cwd, name, hidden)).expanduser())
             if not Path(cwd).is_dir():
-                raise FileNotFoundError(f"The MCP server {name} starts in {cwd}, which is not a directory")
+                raise FileNotFoundError(f"The MCP server {name} starts in {entry['cwd']}, which is not a directory")
+        env = text_mapping(entry.get("env"), name, "environment variables", hidden)
 
         return MCPServerConfig(
             name=name,
@@ -352,17 +381,18 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
             shown=shown,
             command=parts[0],
             args=tuple(parts[1:]),
-            env=text_mapping(entry.get("env"), name, "environment variables"),
+            env=env,
             cwd=cwd,
             tools=tools,
             descriptions=descriptions,
+            hidden=hidden,
         )
 
     if not isinstance(url, str):
         raise ValueError(f"The MCP server {name} is reached at a URL, which it does not give")
     if misplaced := sorted({"command", "args", "env", "cwd"} & set(entry)):
         raise ValueError(f"The MCP server {name} is reached at a URL, so {misplaced[0]} is not used: remove it")
-    address = substitute(url, name)
+    address = substitute(url, name, hidden)
     if urlsplit(address).scheme not in ("http", "https") or not urlsplit(address).netloc:
         raise ValueError(f"The MCP server {name} is reached at {url!r}, which is not an http:// or https:// URL")
 
@@ -372,9 +402,10 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
         transport=transport,
         shown=url,
         url=address,
-        headers=text_mapping(entry.get("headers"), name, "headers"),
+        headers=text_mapping(entry.get("headers"), name, "headers", hidden),
         tools=tools,
         descriptions=descriptions,
+        hidden=hidden,
     )
 
 
@@ -496,6 +527,22 @@ def failure_text(error: BaseException) -> str:
     return "; ".join(shown)
 
 
+def connection_ended(client: Any) -> bool:
+    """Whether the SDK has found that a connection ended, as it does when a server started here
+    exits while no call is waiting on it. The task that holds the connection open is not told,
+    so without this the next call would be sent to the server that is gone, and fail.
+
+    The SDK says so only in its dispatcher's private state. Where that is not found, the
+    connection is taken to be open, and a call on one that has ended fails as it would have.
+    """
+    try:
+        dispatcher = client.session._dispatcher
+    except Exception:
+        return False
+
+    return getattr(dispatcher, "_closed", False) is True
+
+
 class EventLoop:
     """An event loop in a thread of its own, which the servers' connections live on, so that a
     tool is called the same way from any thread, inside an event loop or not."""
@@ -579,6 +626,8 @@ class MCPConnection:
             return ""
         if not text:
             return " It wrote nothing to stderr."
+        # Before it is cut short, so that no part of a secret is left at the start
+        text = self.server.redact(text)
         if len(text) > MCP_LOG_TAIL_CHARS:
             text = "..." + text[-MCP_LOG_TAIL_CHARS:]
 
@@ -684,7 +733,7 @@ class MCPConnection:
             if isinstance(error, MCPServerError):
                 raise
             raise MCPServerError(
-                f"Could not {starting} {self.described}: {failure_text(error)}.{self.log_tail()}"
+                f"Could not {starting} {self.described}: {self.server.redact(failure_text(error))}.{self.log_tail()}"
             ) from None
 
         self.client, self.holding = client, holding
@@ -724,6 +773,7 @@ class MCPConnection:
                 self.client is None
                 or self.stopped
                 or (self.holding is not None and self.holding.task is not None and self.holding.task.done())
+                or connection_ended(self.client)
             ):
                 if self.server.transport == "stdio":
                     warnings.warn(
@@ -771,14 +821,20 @@ class MCPConnection:
             if error.code == REQUEST_TIMEOUT:
                 raise too_slow from None
             if error.code != CONNECTION_CLOSED:
-                raise MCPToolError(f"The MCP server {self.server.name} refused the call: {error.message}") from None
+                raise MCPToolError(
+                    f"The MCP server {self.server.name} refused the call: {self.server.redact(error.message)}"
+                ) from None
             self.lost(generation)
             raise self.stopped_error() from None
         except (anyio.ClosedResourceError, anyio.BrokenResourceError, anyio.EndOfStream):
             self.lost(generation)
             raise self.stopped_error() from None
 
-        return tool_result(result, name, self.wrapped.get(name, False))
+        try:
+            return tool_result(result, name, self.wrapped.get(name, False))
+        except MCPToolError as error:
+            # A server's error can quote what it was given, such as a URL with its API key
+            raise MCPToolError(self.server.redact(str(error))) from None
 
     def lost(self, generation: int) -> None:
         with self.lock:
@@ -886,7 +942,8 @@ def connect_mcp(
     PATH and HOME, and it starts in cwd. Or it is reached at its url, over streamable HTTP, or
     over SSE where its type says "sse" or the URL ends in /sse, with headers sent with every
     request. ${NAME} anywhere in these is replaced with the environment variable NAME, and
-    ${NAME:-default} with the default where NAME is not set. A server that says enabled: false,
+    ${NAME:-default} with the default where NAME is not set; errors show ${NAME} in place of
+    its value. A server that says enabled: false,
     or disabled: true, is left out. tools lists the names of the tools to offer, where not all of
     them; an entry in Biomni's form, with biomni_name and a description, gives the tool that
     description in place of the server's.

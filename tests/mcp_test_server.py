@@ -1,6 +1,6 @@
 """An MCP server for the tests of connect_mcp, run as its own process.
 
-python mcp_test_server.py [--pid-file PATH] [--sleep SECONDS] [stdio | http PORT | sse PORT | die]
+python mcp_test_server.py [--pid-file PATH] [--sleep SECONDS] [--say TEXT] [stdio | http PORT | sse PORT | die]
 """
 
 import argparse
@@ -128,11 +128,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--pid-file")
     parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--say", help="Text to write to stderr as the server starts")
     parser.add_argument("mode", nargs="?", default="stdio")
     parser.add_argument("port", nargs="?", type=int)
     arguments = parser.parse_args()
 
     print("the test server is starting", file=sys.stderr, flush=True)
+    if arguments.say:
+        print(arguments.say, file=sys.stderr, flush=True)
     if arguments.pid_file:
         with open(arguments.pid_file, "w") as file:
             file.write(str(os.getpid()))

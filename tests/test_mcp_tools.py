@@ -6,6 +6,7 @@ import base64
 import concurrent.futures
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -372,7 +373,65 @@ class TestReadingAServer:
         assert stdio.shown == "server --token ${GENE_TOKEN}"
         assert http.shown == "https://x.org/mcp?key=${GENE_TOKEN}"
         assert "secret-token" not in repr(http)
-        assert "secret-token" not in repr(stdio).replace(repr(stdio.args), "")
+        assert "secret-token" not in repr(stdio)
+        program = parse_server("genes", {"command": "/opt/${GENE_TOKEN}/server"})
+        assert program is not None and program.command == "/opt/secret-token/server"
+        assert "secret-token" not in repr(program)
+
+    def test_the_values_of_variables_are_kept_to_hide_from_messages(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GENE_TOKEN", "secret-token")
+        monkeypatch.setenv("GENE_HOST", "genes.example.org")
+        monkeypatch.setenv("GENE_HOME", str(tmp_path))
+        monkeypatch.delenv("GENE_MISSING", raising=False)
+
+        stdio = parse_server(
+            "genes",
+            {
+                "command": ["server", "--token", "${GENE_TOKEN}"],
+                "env": {"A": "${GENE_HOST}", "B": "${GENE_MISSING:-x}"},
+                "cwd": "${GENE_HOME}",
+            },
+        )
+        http = parse_server(
+            "search",
+            {"url": "https://${GENE_HOST}/mcp", "headers": {"Authorization": "Bearer ${GENE_TOKEN}"}},
+        )
+
+        assert stdio is not None and http is not None
+        assert stdio.hidden == {
+            "secret-token": "${GENE_TOKEN}",
+            str(tmp_path): "${GENE_HOME}",
+            "genes.example.org": "${GENE_HOST}",
+        }
+        assert http.hidden == {"genes.example.org": "${GENE_HOST}", "secret-token": "${GENE_TOKEN}"}
+        assert parse_server("genes", {"command": "server"}).hidden == {}  # type: ignore[union-attr]
+
+    def test_a_cwd_that_is_not_a_directory_is_named_as_the_config_gives_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GENE_TOKEN", "secret-token")
+
+        with pytest.raises(FileNotFoundError, match=r"starts in /x/\$\{GENE_TOKEN\}, which is not a directory$"):
+            parse_server("genes", {"command": "x", "cwd": "/x/${GENE_TOKEN}"})
+
+    def test_messages_show_a_variable_in_place_of_its_value(self) -> None:
+        server = MCPServerConfig(
+            name="genes",
+            prefix="genes",
+            transport="http",
+            shown="x",
+            hidden={"to/ken =&": "${TOKEN}", "to/ken =&+more": "${LONGER}", "abc": "${SHORT}", "wxyz": "${FOUR}"},
+        )
+
+        assert server.redact("a to/ken =& b") == "a ${TOKEN} b"
+        assert server.redact("?key=to/ken%20%3D%26&") == "?key=${TOKEN}&"
+        assert server.redact("?key=to%2Fken%20%3D%26&") == "?key=${TOKEN}&"
+        assert server.redact("?key=to%2Fken+%3D%26&") == "?key=${TOKEN}&"
+        assert server.redact("to/ken =&+more") == "${LONGER}"
+        # Too short to be a secret, and too likely to be part of something else
+        assert server.redact("abc wxyz") == "abc ${FOUR}"
 
     def test_a_variable_that_is_not_set_is_refused_rather_than_left_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("GENE_MISSING", raising=False)
@@ -656,6 +715,63 @@ class TestWhatAConnectionKeeps:
 
         assert connection.log_tail() == " What it wrote to stderr ends:\n...he end of it"
 
+    def test_what_a_server_wrote_shows_a_variable_in_place_of_its_value(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(mcp_tools_module, "MCP_LOG_TAIL_CHARS", 20)
+        connection = unconnected("stdio", hidden={"secret-token-0123456789": "${GENE_TOKEN}"})
+        connection.log_path = tmp_path / "server.log"
+        connection.log_path.write_text("the key is secret-token-0123456789\n")
+
+        assert connection.log_tail() == " What it wrote to stderr ends:\n...key is ${GENE_TOKEN}"
+
+    @pytest.mark.parametrize(
+        ("answer", "message"),
+        [
+            (
+                MCPError(code=-32602, message="No key secret-token"),
+                "^The MCP server genes refused the call: No key \\$\\{GENE_TOKEN\\}$",
+            ),
+            (
+                SimpleNamespace(is_error=True, content=[TextContent(type="text", text="Bad URL ?key=secret-token")]),
+                "^Bad URL \\?key=\\$\\{GENE_TOKEN\\}$",
+            ),
+        ],
+    )
+    def test_a_refused_or_failed_call_shows_a_variable_in_place_of_its_value(self, answer: Any, message: str) -> None:
+        class Answering:
+            async def call_tool(self, name: str, arguments: dict[str, Any], read_timeout_seconds: float | None) -> Any:
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+
+        loop = mcp_tools_module.EventLoop()
+        connection = unconnected(hidden={"secret-token": "${GENE_TOKEN}"})
+        connection.loop, connection.timeout = loop, 1.0
+        connection.client, connection.holding, connection.generation = Answering(), mcp_tools_module.Holding(), 1
+        connection.holding.task = concurrent.futures.Future()
+        try:
+            with pytest.raises(MCPToolError, match=message):
+                connection.call("lookup", symbol="TP53")
+        finally:
+            loop.stop()
+
+    def test_a_connection_the_sdk_found_to_have_ended_is_made_again(self) -> None:
+        def ending(closed: Any) -> Any:
+            return SimpleNamespace(session=SimpleNamespace(_dispatcher=SimpleNamespace(_closed=closed)))
+
+        class Unentered:
+            @property
+            def session(self) -> Any:
+                raise RuntimeError("Client must be used within an async context manager")
+
+        assert mcp_tools_module.connection_ended(ending(True)) is True
+        assert mcp_tools_module.connection_ended(ending(False)) is False
+        # Where the SDK no longer says, the connection is taken to be open, as before
+        assert mcp_tools_module.connection_ended(SimpleNamespace(session=SimpleNamespace())) is False
+        assert mcp_tools_module.connection_ended(SimpleNamespace(session=SimpleNamespace(_dispatcher=object()))) is False
+        assert mcp_tools_module.connection_ended(Unentered()) is False
+
 
 class TestConnecting:
     def test_without_the_sdk_the_error_says_how_to_install_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -902,6 +1018,24 @@ class TestAServerThatStopsOrCannotStart:
             with pytest.warns(UserWarning, match="genes stopped, so it is started again"):
                 assert process.function() != first
 
+    def test_a_server_that_stops_between_calls_is_started_again_at_the_next_without_it_failing(self) -> None:
+        with connect_mcp(stdio_config(tools=["process"]), timeout=10) as tools:
+            connection = tools.connections[0]
+            process = tools.tools[0]
+            first = process.function()
+            assert mcp_tools_module.connection_ended(connection.client) is False
+
+            os.kill(first, signal.SIGKILL)
+            assert wait_until_stopped(first)
+            deadline = time.monotonic() + 15
+            while not mcp_tools_module.connection_ended(connection.client) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert mcp_tools_module.connection_ended(connection.client) is True
+
+            with pytest.warns(UserWarning, match="genes stopped, so it is started again"):
+                second = process.function()
+            assert second != first
+
     def test_a_server_whose_tools_cannot_be_listed_is_stopped(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -938,6 +1072,24 @@ class TestAServerThatStopsOrCannotStart:
         message = str(failed.value)
         assert message.startswith(f"Could not start the MCP server genes (started with {sys.executable} {SERVER} die): ")
         assert "the test server has no config, so it stops" in message
+
+    def test_what_a_server_that_exits_wrote_shows_a_variable_in_place_of_its_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GENE_TOKEN", "secret-token")
+
+        with pytest.raises(MCPServerError) as failed:
+            connect_mcp(stdio_config("--say", "my key is ${GENE_TOKEN}", "die"))
+
+        assert "secret-token" not in str(failed.value)
+        assert "What it wrote to stderr ends:\nthe test server is starting\nmy key is ${GENE_TOKEN}\n" in str(failed.value)
+
+    def test_a_tool_that_fails_shows_a_variable_in_place_of_its_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GENE_TOKEN", "secret-token")
+
+        with connect_mcp(stdio_config(env={"TOKEN": "${GENE_TOKEN}"}, tools=["lookup"])) as tools:
+            with pytest.raises(MCPToolError, match=r"^Error executing tool lookup: There is no gene \$\{GENE_TOKEN\}$"):
+                tools.tools[0].function(symbol="secret-token")
 
     def test_a_command_that_is_not_there_says_so(self) -> None:
         with pytest.raises(MCPServerError, match="Could not start the MCP server genes .*FileNotFoundError.*It wrote nothing to stderr"):
@@ -1076,3 +1228,18 @@ class TestServersReachedAtAURL:
 
         with pytest.raises(MCPServerError, match=f"Could not connect to the MCP server remote \\(at {url}\\): ConnectError"):
             connect_mcp({"remote": {"url": url}})
+
+    def test_a_server_that_refuses_the_connection_shows_a_variable_in_place_of_its_value(
+        self, http_server: HTTPServer, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GENE_TOKEN", "secret/token+1")
+        # The server speaks streamable HTTP, so it answers 404, with the URL, to a client of SSE
+        url = http_server.url.removesuffix("/mcp") + "/sse?key=${GENE_TOKEN}"
+
+        with pytest.raises(MCPServerError) as failed:
+            connect_mcp({"remote": {"url": url}})
+
+        message = str(failed.value)
+        assert "404" in message
+        assert "secret" not in message
+        assert message.count("key=${GENE_TOKEN}") == 2
