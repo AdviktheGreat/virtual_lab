@@ -387,15 +387,26 @@ class TestCheckInstalled:
         (tmp_path / "package_xyz").mkdir()
         (tmp_path / "package_xyz" / "__init__.py").write_text("")
         (tmp_path / "script_xyz.py").write_text("")
+        # Installed in a virtual environment kept in the working directory, which is software
+        site = tmp_path / ".venv" / "lib" / "site-packages"
+        (site / "installed_package_xyz").mkdir(parents=True)
+        (site / "installed_package_xyz" / "__init__.py").write_text("")
+        (site / "installed_module_xyz.py").write_text("")
         monkeypatch.chdir(tmp_path)
         # Through a link, as the same directory can be reached by another path
         (tmp_path.parent / f"{tmp_path.name}-link").symlink_to(tmp_path)
         monkeypatch.syspath_prepend(str(tmp_path.parent / f"{tmp_path.name}-link"))
+        monkeypatch.syspath_prepend(str(site))
 
-        report_installed(["output_folder_xyz", "package_xyz", "script_xyz", "_pytest", "sys"], {}, [], 60)
+        report_installed(
+            ["output_folder_xyz", "package_xyz", "script_xyz", "installed_package_xyz", "installed_module_xyz", "sys"],
+            {},
+            [],
+            60,
+        )
 
         found = json.loads(capsys.readouterr().out.strip()[len(INSTALLED_MARKER) :])
-        assert found["libraries"] == ["_pytest", "sys"]
+        assert found["libraries"] == ["installed_package_xyz", "installed_module_xyz", "sys"]
 
     def test_with_no_modules_none_are_imported(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
