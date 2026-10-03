@@ -483,6 +483,39 @@ Three things about this are deliberate:
 
 **Coordinates go to disk, not into the conversation.** One moderate structure file is several hundred kilobytes, and code an agent writes runs in a sandbox with no network of its own. So `fetch_structure_file` fetches outside the sandbox and writes into `artifacts/<save_name>/structures`, which is inside the one directory mounted into the container, and reports back the path to use from there. A file written anywhere else is invisible to the code that needs it. Where it writes is bound when the tool is built and is not a parameter a model fills in, which is why `all_tools` takes the same `save_dir` and `save_name` that `run_meeting` does.
 
+### Your own tools
+
+`tool_from_function` makes a tool of any Python function, the way Biomni's `add_tool` does. Biomni asks a model to read the function's source and write out its parameters. Here the parameters come from the signature and its type hints, and the descriptions from the docstring, so nothing is invented:
+
+```python
+from virtual_lab import tool_from_function
+
+def gc_content(sequence: str, window: int = 100) -> list[float]:
+    """The GC fraction of a DNA sequence, in windows along it.
+
+    :param sequence: The sequence, as A, C, G, and T.
+    :param window: How many bases each window spans.
+    """
+    ...
+
+tool = tool_from_function(gc_content)
+hold_meeting(..., tools=(tool,))     # the agents call it as a tool
+```
+
+A parameter without a default is required, and each is typed by its hint: `str`, `int`, `float`, `bool`, `list[str]`, `dict[str, float]`, `Literal["a", "b"]`, an `Enum`, a `Path`, a `date`, a pydantic model, or anything else pydantic can read from JSON. The arguments a model sends are converted to those types before the function is called, so `"5"` becomes `5` and `{"start": 1, ...}` becomes the model it describes. Arguments that are wrong are not passed on: the model is told what was wrong and can correct the call. The docstring can be in the reST, Google, or NumPy style. `name=` and `description=` override what the function says of itself. A `functools.partial` leaves the arguments it binds out of the tool, and an async function is waited for. A parameter whose type cannot come from JSON, such as a pandas DataFrame, is refused, since no model can pass one; take a path to the file instead.
+
+A function with no docstring needs `description=`, or a model to describe it: `tool_from_function(f, model="gpt-4o")` asks it once, from the function's source, and prints what it wrote. Only the descriptions come from the model; the parameters still come from the signature. A model can describe the same function differently each time, and a project resumed with a tool described differently holds its meetings again, so keep a description you are happy with by adding it to the function as its docstring.
+
+Give the tool to a session instead, and code in the session calls it like any other function, without importing it, as Biomni's agent calls the tools added to it:
+
+```python
+with DockerSession(Path("results/session"), tools=(tool,)) as session:
+    session.run("profile = gc_content(sequence, window=50)")
+    hold_meeting(..., session=session)  # the agents are told of gc_content, and their code calls it
+```
+
+The function runs on your machine, outside the container. When code in the sandbox calls it, the call comes out over the session's own connection as JSON, the function runs here, and what it returns goes back the same way. A tool can therefore use what the sandbox does not have: the network when the session has none, an API key the sandbox is never given, a GPU, a licensed program, or files outside the session's directory. That is also the risk: a tool can do whatever the function does, with your permissions, on arguments that code written by a model chose. Give a session only tools you would let that code call. Arguments and results are JSON. NumPy arrays, sets, and paths are converted, and anything else is refused with advice to convert it or pass a file instead. A failure in the tool raises `HostToolError` in the code. A call counts towards the time limit of the code that made it: code stopped at its limit while a tool runs keeps its session, and the tool is left to finish, its result unused. Each call is recorded with the cell that made it: the tool, its arguments, how it ended, and how long it took. The tools are listed to a meeting's agents ahead of Biomni's resources, as functions added for this work that they should prefer, again as Biomni lists the tools added to its agent. Changing a session's tools changes the inputs of every project step held with it. R and bash code cannot call them, and a tool cannot run code in the session whose code called it.
+
 ### What these services will tell you that is not true
 
 Each lookup refuses a particular confident wrong answer, because every one of these arrives as a successful response rather than as an error:

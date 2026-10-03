@@ -14,14 +14,24 @@ disk.
 
 Python code runs in one namespace that outlives each request, the way a notebook's cells do. R
 and shell code run as a fresh Rscript or bash process each time, as they do in Biomni.
+
+A session can also define functions in that namespace that run outside it, on the host: tools
+of the user's own, which may need what the sandbox does not have, such as the network, a key, or
+a GPU. Calling one writes the call to the session as a line of JSON, beside the answers, and
+waits for the reply the session writes back on standard input, so each line arriving there is
+either a request or the reply to a call.
 """
 
 from __future__ import annotations
 
 import ast
+import contextlib
+import inspect
 import json
+import keyword
 import linecache
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -53,6 +63,15 @@ MAX_FIGURES = 50
 
 INTERPRETERS = {"r": ("Rscript",), "bash": ("bash",)}
 
+# Most bytes of a call to a host tool, unless the session says otherwise. The session reads each
+# line written to it up to a limit, and a longer one would end it.
+MAX_CALL_BYTES = 2 * 1024**2
+
+# Seconds between looks at the time limit while waiting for a host tool's reply. The signal that
+# stops code at its limit can be delivered to another thread, which a wait without a timeout
+# would not notice until the reply came.
+REPLY_POLL_SECONDS = 0.1
+
 
 class CellTimeout(BaseException):
     """Raised in the code when its time is up.
@@ -60,6 +79,61 @@ class CellTimeout(BaseException):
     A BaseException, like KeyboardInterrupt, so that the "except Exception" code commonly wraps
     its work in does not swallow it and carry on.
     """
+
+
+class Unreadable:
+    """A line that could not be read as JSON, kept to be answered as a request would be."""
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+
+class HostToolError(RuntimeError):
+    """Raised in the code when a host tool it called failed, or could not be called."""
+
+
+class Default:
+    """Stands for a parameter's default, which the host tool applies itself, so that leaving the
+    parameter out and passing its default are the same call. Shown as the default, where known."""
+
+    def __init__(self, shown: str) -> None:
+        self.shown = shown
+
+    def __repr__(self) -> str:
+        return self.shown
+
+
+@contextlib.contextmanager
+def alarm_deferred():
+    """Holds the time limit's signal back while a line is written, since a line cut short would
+    run into the next one and leave the session unable to read either."""
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+    else:
+        yield
+
+
+def to_json(value: object) -> object:
+    """Converts what json cannot write itself: numpy arrays and scalars, sets, and paths."""
+    for method in ("tolist", "item"):
+        if callable(getattr(value, method, None)):
+            try:
+                return getattr(value, method)()
+            except Exception:
+                pass
+    if isinstance(value, (set, frozenset)):
+        return list(value)
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+
+    raise TypeError(
+        f"a {type(value).__name__} cannot be passed as JSON; convert it first, a table to a list of "
+        "rows with .to_dict('records'), say, or write it to a file and pass the file's path"
+    )
 
 
 class Capture:
@@ -124,8 +198,42 @@ class Kernel:
         self.home = os.getcwd()
         self.can_time_out = hasattr(signal, "setitimer")
         warnings.filterwarnings("ignore", message=".*non-interactive.*cannot be shown")
+        self.outbox = None
+        self.write_lock = threading.Lock()
+        # Guards which request is running, and the calls waiting for replies
+        self.calls = threading.Condition()
+        self.running = None
+        self.call_count = 0
+        self.replies: dict = {}
+        self.max_call_bytes = MAX_CALL_BYTES
+
+    def send(self, message: dict) -> None:
+        """Writes one line to the session."""
+        line = json.dumps(message) + "\n"
+        with self.write_lock:
+            self.outbox.write(line)
+            self.outbox.flush()
 
     def handle(self, request: dict) -> dict:
+        with self.calls:
+            self.running = request.get("id")
+        try:
+            return self.run_request(request)
+        finally:
+            self.end_calls()
+
+    def end_calls(self) -> None:
+        """Ends the calls still waiting when the code that made them has finished.
+
+        Only a thread the code started can still be waiting. The session stops listening for
+        calls once it has the answer, so a call made after it would never be answered.
+        """
+        with self.calls:
+            self.running = None
+            self.replies.clear()
+            self.calls.notify_all()
+
+    def run_request(self, request: dict) -> dict:
         self.cells += 1
         language = str(request.get("language", "python")).strip().casefold()
         code = str(request.get("code", ""))
@@ -184,6 +292,120 @@ class Kernel:
             "duration": time.monotonic() - start,
         }
 
+    def deliver(self, reply: dict) -> None:
+        """Hands a reply to the call waiting for it. A reply nothing waits for is dropped: the
+        call was given up at a time limit, or the code that made it has finished."""
+        with self.calls:
+            call = reply.get("reply")
+            if call in self.replies and self.replies[call] is None:
+                self.replies[call] = reply
+                self.calls.notify_all()
+
+    def call_host(self, name: str, arguments: dict) -> object:
+        """Calls a host tool and waits for what it returns."""
+        with self.calls:
+            request = self.running
+            if request is None:
+                raise HostToolError(
+                    f"{name} can only be called while code is running in the session, and the code "
+                    "that started this thread has finished"
+                )
+            try:
+                line = json.dumps(
+                    {"call": self.call_count + 1, "request": request, "tool": name, "arguments": arguments},
+                    default=to_json,
+                )
+            except (TypeError, ValueError) as error:
+                raise TypeError(f"The arguments to {name} must be JSON: {error}") from None
+            if len(line) + 1 > self.max_call_bytes:
+                raise ValueError(
+                    f"The arguments to {name} are {len(line):,} bytes of JSON, more than the "
+                    f"{self.max_call_bytes - 1:,} a call can carry. Write them to a file and pass its path."
+                )
+            self.call_count += 1
+            call = self.call_count
+            self.replies[call] = None
+            # Written while the lock is held, so that it cannot follow the request's answer
+            with alarm_deferred(), self.write_lock:
+                self.outbox.write(line + "\n")
+                self.outbox.flush()
+
+            try:
+                while self.replies.get(call) is None:
+                    if self.running != request or call not in self.replies:
+                        raise HostToolError(f"{name} was still running when the code that called it finished")
+                    self.calls.wait(REPLY_POLL_SECONDS)
+                reply = self.replies[call]
+            finally:
+                self.replies.pop(call, None)
+
+        if reply.get("error") is not None:
+            raise HostToolError(f"{name} failed: {reply['error']}")
+
+        return reply.get("result")
+
+    def define_tools(self, request: dict) -> dict:
+        """Defines a function in the namespace for each host tool, which calls it."""
+        answer = {
+            "id": request.get("id"),
+            "status": "ok",
+            "error": None,
+            "output": "",
+            "output_dropped": 0,
+            "plots": [],
+            "duration": 0.0,
+        }
+        try:
+            self.max_call_bytes = int(request.get("max_call_bytes") or MAX_CALL_BYTES)
+            stubs = {str(spec["name"]): self.make_stub(spec) for spec in request["tools"]}
+        except Exception as error:
+            answer.update(status="error", error=f"Could not define the tools: {type(error).__name__}: {error}")
+            return answer
+        self.namespace.update(stubs)
+        return answer
+
+    def make_stub(self, spec: dict):
+        """A function taking the tool's parameters, as its signature on the host orders them."""
+        name = str(spec["name"])
+        parameters = []
+        untakeable = False
+        for item in spec.get("parameters", []):
+            parameter = str(item["name"])
+            # A parameter Python cannot name, such as "max-results", is passed with **
+            if not parameter.isidentifier() or keyword.iskeyword(parameter):
+                untakeable = True
+                continue
+            kind = inspect.Parameter.KEYWORD_ONLY if item.get("keyword_only") else inspect.Parameter.POSITIONAL_OR_KEYWORD
+            default = inspect.Parameter.empty if item.get("required") else Default(str(item.get("default", "<default>")))
+            parameters.append(inspect.Parameter(parameter, kind, default=default))
+        if untakeable:
+            rest = "arguments"
+            while rest in {parameter.name for parameter in parameters}:
+                rest = f"_{rest}"
+            parameters.append(inspect.Parameter(rest, inspect.Parameter.VAR_KEYWORD))
+        signature = inspect.Signature(parameters)
+        kernel = self
+
+        def stub(*args, **kwargs):
+            try:
+                bound = signature.bind(*args, **kwargs)
+            except TypeError as error:
+                raise TypeError(f"{name}() {error}") from None
+            arguments = {}
+            for key, value in bound.arguments.items():
+                if signature.parameters[key].kind is inspect.Parameter.VAR_KEYWORD:
+                    arguments.update(value)
+                else:
+                    arguments[key] = value
+            return kernel.call_host(name, arguments)
+
+        stub.__name__ = stub.__qualname__ = name
+        stub.__signature__ = signature
+        stub.__doc__ = str(spec.get("description") or "")
+        stub.__module__ = "host_tools"
+
+        return stub
+
     def start_timer(self, timeout: float) -> None:
         if timeout > 0 and self.can_time_out:
             signal.signal(signal.SIGALRM, raise_timeout)
@@ -222,9 +444,14 @@ class Kernel:
         except CellTimeout:
             raise
         except BaseException as error:
-            # The first frame is the exec above, which is not the code's own
+            # The first frame is the exec above, which is not the code's own, and the kernel's
+            # frames below the code's, where it called a host tool, are not either
             frames = error.__traceback__.tb_next if error.__traceback__ else None
-            traceback.print_exception(type(error), error, frames)
+            report = traceback.TracebackException(type(error), error, frames)
+            report.stack = traceback.StackSummary.from_list(
+                [frame for frame in report.stack if frame.filename != KERNEL_FILE]
+            )
+            sys.stderr.write("".join(report.format()))
             return "".join(traceback.format_exception_only(type(error), error)).strip()
 
         return None
@@ -289,6 +516,10 @@ def raise_timeout(signum: int, frame: object) -> None:
     raise CellTimeout()
 
 
+# Where the kernel's own code is, as a traceback names it: "<string>" when run with -c
+KERNEL_FILE = raise_timeout.__code__.co_filename
+
+
 def kill_group(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -333,29 +564,45 @@ def main() -> None:
     sys.stdin = open(os.devnull, encoding="utf-8")
 
     kernel = Kernel()
-    outbox.write(json.dumps({"ready": True, "python": sys.version.split()[0], "pid": os.getpid()}) + "\n")
-    outbox.flush()
+    kernel.outbox = outbox
+    kernel.send({"ready": True, "python": sys.version.split()[0], "pid": os.getpid()})
 
-    for line in inbox:
-        try:
-            request = json.loads(line)
-            if not isinstance(request, dict):
-                raise ValueError("not an object")
-        except ValueError as error:
+    # Read in a thread of its own, so that the reply to a host tool's call is read while the
+    # code that made the call is still running
+    requests: queue.Queue = queue.Queue()
+
+    def read_inbox() -> None:
+        for line in inbox:
+            try:
+                message = json.loads(line)
+            except ValueError as error:
+                requests.put(Unreadable(str(error)))
+                continue
+            if isinstance(message, dict) and "reply" in message:
+                kernel.deliver(message)
+            else:
+                requests.put(message)
+        requests.put(None)
+
+    threading.Thread(target=read_inbox, daemon=True).start()
+
+    while (request := requests.get()) is not None:
+        if isinstance(request, dict) and "tools" in request:
+            response = kernel.define_tools(request)
+        elif isinstance(request, dict):
+            response = kernel.handle(request)
+        else:
             # Answered all the same, since the other end waits for one answer per request
             response = {
                 "id": None,
                 "status": "error",
-                "error": f"Unreadable request: {error}",
+                "error": f"Unreadable request: {request.error if isinstance(request, Unreadable) else 'not an object'}",
                 "output": "",
                 "output_dropped": 0,
                 "plots": [],
                 "duration": 0.0,
             }
-        else:
-            response = kernel.handle(request)
-        outbox.write(json.dumps(response) + "\n")
-        outbox.flush()
+        kernel.send(response)
 
 
 if __name__ == "__main__":
