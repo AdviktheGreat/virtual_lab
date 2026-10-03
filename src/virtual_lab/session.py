@@ -469,7 +469,8 @@ class Session:
     :param timeout: Seconds each piece of code may run, unless it is given its own limit.
     :param start_timeout: Seconds to wait for the interpreter to start.
     :param tools: Tools for code in the session to call by name, as functions it need not
-        import, which run here rather than in the session; see tool_from_function. A call
+        import, which run here rather than in the session; see tool_from_function and
+        connect_mcp. A call
         takes up the time of the code that made it, and one still running when that code
         stops at its limit is left to finish, its result unused.
     :param data: Files and directories for the code to read, each by its path here, with what

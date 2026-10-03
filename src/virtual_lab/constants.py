@@ -280,6 +280,18 @@ MAX_SESSION_RESPONSE_BYTES = 2 * 1024**2
 # are bounded by MAX_SESSION_RESPONSE_BYTES, since they come back the way answers do.
 MAX_HOST_TOOL_RESULT_BYTES = 16 * 1024**2
 
+# Seconds a call to a tool of an MCP server may take before it is given up, and the agent told so
+MCP_CALL_TIMEOUT = 300.0
+# Seconds an MCP server may take to start, or be connected to, and list its tools. Generous, since
+# a server run with npx or docker may first have to be downloaded.
+MCP_START_TIMEOUT = 120.0
+# Seconds an MCP server is given to stop once it is closed, before it is stopped regardless
+MCP_STOP_TIMEOUT = 10.0
+# Most characters of what an MCP server wrote to stderr shown when it fails to start or stops
+MCP_LOG_TAIL_CHARS = 2_000
+# Most pages an MCP server may list its tools in, so that a server whose pages never end cannot
+# keep a connection from finishing
+MCP_MAX_TOOL_PAGES = 1_000
 # Most characters of a tool call's arguments kept in a session's record of it
 MAX_RECORDED_ARGUMENT_CHARS = 10_000
 

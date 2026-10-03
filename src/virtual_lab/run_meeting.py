@@ -177,8 +177,8 @@ def hold_meeting(
     :param pubmed_search: Whether to include a PubMed search tool. Shorthand for passing
         PUBMED_TOOL in tools.
     :param tools: Additional tools the agents may call during the meeting. Make one of a
-        function of your own with tool_from_function. To have code in a session call it instead,
-        give it to the session.
+        function of your own with tool_from_function, or take an MCP server's with connect_mcp.
+        To have code in a session call it instead, give it to the session.
     :param output_schema: A pydantic model for the meeting's conclusions. When given, the agent who
         closed the meeting is asked to restate them against the schema in one additional call, and
         the result is saved under save_dir/outputs/. Note that the API makes every field of the

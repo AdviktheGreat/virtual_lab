@@ -56,6 +56,8 @@ bedrock = ["langchain-aws>=1.0"]
 # Biomni's benchmarks: pyarrow reads their files, numpy shuffles LAB-Bench's options as Biomni
 # does, and pandas gives Biomni's BiomniEval1 its DataFrames
 eval = ["numpy", "pandas", "pyarrow"]
+# Tools from MCP servers, with connect_mcp. PyYAML reads Biomni's YAML configs
+mcp = ["mcp>=2.3,<3", "PyYAML"]
 nanobody-design = [
     "biopython",
     "pandas",
@@ -66,6 +68,9 @@ nanobody-design = [
 ]
 dev = [
     "pytest",
+    # So that the tests of connect_mcp run, rather than being skipped
+    "mcp>=2.3,<3",
+    "PyYAML",
 ]
 
 [tool.hatch.version]
