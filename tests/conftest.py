@@ -1,7 +1,6 @@
 """Shared fixtures for building fake OpenAI and HTTP responses without hitting either."""
 
 import json
-import time
 from importlib import import_module
 from typing import Any
 

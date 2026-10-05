@@ -68,9 +68,8 @@ nanobody-design = [
 ]
 dev = [
     "pytest",
-    # So that the tests of connect_mcp run, rather than being skipped
-    "mcp>=2.3,<3",
-    "PyYAML",
+    # Every extra the tests use, so that none of them is skipped or fails for want of a package
+    "virtual-lab[bedrock,eval,mcp,ollama]",
 ]
 
 [tool.hatch.version]

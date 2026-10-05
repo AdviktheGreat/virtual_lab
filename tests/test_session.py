@@ -543,14 +543,14 @@ class TestDocker:
         assert command[command.index("--network") + 1] == "none"
         assert command[-4:] == ["python3", "-u", "-c", KERNEL_SOURCE]
 
-    def test_the_default_is_biomnis_full_environment_on_the_network(self) -> None:
+    def test_the_default_is_biomnis_full_environment_on_the_network(self, tmp_path: Path) -> None:
         executor = session_executor()
 
         assert executor.image == sandbox_image("full")
         assert executor.platform == SANDBOX_PLATFORM
         assert executor.allow_network is True
         assert executor.memory_limit == DEFAULT_SESSION_MEMORY_LIMIT
-        assert DockerSession(Path("unused-session-dir")).executor == executor
+        assert DockerSession(tmp_path / "work").executor == executor
 
     def test_an_unbuilt_sandbox_image_is_reported_with_how_to_build_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

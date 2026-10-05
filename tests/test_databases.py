@@ -8,7 +8,6 @@ fields these fixtures claim exist really do, and they run when VIRTUAL_LAB_LIVE_
 """
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -33,7 +32,6 @@ from virtual_lab.records import (
 from virtual_lab.databases import (
     Chain,
     PredictedStructure,
-    Protein,
     Structure,
     bounded,
     download_structure,

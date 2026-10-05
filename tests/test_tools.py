@@ -539,7 +539,7 @@ class TestTheStructureDownloadTool:
             if t.name == "fetch_structure_file"
         ][0]
 
-        output = tool.function(identifier="4HHB")
+        tool.function(identifier="4HHB")
 
         work_dir = tmp_path / ARTIFACT_DIR_NAME / "meeting"
         written = work_dir / STRUCTURE_DIR_NAME / "4HHB.cif"
