@@ -15,12 +15,9 @@ import os
 import pytest
 
 from conftest import FakeResponse
-from virtual_lab import chemistry
 from virtual_lab.chemistry import (
     Activity,
     ActivityResults,
-    Compound,
-    Drug,
     DrugHit,
     SearchHits,
     Target,
