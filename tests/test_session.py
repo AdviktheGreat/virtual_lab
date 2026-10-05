@@ -203,6 +203,100 @@ class TestPython:
         assert "bytes of output truncated" in result.output
 
 
+class TestEvaluate:
+    def test_the_value_of_the_last_expression_is_sent_back_rather_than_printed(
+        self, session: LocalSession
+    ) -> None:
+        result = session.evaluate("print('working')\n{'genes': ['TP53'], 'count': 1, 'ratio': 0.5, 'ok': True}")
+
+        assert result.succeeded
+        assert result.value == {"genes": ["TP53"], "count": 1, "ratio": 0.5, "ok": True}
+        assert result.output == "working\n"
+
+    def test_what_json_has_no_type_for_is_converted(self, session: LocalSession) -> None:
+        result = session.evaluate("import pathlib\n{'members': {3}, 'where': pathlib.Path('a/b'), 'pair': (1, 2)}")
+
+        assert result.value == {"members": [3], "where": "a/b", "pair": [1, 2]}
+
+    def test_numpy_arrays_and_scalars_are_converted(self, session: LocalSession) -> None:
+        pytest.importorskip("numpy")
+
+        result = session.evaluate("import numpy as np\n{'array': np.arange(3), 'mean': np.float64(1.5)}")
+
+        assert result.value == {"array": [0, 1, 2], "mean": 1.5}
+
+    def test_a_value_is_not_carried_over_to_the_next_code(self, session: LocalSession) -> None:
+        session.evaluate("41")
+
+        assert session.evaluate("y = 1").value is None
+
+    def test_code_ending_in_a_statement_has_no_value(self, session: LocalSession) -> None:
+        result = session.evaluate("x = 41")
+
+        assert result.succeeded
+        assert result.value is None
+        assert session.run("x").output == "41\n"
+
+    def test_a_value_that_is_not_json_fails_the_code_but_keeps_what_it_did(self, session: LocalSession) -> None:
+        result = session.evaluate("made = 'yes'\nobject()")
+
+        assert result.status == "error"
+        assert result.value is None
+        assert "cannot be sent back" in result.error
+        assert "a object is not JSON" in result.error
+        assert "return the file's path" in result.error
+        assert session.run("made").output == "'yes'\n"
+
+    def test_a_value_too_large_to_send_back_fails_the_code_without_ending_the_session(
+        self, session: LocalSession
+    ) -> None:
+        result = session.evaluate("'x' * (2 * 1024**2)")
+
+        assert result.status == "error"
+        assert "more than the 1,048,576" in result.error
+        assert session.run("1").start == 1
+
+    def test_a_value_just_within_the_limit_is_sent_back(self, session: LocalSession) -> None:
+        # Two bytes of the JSON are the quotes around the string
+        result = session.evaluate("'x' * (1024**2 - 2)")
+
+        assert result.succeeded
+        assert len(result.value) == 1024**2 - 2
+
+    def test_code_that_fails_has_no_value(self, session: LocalSession) -> None:
+        result = session.evaluate("1 / 0")
+
+        assert result.status == "error"
+        assert result.error == "ZeroDivisionError: division by zero"
+        assert result.value is None
+
+    def test_code_stopped_at_its_limit_has_no_value(self, session: LocalSession) -> None:
+        result = session.evaluate("import time\ntime.sleep(5)\n1", timeout=0.5)
+
+        assert result.status == "timeout"
+        assert result.value is None
+
+    def test_the_value_is_kept_as_underscore_as_a_printed_one_is(self, session: LocalSession) -> None:
+        session.evaluate("[1, 2, 3]")
+
+        assert session.run("_").output == "[1, 2, 3]\n"
+
+    def test_the_run_is_recorded_with_its_value(self, session: LocalSession) -> None:
+        session.evaluate("{'a': 1}")
+
+        assert session.history[-1].value == {"a": 1}
+        assert session.history[-1].to_dict()["value"] == {"a": 1}
+
+    def test_run_still_prints_the_value_and_has_none(self, session: LocalSession) -> None:
+        session.evaluate("1")
+
+        result = session.run("{'a': 1}")
+
+        assert result.output == "{'a': 1}\n"
+        assert result.value is None
+        assert result.to_dict()["value"] is None
+
+
 class TestTimeLimits:
     def test_code_is_stopped_at_its_limit_and_the_session_keeps_its_state(
         self, session: LocalSession
