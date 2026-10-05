@@ -27,6 +27,8 @@ dependencies = [
     "openai>=1.92",
     # Already required by openai, declared here because meeting output schemas are pydantic models
     "pydantic>=2.4",
+    # Reads API keys from a .env file, as Biomni does
+    "python-dotenv>=1.0",
     "requests",
     "tiktoken",
     "tqdm",
@@ -56,7 +58,8 @@ bedrock = ["langchain-aws>=1.0"]
 # Biomni's benchmarks: pyarrow reads their files, numpy shuffles LAB-Bench's options as Biomni
 # does, and pandas gives Biomni's BiomniEval1 its DataFrames
 eval = ["numpy", "pandas", "pyarrow"]
-# Tools from MCP servers, with connect_mcp. PyYAML reads Biomni's YAML configs
+# Tools from MCP servers, with connect_mcp, and tools served over MCP, with serve_mcp and
+# virtual-lab-mcp. PyYAML reads Biomni's YAML configs
 mcp = ["mcp>=2.3,<3", "PyYAML"]
 nanobody-design = [
     "biopython",
@@ -71,6 +74,9 @@ dev = [
     # Every extra the tests use, so that none of them is skipped or fails for want of a package
     "virtual-lab[bedrock,eval,mcp,ollama]",
 ]
+
+[project.scripts]
+virtual-lab-mcp = "virtual_lab.mcp_server:main"
 
 [tool.hatch.version]
 path = "src/virtual_lab/__about__.py"

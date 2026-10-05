@@ -1,6 +1,14 @@
 """Virtual Lab package."""
 
+import importlib
+from typing import Any
+
 from virtual_lab.__about__ import __version__
+from virtual_lab.env_file import load_default_env, load_env
+
+# First, so that every module imported after it sees the keys the .env file sets, as Biomni's do
+load_default_env()
+
 from virtual_lab.actions import CodeAction, find_code_action
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts, CodeFile, UnsafeFilenameError, save_artifacts
@@ -154,6 +162,7 @@ from virtual_lab.tools import (
     structure_file_tool,
     tools_for,
 )
+from virtual_lab.toolbox import BiomniToolError, biomni_session_tools
 from virtual_lab.utils import BudgetExceededError, CostUnknownError
 from virtual_lab.web import (
     ALLOWED_HOSTS,
@@ -183,6 +192,7 @@ __all__ = [
     "BenchmarkError",
     "BiomniEval1",
     "BiomniEval1Benchmark",
+    "BiomniToolError",
     "BudgetExceededError",
     "CHEMBL_ACTIVITIES_TOOL",
     "CHEMBL_LOOKUP_TOOL",
@@ -281,10 +291,12 @@ __all__ = [
     "all_tools",
     "available_resources",
     "biomni_package_directory",
+    "biomni_session_tools",
     "biomni_tools",
     "build_sandbox_image",
     "commercial_data_lake",
     "connect_mcp",
+    "create_mcp_server",
     "data_file_tools",
     "describe_table",
     "detect_source",
@@ -303,6 +315,7 @@ __all__ = [
     "get_structure",
     "hold_meeting",
     "list_data_files",
+    "load_env",
     "load_know_how",
     "request_json",
     "request_text",
@@ -320,6 +333,7 @@ __all__ = [
     "search_proteins",
     "search_targets",
     "select_resources",
+    "serve_mcp",
     "session_executor",
     "session_tool",
     "session_tools_prompt",
@@ -327,3 +341,14 @@ __all__ = [
     "tool_from_function",
     "tools_for",
 ]
+
+# Imported when first used, so that python -m virtual_lab.mcp_server does not find the module it
+# runs already imported by the package, which runpy warns of
+LAZY_EXPORTS = {"create_mcp_server": "virtual_lab.mcp_server", "serve_mcp": "virtual_lab.mcp_server"}
+
+
+def __getattr__(name: str) -> Any:
+    if name in LAZY_EXPORTS:
+        return getattr(importlib.import_module(LAZY_EXPORTS[name]), name)
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -48,6 +48,7 @@ from virtual_lab.constants import (
     MAX_REPORTED_FILES,
     MAX_REPORTED_OUTPUT_CHARS,
     MAX_SESSION_RESPONSE_BYTES,
+    MAX_SESSION_VALUE_BYTES,
     MAX_TOOL_ERROR_CHARACTERS,
     MAX_WRITTEN_FILE_BYTES,
     SANDBOX_DATA_LAKE_DIR,
@@ -116,6 +117,8 @@ class CellResult:
     :param tool_calls: Each call it made to one of the session's tools: the tool, its arguments
         as JSON, how it ended ("ok", "error", or "running" if the code finished first), the
         error if there was one, and how many seconds it took.
+    :param value: For code run with Session.evaluate, the value of its last expression, in
+        JSON's types; None otherwise, or if the code failed.
     """
 
     language: str
@@ -130,6 +133,7 @@ class CellResult:
     start: int = 1
     sandboxed: bool = True
     tool_calls: tuple[dict[str, Any], ...] = ()
+    value: Any = None
 
     @property
     def succeeded(self) -> bool:
@@ -183,6 +187,7 @@ class CellResult:
                 {**call, "duration": None if call["duration"] is None else round(call["duration"], 3)}
                 for call in self.tool_calls
             ],
+            "value": self.value,
         }
 
 
@@ -749,6 +754,24 @@ class Session:
 
             return result
 
+    def evaluate(self, code: str, timeout: float | None = None) -> CellResult:
+        """Runs Python code in the session, as run does, and sends back the value of its last
+        line, if that is an expression, rather than printing it.
+
+        :param code: The code.
+        :param timeout: Seconds to allow, defaulting to the session's limit.
+        :raises SessionError: If the session was closed or cannot be started.
+        :return: What happened, with the value in its value, in JSON's types. Numpy arrays and
+            scalars, sets, and paths are converted; a value that is otherwise not JSON, or is more
+            than MAX_SESSION_VALUE_BYTES of it, fails the code, though what it did is done.
+        """
+        self.refuse_from_tool()
+        with self._lock:
+            result = self.execute(code, "python", self.timeout if timeout is None else timeout, value=True)
+            self.history.append(result)
+
+            return result
+
     def check(self, code: str, timeout: float | None = None) -> CellResult:
         """Runs Python code that asks about the session rather than taking part in its analysis,
         such as what is installed, and keeps it out of the history.
@@ -764,13 +787,16 @@ class Session:
         with self._lock:
             return self.execute(code, "python", self.timeout if timeout is None else timeout)
 
-    def execute(self, code: str, normalized: str, limit: float) -> CellResult:
-        """Runs a piece of code without recording it. The caller holds the lock."""
+    def execute(self, code: str, normalized: str, limit: float, value: bool = False) -> CellResult:
+        """Runs a piece of code without recording it, sending back the value of its last
+        expression if asked. The caller holds the lock."""
         self.start()
         before = list_files(self.directory)
         started = time.monotonic()
         self._requests += 1
         request = {"id": self._requests, "language": normalized, "code": code, "timeout": limit}
+        if value:
+            request["value"] = MAX_SESSION_VALUE_BYTES
         answer: dict | None | bool = None
         calls: list[dict[str, Any]] = []
 
@@ -829,6 +855,7 @@ class Session:
             output_dropped=int(answer.get("output_dropped") or 0),
             start=self.starts,
             sandboxed=self.sandboxed,
+            value=answer.get("value"),
         )
 
     def restart(self) -> None:
@@ -1156,20 +1183,13 @@ class LocalSession(Session):
         return self.biomni_tools
 
 
-def session_tool(session: Session) -> Tool:
-    """Builds the tool that lets an agent run code in a session.
-
-    :param session: The session, shared by everyone the tool is given to.
-    :return: The tool.
-    """
+def session_notes(session: Session) -> list[str]:
+    """What the tool that runs code in a session says of it, after saying who shares it."""
     data_lake = session.data_lake_path()
 
     notes = [
-        "Run code in the meeting's shared interpreter and see what it prints. Python runs in "
-        "one session that keeps its variables, imports, and loaded data from one call to the "
-        "next, for every member of the meeting: what another agent defined is there for you, "
-        "so check before loading something again. R and bash code runs as a fresh process "
-        "each time, in the same directory, and can hand results to Python through files.",
+        "R and bash code runs as a fresh process each time, in the same directory, and can hand "
+        "results to Python through files.",
         f"The working directory is {session.where_code_runs()}; files written there are kept. "
         "A matplotlib figure left open is saved to plots/ and reported back.",
         "The value of a final expression is printed, as in a notebook. Keep output short: "
@@ -1181,6 +1201,23 @@ def session_tool(session: Session) -> Tool:
             f"Biomni's data lake is mounted read-only at {data_lake}, also in the "
             "BIOMNI_DATA_LAKE environment variable."
         )
+
+    return notes
+
+
+def session_tool(session: Session) -> Tool:
+    """Builds the tool that lets an agent run code in a session.
+
+    :param session: The session, shared by everyone the tool is given to.
+    :return: The tool.
+    """
+    notes = [
+        "Run code in the meeting's shared interpreter and see what it prints. Python runs in "
+        "one session that keeps its variables, imports, and loaded data from one call to the "
+        "next, for every member of the meeting: what another agent defined is there for you, "
+        "so check before loading something again.",
+        *session_notes(session),
+    ]
 
     def run_code(code: str, language: str = "python") -> str:
         return session.run(code, language=language).report()

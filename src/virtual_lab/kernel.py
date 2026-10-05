@@ -13,7 +13,9 @@ arrives and counts what it drops, so that code printing without bound costs neit
 disk.
 
 Python code runs in one namespace that outlives each request, the way a notebook's cells do. R
-and shell code run as a fresh Rscript or bash process each time, as they do in Biomni.
+and shell code run as a fresh Rscript or bash process each time, as they do in Biomni. A request
+for Python code can ask for the value of its last expression to be sent back in the answer, as
+JSON, rather than printed.
 
 A session can also define functions in that namespace that run outside it, on the host: tools
 of the user's own, which may need what the sandbox does not have, such as the network, a key, or
@@ -206,6 +208,7 @@ class Kernel:
         self.call_count = 0
         self.replies: dict = {}
         self.max_call_bytes = MAX_CALL_BYTES
+        self.value: object = None
 
     def send(self, message: dict) -> None:
         """Writes one line to the session."""
@@ -238,6 +241,10 @@ class Kernel:
         language = str(request.get("language", "python")).strip().casefold()
         code = str(request.get("code", ""))
         timeout = float(request.get("timeout") or 0)
+        # The most bytes of JSON the value of the code's last expression may take to be sent
+        # back, for a request that asks for it, which is then not printed
+        max_value = int(request.get("value") or 0)
+        self.value = None
 
         read_end, write_end = os.pipe()
         capture = Capture(read_end)
@@ -254,7 +261,7 @@ class Kernel:
             self.start_timer(timeout)
             try:
                 if language == "python":
-                    error = self.run_python(code)
+                    error = self.run_python(code, max_value)
                 elif language in INTERPRETERS:
                     error = self.run_program(INTERPRETERS[language], code, language)
                 else:
@@ -282,7 +289,7 @@ class Kernel:
 
         output, dropped = capture.text(DRAIN_SECONDS)
 
-        return {
+        answer = {
             "id": request.get("id"),
             "status": status,
             "error": error,
@@ -291,6 +298,11 @@ class Kernel:
             "plots": plots,
             "duration": time.monotonic() - start,
         }
+        if max_value:
+            # The time limit can still stop the code just after its value was kept
+            answer["value"] = self.value if status == "ok" else None
+
+        return answer
 
     def deliver(self, reply: dict) -> None:
         """Hands a reply to the call waiting for it. A reply nothing waits for is dropped: the
@@ -415,8 +427,32 @@ class Kernel:
         if self.can_time_out:
             signal.setitimer(signal.ITIMER_REAL, 0)
 
-    def run_python(self, code: str) -> str | None:
-        """Runs a cell, printing the value of its last line if that is an expression."""
+    def returnable(self, value: object, max_bytes: int) -> object:
+        """The value as JSON's types, to be sent back, if it is JSON and no larger than allowed."""
+        def convert(item: object) -> object:
+            try:
+                return to_json(item)
+            except TypeError:
+                raise TypeError(
+                    f"a {type(item).__name__} is not JSON; convert it first, a table to a list of rows with "
+                    ".to_dict('records'), say, or write it to a file and return the file's path"
+                ) from None
+
+        try:
+            text = json.dumps(value, default=convert)
+        except (TypeError, ValueError) as error:
+            raise TypeError(f"The value of the code's last expression cannot be sent back: {error}") from None
+        if len(text) > max_bytes:
+            raise ValueError(
+                f"The value of the code's last expression is {len(text):,} bytes of JSON, more than the "
+                f"{max_bytes:,} that can be sent back. Write it to a file and return the file's path."
+            )
+
+        return json.loads(text)
+
+    def run_python(self, code: str, max_value: int = 0) -> str | None:
+        """Runs a cell, printing the value of its last line if that is an expression, or, if
+        max_value is given, keeping it to send back instead."""
         filename = f"<cell {self.cells}>"
         # Registered so that a traceback can quote the lines of the cell that raised
         linecache.cache[filename] = (len(code), None, code.splitlines(True), filename)
@@ -438,6 +474,9 @@ class Kernel:
                 value = eval(compile(last, filename, "eval"), self.namespace)
                 if value is not None:
                     self.namespace["_"] = value
+                if max_value:
+                    self.value = self.returnable(value, max_value)
+                elif value is not None:
                     print(repr(value))
         except SystemExit as exit:
             return f"The code called exit({exit.code!r}). The session is still running."

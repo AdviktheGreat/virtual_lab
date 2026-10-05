@@ -280,6 +280,11 @@ MAX_SESSION_RESPONSE_BYTES = 2 * 1024**2
 # are bounded by MAX_SESSION_RESPONSE_BYTES, since they come back the way answers do.
 MAX_HOST_TOOL_RESULT_BYTES = 16 * 1024**2
 
+# Most bytes of JSON the value of code's last expression may take to be sent back from a session,
+# as Session.evaluate asks for it. It comes back in the answer, beside the code's output, and
+# the two must fit within MAX_SESSION_RESPONSE_BYTES.
+MAX_SESSION_VALUE_BYTES = 1024**2
+
 # Seconds a call to a tool of an MCP server may take before it is given up, and the agent told so
 MCP_CALL_TIMEOUT = 300.0
 # Seconds an MCP server may take to start, or be connected to, and list its tools. Generous, since
@@ -292,6 +297,14 @@ MCP_LOG_TAIL_CHARS = 2_000
 # Most pages an MCP server may list its tools in, so that a server whose pages never end cannot
 # keep a connection from finishing
 MCP_MAX_TOOL_PAGES = 1_000
+# Where serve_mcp listens over HTTP by default: this machine alone, at http://127.0.0.1:8000/mcp
+MCP_SERVER_HOST = "127.0.0.1"
+MCP_SERVER_PORT = 8000
+MCP_SERVER_PATH = "/mcp"
+# Where virtual-lab-mcp reads the token that every HTTP request must carry, and the fewest
+# characters a token may have, which secrets.token_urlsafe(32) exceeds at 43
+MCP_SERVER_TOKEN_VARIABLE = "VIRTUAL_LAB_MCP_TOKEN"
+MCP_SERVER_MIN_TOKEN_CHARS = 16
 # Most characters of a tool call's arguments kept in a session's record of it
 MAX_RECORDED_ARGUMENT_CHARS = 10_000
 

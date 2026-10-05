@@ -50,7 +50,7 @@ cd virtual_lab
 pip install -e .
 ```
 
-Tools from MCP servers need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`.
+Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`.
 
 
 ## Models and API keys
@@ -79,6 +79,8 @@ result = hold_meeting(..., chat_models={"biomni-r0": served})
 `chat_models` also takes a single LangChain chat model for every agent, or a function from model name to chat model. The record of each meeting names the class that answered for each model and the server it was sent to.
 
 OpenAI's API is told which agent wrote each earlier turn. Other providers have no field for this, so for them the other agents' turns are passed as user messages that begin with the speaker's name, rather than as the reader's own words.
+
+Keys can be kept in a `.env` file, one `NAME=value` per line. As Biomni does, `import virtual_lab` reads the `.env` file in the directory Python was started in, if there is one, and sets each variable that is not already set, so a key set in the shell outranks the file's. It prints nothing. `load_env("keys.env")` reads another file, `load_env(override=True)` replaces what is set, and each returns the names of the variables it set. Setting `VIRTUAL_LAB_LOAD_ENV=0` stops the file being read on import. What is read reaches this process alone: a session's code gets a variable only when it is forwarded by name (see `forward_env` below).
 
 
 ## Holding a meeting and limiting what it spends
@@ -574,6 +576,45 @@ Biomni starts a server again for every call to one of its tools, over stdio only
 - **A config that cannot work fails at once.** A variable that is not set is an error, rather than an empty value, and so is a server that does not start, or a tool asked for that a server does not have. What a server writes to stderr is kept out of the way, and its end is shown when the server fails. Where one server fails, those already started are stopped again.
 
 A server's tools run wherever the server does: one started here runs on your machine, with your permissions, on arguments a model chose, even when the code calling it is in a sandbox, so give a session only the servers you would let that code use. Changing a server's tools, or what it says of them, changes the inputs of every project step held with them.
+
+### Serving tools over MCP
+
+`virtual-lab-mcp` serves tools to any MCP client: Claude Desktop, Claude Code, Cursor, another agent, or `connect_mcp`. It can serve Biomni's tool functions, the `run_code` tool, the database and literature tools above, and tools of your own, in any combination. `python -m virtual_lab.mcp_server` is the same command.
+
+```bash
+virtual-lab-mcp --biomni-tools --code-tool --directory results/served            # over stdio, for a client that starts it
+virtual-lab-mcp --biomni-tools --biomni-module database --data-lake data/biomni_data --directory results/served
+virtual-lab-mcp --database-tools --tool my_tools:TOOLS --transport http             # at http://127.0.0.1:8000/mcp
+```
+
+For Claude Desktop, add the server to `claude_desktop_config.json`, giving the full path to the command if Claude does not find it on its own:
+
+```json
+{
+  "mcpServers": {
+    "virtual-lab": {
+      "command": "virtual-lab-mcp",
+      "args": ["--biomni-tools", "--code-tool", "--directory", "/Users/me/lab/served"]
+    }
+  }
+}
+```
+
+Biomni's `create_mcp_server` runs its functions in the server's own process, passes every parameter whose type it does not recognise as a string, and reports a function that fails as if it had returned its error. Here:
+
+- **Biomni's functions run in the sandbox.** Each call runs in one session, a `DockerSession` in the `full` image unless `--image-target` says otherwise, with its working directory at `--directory`, where files the functions write are kept. `--session local` runs them on your machine instead, with no isolation, and says so. `--data-lake`, `--no-network`, and `--forward-env` are as for `session_executor`. Only the modules that import in the session are served, and those that do not are named in a warning; `--biomni-module` serves only the modules given.
+- **Parameters are typed.** Biomni's types become JSON schema, so an `int` is an integer, a `List[str]` an array of strings, and a `pd.DataFrame` an array of rows. Arrays are made the numpy arrays, data frames, or tuples the function expects before it is called. A default the schema can hold is given as the default, and a parameter that takes a function, which cannot be sent, is left out.
+- **The session is shared.** With `--code-tool`, `run_code` runs code in the same session, which keeps its variables from one call to the next. Whatever a Biomni function returned last is there as `_`, and a file it wrote can be read.
+- **Arguments are checked.** Each call's arguments are checked against the tool's parameters before it runs, and every problem found is listed for the client, which can correct its call.
+- **What a tool returns is sent back whole.** A dict, or a pydantic model, is sent as the structured result as well as text. A Biomni function that returns nothing gives back what it printed instead.
+- **A failure is a failure.** A tool that raises an error is reported as failed, with the error, and for a Biomni function with the end of what it printed. The server carries on.
+- **Calls run at the same time**, each in a thread of its own, except that calls to one session wait their turn.
+
+`--tool` serves one of the database tools by name (`--tool uniprot_lookup`), or `module:attribute` for a `Tool`, a list of them, what `connect_mcp` returns, or a function, which is made a tool as `tool_from_function` makes it. The module is imported from the working directory. In Python, `serve_mcp(tools)` serves a list of tools, and `create_mcp_server(tools)` returns the server for you to run.
+
+Over HTTP the server listens at `127.0.0.1`, which only this machine can reach, and refuses requests that name another host, so a web page cannot reach it by DNS rebinding. To listen anywhere else, such as `--host 0.0.0.0`, set a token of at least 16 characters in `VIRTUAL_LAB_MCP_TOKEN`, in the environment or in the `.env` file. Every request must then carry it as `Authorization: Bearer <token>`, which `connect_mcp` sends from the `headers` of its config. A token can be set on this machine too. `--env-file` reads another `.env` file before the server starts.
+
+The server stops when its client does, or at Ctrl-C or `SIGTERM`, and stops its session's container as it goes. A Biomni function runs on arguments a model chose, and with the network on it can reach anything the container can, so serve them in a session you would let any of the server's clients use.
 
 ### What these services will tell you that is not true
 
