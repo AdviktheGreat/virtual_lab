@@ -214,6 +214,28 @@ def is_loopback(host: str) -> bool:
         return False
 
 
+def loopback_security(host: str) -> Any:
+    """Protection from DNS rebinding for a server on this machine: a request must name it, as
+    127.0.0.1, localhost, [::1], or as the host it listens at, not some other host that a web
+    page has made resolve to it.
+
+    The MCP SDK protects a server this way only when its host is written exactly as one of the
+    first three, and every other way of writing this machine would otherwise go unprotected.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    bare = host.strip("[]")
+    written = f"[{bare}]" if ":" in bare else bare
+    names = list(dict.fromkeys(["127.0.0.1", "localhost", "[::1]", written, written.lower()]))
+
+    # A Host header has no port where the port is HTTP's default, 80
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[*names, *(f"{name}:*" for name in names)],
+        allowed_origins=[*(f"http://{name}" for name in names), *(f"http://{name}:*" for name in names)],
+    )
+
+
 def check_token(token: str | None, host: str) -> None:
     if token is None:
         if not is_loopback(host):
@@ -294,9 +316,9 @@ def serve_mcp(
     :param tools: The tools; see create_mcp_server.
     :param transport: "stdio", for a client that starts the server and speaks to it over its
         standard input and output; or "http", for streamable HTTP at host, port, and path.
-    :param host: Where to listen, for HTTP. The default answers this machine alone, and refuses
-        requests that name another host, so that a web page cannot reach the server by DNS
-        rebinding. Anywhere else needs a token.
+    :param host: Where to listen, for HTTP. The default answers this machine alone. A server at
+        any of this machine's own addresses refuses requests that name another host, so that a
+        web page cannot reach it by DNS rebinding. Anywhere else needs a token.
     :param port: The port, for HTTP, or 0 for any that is free.
     :param path: Where the server is, for HTTP.
     :param token: A token every HTTP request must carry, as the header Authorization: Bearer,
@@ -336,7 +358,11 @@ def serve_mcp(
 
     import uvicorn
 
-    app = server.streamable_http_app(streamable_http_path=path, host=host)
+    app = server.streamable_http_app(
+        streamable_http_path=path,
+        host=host,
+        transport_security=loopback_security(host) if is_loopback(host) else None,
+    )
     if token is not None:
         app = RequireToken(app, token)
 

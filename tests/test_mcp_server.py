@@ -344,6 +344,26 @@ def http_scope(*headers: tuple[bytes, bytes]) -> dict[str, Any]:
     return {"type": "http", "method": "POST", "path": "/mcp", "headers": list(headers)}
 
 
+class TestLoopbackSecurity:
+    @pytest.mark.parametrize(
+        ("host", "written"),
+        [("127.0.0.2", "127.0.0.2"), ("LOCALHOST", "localhost"), ("0:0:0:0:0:0:0:1", "[0:0:0:0:0:0:0:1]")],
+    )
+    def test_the_host_listened_at_is_allowed_as_well_as_the_usual_names(self, host: str, written: str) -> None:
+        security = server_module.loopback_security(host)
+
+        assert security.enable_dns_rebinding_protection
+        for name in ("127.0.0.1", "localhost", "[::1]", written):
+            assert f"{name}:*" in security.allowed_hosts
+            assert f"http://{name}:*" in security.allowed_origins
+        assert not any("evil" in allowed for allowed in security.allowed_hosts + security.allowed_origins)
+
+    def test_each_name_is_listed_once(self) -> None:
+        security = server_module.loopback_security("127.0.0.1")
+
+        assert len(security.allowed_hosts) == len(set(security.allowed_hosts)) == 6
+
+
 class TestRequireToken:
     def test_a_request_with_the_token_is_let_through(self) -> None:
         sent, reached = asgi_call(None, http_scope((b"authorization", f"Bearer {TOKEN}".encode())))
@@ -960,6 +980,35 @@ class TestOverHTTP:
             urllib.request.urlopen(request, timeout=30)
 
         assert refused.value.code == 421
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "LOCALHOST",
+            pytest.param(
+                "0:0:0:0:0:0:0:1",
+                marks=pytest.mark.skipif(not has_ipv6_loopback(), reason="needs IPv6's loopback address"),
+            ),
+        ],
+    )
+    def test_every_way_of_writing_this_machine_refuses_other_hosts(self, started: Any, host: str) -> None:
+        server = started("--database-tools", "--transport", "http", "--host", host, "--port", "0")
+        url = server.wait_for(r"at (http://\S+)")[1]
+
+        def refused(**headers: str) -> int:
+            request = urllib.request.Request(
+                url,
+                data=b"{}",
+                headers={"content-type": "application/json", "accept": "application/json", **headers},
+            )
+            with pytest.raises(urllib.error.HTTPError) as refusal:
+                urllib.request.urlopen(request, timeout=30)
+            return refusal.value.code
+
+        assert refused(host="evil.example:8000") == 421
+        assert refused(origin="http://evil.example") == 403
+        with connect_mcp({"mcpServers": {"lab": {"url": url}}}) as tools:
+            assert len(tools.tools) == 14
 
     def test_a_token_is_required_once_set(self, started: Any) -> None:
         server = started(
