@@ -30,21 +30,36 @@ import threading
 import warnings
 from collections.abc import Iterable, Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
 from typing import Any, Self
 from urllib.parse import quote, quote_plus, urlsplit
 
 from virtual_lab.__about__ import __version__
+from virtual_lab.approval import (
+    Answer,
+    ApprovalDeclined,
+    ApprovalRequest,
+    Approve,
+    ServerQuestion,
+    answer_in_terminal,
+    approve_in_terminal,
+    asked_for,
+    withdrawn,
+)
 from virtual_lab.constants import (
     MCP_CALL_TIMEOUT,
     MCP_LOG_TAIL_CHARS,
+    MCP_MAX_INSTRUCTIONS_CHARS,
     MCP_MAX_TOOL_PAGES,
     MCP_START_TIMEOUT,
     MCP_STOP_TIMEOUT,
 )
 from virtual_lab.custom_tools import clean_schema, inline_references
+from virtual_lab.mcp_presets import MCP_PRESETS, preset_entry
+from virtual_lab.records import truncate_text
 from virtual_lab.tools import Tool
 
 # Where a config lists its servers: Biomni's YAML, and the JSON of Claude Desktop and the rest
@@ -66,8 +81,15 @@ SERVER_KEYS = frozenset(
         "disabled",
         "tools",
         "description",
+        "preset",
+        "approval",
+        "instructions",
     }
 )
+
+# What a server's approval can say: the tools that wait for a person's approval of each call, and
+# those of them that do not after all
+APPROVAL_KEYS = frozenset({"ask", "allow"})
 
 STREAMABLE_HTTP_TYPES = frozenset({"http", "streamable-http", "streamable_http", "streamableHttp"})
 
@@ -94,6 +116,10 @@ class MCPServerError(ConnectionError):
     """Raised when an MCP server cannot be started or reached, or stops while a tool runs."""
 
 
+class UnsetVariableError(ValueError):
+    """Raised when a config uses an environment variable that is not set, and gives no default."""
+
+
 @dataclass(frozen=True)
 class MCPServerConfig:
     """How to reach one MCP server, read from a config.
@@ -114,6 +140,13 @@ class MCPServerConfig:
         server's.
     :param hidden: The values of the environment variables that replaced ${NAME} in the
         config, each with the ${NAME} it replaced, which messages show in its place.
+    :param ask: Patterns, as fnmatch reads them, of the names on the server of the tools that
+        wait for a person's approval of each call.
+    :param allow: Patterns of the names of those of them that do not after all.
+    :param instructions: What the agents are told of using the server's tools, besides what the
+        server says itself, or None.
+    :param setup: What to do before the server can be connected to, said when it cannot be, as a
+        preset says it; or None.
     """
 
     name: str
@@ -129,6 +162,16 @@ class MCPServerConfig:
     tools: tuple[str, ...] | None = None
     descriptions: dict[str, str] = field(default_factory=dict)
     hidden: dict[str, str] = field(default_factory=dict, repr=False)
+    ask: tuple[str, ...] = ()
+    allow: tuple[str, ...] = ()
+    instructions: str | None = field(default=None, repr=False)
+    setup: str | None = field(default=None, repr=False)
+
+    def needs_approval(self, tool: str) -> bool:
+        """Whether each call to a tool, by its name on the server, waits for a person's approval."""
+        return any(fnmatchcase(tool, pattern) for pattern in self.ask) and not any(
+            fnmatchcase(tool, pattern) for pattern in self.allow
+        )
 
     def redact(self, text: str) -> str:
         """The text with each value of a variable the config used, as it is or as it appears
@@ -211,7 +254,7 @@ def substitute(text: str, server: str, hidden: dict[str, str] | None = None) -> 
             return os.environ[name]
         if default is not None:
             return default
-        raise ValueError(
+        raise UnsetVariableError(
             f"The MCP server {server} uses ${{{name}}}, which is not set: set it, or give a default as "
             f"${{{name}:-default}}"
         )
@@ -281,14 +324,60 @@ def tool_selection(value: Any, server: str) -> tuple[tuple[str, ...] | None, dic
             f"The parameters the config lists for the tools of the MCP server {server} are not used: each tool "
             "takes the parameters the server declares for it.",
             UserWarning,
-            stacklevel=4,
+            stacklevel=5,
         )
 
     return tuple(names), descriptions
 
 
+def patterns(value: Any, server: str, what: str) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise TypeError(
+            f"{what} of the MCP server {server} lists the names of tools, or patterns such as list_*, not "
+            f"{type(value).__name__}"
+        )
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"{what} of the MCP server {server} lists tools by name, not {item!r}")
+
+    return tuple(item.strip() for item in value)
+
+
+def approval_rules(value: Any, server: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The tools of a server that wait for a person's approval of each call, and those of them
+    that do not after all, each as names or patterns.
+
+    A server's approval is a list of the tools that wait, or a mapping with them under ask and
+    those that do not under allow, so that {ask: ["*"], allow: ["list_*"]} has every tool wait but
+    those that list.
+    """
+    if value is None:
+        return (), ()
+    if isinstance(value, list):
+        return patterns(value, server, "The approval"), ()
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"The approval of the MCP server {server} is a list of the tools that wait for a person's approval, or "
+            f"a mapping with them under ask and those that do not under allow, not {type(value).__name__}"
+        )
+    if unknown := sorted(str(key) for key in set(value) - APPROVAL_KEYS):
+        raise ValueError(
+            f"The approval of the MCP server {server} says {', '.join(unknown)}, which it does not take: it takes ask "
+            "and allow"
+        )
+
+    return (
+        patterns(value.get("ask", []), server, "The approval's ask"),
+        patterns(value.get("allow", []), server, "The approval's allow"),
+    )
+
+
 def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
-    """How to reach a server, from its entry in a config, or None if the entry disables it."""
+    """How to reach a server, from its entry in a config, or None if the entry disables it.
+
+    An entry that names a preset is the preset's, with what else it gives in place of the
+    preset's.
+    """
     if not isinstance(name, str) or not name:
         raise ValueError(f"An MCP server is named by text, not {name!r}")
     if not isinstance(entry, Mapping):
@@ -296,7 +385,21 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
             f"The MCP server {name} is described by a mapping, such as {{'command': ['python', 'server.py']}}, "
             f"not {type(entry).__name__}"
         )
+    entry, preset = preset_entry(name, dict(entry))
+    try:
+        parsed = parse_entry(name, entry)
+    except UnsetVariableError as error:
+        if preset is None:
+            raise
+        raise UnsetVariableError(f"{error}. {preset.setup}") from None
+    if parsed is None or preset is None:
+        return parsed
 
+    return replace(parsed, setup=preset.setup)
+
+
+def parse_entry(name: str, entry: Mapping[str, Any]) -> MCPServerConfig | None:
+    """How to reach a server, from its entry in a config with any preset filled in."""
     for key in ("enabled", "disabled"):
         if key in entry and not isinstance(entry[key], bool):
             raise TypeError(f"{key} of the MCP server {name} must be true or false, not {entry[key]!r}")
@@ -307,7 +410,7 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
         warnings.warn(
             f"The MCP server {name} has settings that are not used: {', '.join(unknown)}.",
             UserWarning,
-            stacklevel=3,
+            stacklevel=4,
         )
 
     prefix = re.sub(r"[^A-Za-z0-9_]", "_", name)
@@ -343,6 +446,11 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
         raise ValueError(f'The MCP server {name} has the type {transport!r}: use "stdio", "http", or "sse"')
 
     tools, descriptions = tool_selection(entry.get("tools"), name)
+    ask, allow = approval_rules(entry.get("approval"), name)
+    instructions = entry.get("instructions")
+    if instructions is not None and not isinstance(instructions, str):
+        raise TypeError(f"The instructions of the MCP server {name} are text, not {type(instructions).__name__}")
+    notes = (instructions or "").strip() or None
     hidden: dict[str, str] = {}
 
     if transport == "stdio":
@@ -386,6 +494,9 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
             tools=tools,
             descriptions=descriptions,
             hidden=hidden,
+            ask=ask,
+            allow=allow,
+            instructions=notes,
         )
 
     if not isinstance(url, str):
@@ -406,6 +517,9 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
         tools=tools,
         descriptions=descriptions,
         hidden=hidden,
+        ask=ask,
+        allow=allow,
+        instructions=notes,
     )
 
 
@@ -589,6 +703,11 @@ class Holding:
 class MCPConnection:
     """A connection to one MCP server, made again if the server stops."""
 
+    # How the version of the protocol is agreed, as the SDK's Client takes it: "auto" speaks the
+    # newest the server does, and "legacy" the one from before 2026, under which a server asks
+    # its questions with requests of its own rather than in a tool's result
+    protocol_mode = "auto"
+
     def __init__(
         self,
         server: MCPServerConfig,
@@ -596,9 +715,13 @@ class MCPConnection:
         log_dir: Path,
         timeout: float | None,
         start_timeout: float,
+        approve: Approve = approve_in_terminal,
+        answer: Answer = answer_in_terminal,
     ) -> None:
         self.server = server
         self.loop = loop
+        self.approve = approve
+        self.answer = answer
         self.log_path = log_dir / f"{server.prefix}.log" if server.transport == "stdio" else None
         self.timeout = timeout
         self.start_timeout = start_timeout
@@ -610,6 +733,10 @@ class MCPConnection:
         self.closed = False
         self.listed: list[Any] = []
         self.wrapped: dict[str, bool] = {}
+        # What the server says of how to use its tools, when it is connected to
+        self.instructions: str | None = None
+        # Each tool offered, by its name on the server, with its name and description here
+        self.offered: dict[str, tuple[str, str]] = {}
 
     @property
     def described(self) -> str:
@@ -632,6 +759,57 @@ class MCPConnection:
             text = "..." + text[-MCP_LOG_TAIL_CHARS:]
 
         return f" What it wrote to stderr ends:\n{text}"
+
+    def setup_hint(self) -> str:
+        return f"\n{self.server.setup}" if self.server.setup else ""
+
+    async def elicited(self, context: Any, params: Any) -> Any:
+        """Passes on to a person what the server asks while one of its tools runs, and gives
+        back their answer, or that they declined, which is also the answer where no one is
+        asked."""
+        import anyio
+        from mcp_types import ElicitResult
+
+        if getattr(params, "mode", "form") == "url":
+            question = ServerQuestion(server=self.server.name, message=params.message, url=params.url)
+        else:
+            schema = params.requested_schema if isinstance(params.requested_schema, dict) else {}
+            properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+            required = schema.get("required") if isinstance(schema.get("required"), list) else []
+            question = ServerQuestion(
+                server=self.server.name,
+                message=params.message,
+                fields={str(name): dict(item) if isinstance(item, dict) else {} for name, item in properties.items()},
+                required=tuple(str(name) for name in required),
+            )
+        finished = threading.Event()
+
+        def ask() -> dict[str, Any] | None:
+            with asked_for(finished):
+                return self.answer(question)
+
+        try:
+            # In a thread, since a person may take a while, and the connections to every server
+            # are served on this loop meanwhile. The thread is left behind if the call is
+            # cancelled, and the question is withdrawn, so that the answer is not taken for
+            # one to whatever is asked next
+            answer = await anyio.to_thread.run_sync(ask, abandon_on_cancel=True)
+        except Exception as error:
+            warnings.warn(
+                f"The question the MCP server {self.server.name} asked could not be answered, so it was declined: "
+                f"{failure_text(error)}",
+                UserWarning,
+                stacklevel=1,
+            )
+            return ElicitResult(action="decline")
+        finally:
+            finished.set()
+        if answer is None:
+            return ElicitResult(action="decline")
+        if question.url is not None:
+            return ElicitResult(action="accept")
+
+        return ElicitResult(action="accept", content=dict(answer))
 
     async def transport(self, stack: AsyncExitStack, log: Any) -> Any:
         server = self.server
@@ -674,6 +852,8 @@ class MCPConnection:
                         Client(
                             await self.transport(stack, log),
                             client_info=Implementation(name="virtual-lab", version=__version__),
+                            elicitation_callback=self.elicited,
+                            mode=self.protocol_mode,
                         )
                     )
                     if not holding.ready.done():
@@ -724,7 +904,7 @@ class MCPConnection:
                 log.close()
             raise MCPServerError(
                 f"Could not {starting} {self.described}: it did not answer within {self.start_timeout:g} seconds."
-                f"{self.log_tail()}"
+                f"{self.log_tail()}{self.setup_hint()}"
             ) from None
         except Exception as error:
             self.end(holding, graceful=False)
@@ -734,6 +914,7 @@ class MCPConnection:
                 raise
             raise MCPServerError(
                 f"Could not {starting} {self.described}: {self.server.redact(failure_text(error))}.{self.log_tail()}"
+                f"{self.setup_hint()}"
             ) from None
 
         self.client, self.holding = client, holding
@@ -741,6 +922,8 @@ class MCPConnection:
         self.stopped = False
         self.listed = tools
         self.wrapped = {tool.name: wraps_result(tool) for tool in tools}
+        instructions = getattr(client, "instructions", None)
+        self.instructions = (instructions.strip() or None) if isinstance(instructions, str) else None
 
     def end(self, holding: Holding | None, graceful: bool = True) -> None:
         """Closes a connection, and stops the server if it was started here: by asking, where
@@ -809,6 +992,8 @@ class MCPConnection:
         from mcp import MCPError
         from mcp_types import CONNECTION_CLOSED, REQUEST_TIMEOUT
 
+        if self.server.needs_approval(name):
+            self.approved(name, arguments)
         client, generation = self.connected()
         call = self.loop.submit(client.call_tool(name, arguments, read_timeout_seconds=self.timeout))
         too_slow = TimeoutError(f"The MCP server {self.server.name} did not answer within {self.timeout} seconds")
@@ -835,6 +1020,31 @@ class MCPConnection:
         except MCPToolError as error:
             # A server's error can quote what it was given, such as a URL with its API key
             raise MCPToolError(self.server.redact(str(error))) from None
+
+    def approved(self, name: str, arguments: dict[str, Any]) -> None:
+        """Asks a person whether a call may be made.
+
+        :raises ApprovalDeclined: If it may not.
+        """
+        here, description = self.offered.get(name, (tool_name(self.server.prefix, name), ""))
+        request = ApprovalRequest(
+            tool=here, server=self.server.name, server_tool=name, arguments=dict(arguments), description=description
+        )
+        late = ApprovalDeclined(
+            f"The code that called {here} stopped waiting for a person to approve the call, so it was not made."
+        )
+        if withdrawn():
+            raise late
+        # Only True approves, so that an approver that answers anything else, such as "no", does not
+        approval = self.approve(request)
+        # An approval that comes once the caller has gone would make a call whose result no one
+        # receives, and that the caller may well make again
+        if withdrawn():
+            raise late
+        if approval is not True:
+            raise ApprovalDeclined(
+                f"A person declined this call to {here}, so it was not made. Do not make it again unchanged."
+            )
 
     def lost(self, generation: int) -> None:
         with self.lock:
@@ -925,11 +1135,38 @@ def check_timeout(name: str, value: float | None, optional: bool) -> None:
         raise ValueError(f"{name} must be {allowed}, not {value!r}")
 
 
+def server_instructions(connection: MCPConnection) -> str | None:
+    """What the agents are told of using a server's tools: what its config says, and what the
+    server says itself, or None if neither says anything."""
+    server = connection.server
+    parts = [server.instructions] if server.instructions else []
+    if connection.instructions:
+        said = truncate_text(server.redact(connection.instructions), MCP_MAX_INSTRUCTIONS_CHARS)
+        parts.append(f"The server says of them:\n{said}")
+    if not parts:
+        return None
+
+    heading = f"The tools of the MCP server {server.name}, named {server.prefix}_ and then their names on the server:"
+
+    return heading + "\n" + "\n\n".join(parts)
+
+
+def unused_approvals(server: MCPServerConfig, listed: Iterable[str]) -> list[str]:
+    """The tools a server's approval names, not as patterns, that the server does not have, which
+    is likely a mistake, since a call to the tool meant would then not wait."""
+    names = set(listed)
+
+    return [pattern for pattern in server.ask if not any(mark in pattern for mark in "*?[") and pattern not in names]
+
+
 def connect_mcp(
-    config: str | os.PathLike[str] | Mapping[str, Any],
+    config: str | os.PathLike[str] | Mapping[str, Any] | None = None,
     servers: Iterable[str] | None = None,
     timeout: float | None = MCP_CALL_TIMEOUT,
     start_timeout: float = MCP_START_TIMEOUT,
+    presets: Iterable[str] | None = None,
+    approve: Approve | None = None,
+    answer: Answer | None = None,
 ) -> MCPTools:
     """Starts, or connects to, the MCP servers a config lists, and makes tools of their tools,
     for a meeting's agents to call, or for code in a session to call, or both, as Biomni's
@@ -969,15 +1206,43 @@ def connect_mcp(
     run at the same time. What a server started here writes to stderr is kept out of the way,
     and its end is shown if the server fails.
 
-    :param config: The config: a path to a YAML or JSON file, or the config as a dict.
+    A server's approval lists the tools, by their names on the server, or by patterns such as
+    create_*, that wait for a person's approval of each call: approval: [submit, pay], or
+    approval: {ask: ["*"], allow: ["list_*", "get_*"]} for every tool to wait but those that only
+    read, which also holds for any tool the server adds later. A call that is not approved is not
+    made, and fails with ApprovalDeclined, which the agent is told of. A server's instructions,
+    and what the server says itself of how to use its tools, are told to the agents of a meeting
+    given its tools, or a session given them. What a server asks a person while one of its tools
+    runs, as Proto's server asks before it deploys a tool, is passed on to a person to answer.
+
+    A preset is a server's entry written out already, for Paperclip's literature, Adaptyv's lab,
+    or Proto's design tools: {"lab": {"preset": "adaptyv"}} in a config, with anything else the
+    entry gives used in place of the preset's, or presets=["adaptyv"] for a server named after
+    its preset. MCP_PRESETS lists them, with what each needs, such as an API key.
+
+        with connect_mcp(presets=["paperclip", "proto"]) as mcp:
+            run_meeting(..., tools=mcp.tools)
+
+    :param config: The config: a path to a YAML or JSON file, or the config as a dict; or None
+        for presets alone.
     :param servers: The names of the servers to connect to, or None for every one the config
-        enables.
+        enables, and the presets.
     :param timeout: The most seconds a call to a tool may take, or None for no limit.
     :param start_timeout: The most seconds a server may take to start, or be connected to, and
         list its tools. A server run with npx or docker may first have to be downloaded.
+    :param presets: Presets to connect to as well, each as a server named after it.
+    :param approve: Called with an ApprovalRequest before each call to a tool that waits for
+        approval, and makes the call only if it returns True; it may raise ApprovalDeclined to
+        say why not. None asks at the terminal, and declines every call where there is none. A
+        call from code in a session that stops before the call is approved is not made.
+    :param answer: Called with a ServerQuestion when a server asks a person something, and returns
+        the answer: the form's fields by name, {} once the person has gone to a web page the
+        question asks them to, or None to decline. None asks at the terminal, and declines
+        where there is none. A question whose call stops waiting before it is answered is
+        withdrawn, and asking at the terminal then declines it.
     :raises ImportError: If the MCP SDK is not installed: pip install "virtual-lab[mcp]".
-    :raises ValueError: If the config is not one, or uses a variable that is not set, or two
-        tools would share a name.
+    :raises ValueError: If the config is not one, or uses a variable that is not set, or names
+        a preset that is not one, or two tools would share a name.
     :raises MCPServerError: If a server cannot be started or reached. Those that could are
         stopped again.
     :return: The tools, which hold the servers open until they are closed.
@@ -991,8 +1256,21 @@ def connect_mcp(
 
     check_timeout("timeout", timeout, optional=True)
     check_timeout("start_timeout", start_timeout, optional=False)
+    for what, value in (("approve", approve), ("answer", answer)):
+        if value is not None and not callable(value):
+            raise TypeError(f"{what} is a function, or None to ask at the terminal, not {type(value).__name__}")
 
-    entries = read_config(config)
+    if config is None and presets is None:
+        raise ValueError("connect_mcp connects to the servers of a config, or to presets, or both: give one")
+    entries = read_config(config) if config is not None else {}
+    for preset in [presets] if isinstance(presets, str) else list(presets or ()):
+        if preset not in MCP_PRESETS:
+            raise ValueError(f"There is no MCP preset {preset!r}: the presets are {', '.join(MCP_PRESETS)}")
+        if preset in entries:
+            raise ValueError(
+                f"The MCP config already has a server {preset}: give it preset: {preset} there, or name it otherwise"
+            )
+        entries[preset] = {"preset": preset}
     if servers is None:
         chosen = list(entries)
     else:
@@ -1024,7 +1302,18 @@ def connect_mcp(
 
     loop = EventLoop()
     log_dir = Path(tempfile.mkdtemp(prefix="virtual_lab_mcp_"))
-    connections = [MCPConnection(parsed, loop, log_dir, timeout, start_timeout) for parsed in configs]
+    connections = [
+        MCPConnection(
+            parsed,
+            loop,
+            log_dir,
+            timeout,
+            start_timeout,
+            approve=approve if approve is not None else approve_in_terminal,
+            answer=answer if answer is not None else answer_in_terminal,
+        )
+        for parsed in configs
+    ]
     opened = MCPTools(connections, {}, loop, log_dir)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(connections)) as pool:
@@ -1047,6 +1336,15 @@ def connect_mcp(
                         f"{', '.join(offered) or 'none'}"
                     )
                 offered = {name: offered[name] for name in parsed.tools}
+            if unused := unused_approvals(parsed, (tool.name for tool in connection.listed)):
+                warnings.warn(
+                    f"The approval of the MCP server {parsed.name} names {', '.join(unused)}, which it has no tool "
+                    f"called, so no call waits for approval on {'its' if len(unused) == 1 else 'their'} account. "
+                    "To have every tool wait but those allowed, ask for \"*\".",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            instructions = server_instructions(connection)
             made = []
             for tool in offered.values():
                 name = tool_name(parsed.prefix, tool.name)
@@ -1062,12 +1360,16 @@ def connect_mcp(
                     or (getattr(tool, "title", None) or "").strip()
                     or f"The tool {tool.name} of the MCP server {parsed.name}."
                 )
+                connection.offered[tool.name] = (name, description)
+                if parsed.needs_approval(tool.name):
+                    description += "\n\nEach call waits for a person to approve it, and fails if they do not."
                 made.append(
                     Tool(
                         name=name,
                         description=description,
                         parameters=tool_parameters(tool.input_schema),
                         function=partial(connection.call, tool.name),
+                        instructions=instructions,
                     )
                 )
             by_server[parsed.name] = tuple(made)

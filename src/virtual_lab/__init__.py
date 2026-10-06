@@ -11,6 +11,13 @@ load_default_env()
 
 from virtual_lab.actions import CodeAction, find_code_action
 from virtual_lab.agent import Agent
+from virtual_lab.approval import (
+    ApprovalDeclined,
+    ApprovalRequest,
+    ServerQuestion,
+    answer_in_terminal,
+    approve_in_terminal,
+)
 from virtual_lab.artifacts import CodeArtifacts, CodeFile, UnsafeFilenameError, save_artifacts
 from virtual_lab.benchmarks import (
     Benchmark,
@@ -91,6 +98,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.mcp_presets import MCP_PRESETS, MCPPreset
 from virtual_lab.mcp_tools import MCPServerError, MCPToolError, MCPTools, connect_mcp
 from virtual_lab.memory import Finding, Findings, LabMemory, MemoryEntry
 from virtual_lab.planning import NextStep, PlanTask, ProjectReport, ProjectRound, ResearchPlan, Review, run_project
@@ -183,6 +191,8 @@ __all__ = [
     "ActivityResults",
     "Agent",
     "AgentSpec",
+    "ApprovalDeclined",
+    "ApprovalRequest",
     "Article",
     "ArticleResults",
     "ArticleText",
@@ -235,9 +245,11 @@ __all__ = [
     "LabMemory",
     "LocalExecutor",
     "LocalSession",
+    "MCPPreset",
     "MCPServerError",
     "MCPToolError",
     "MCPTools",
+    "MCP_PRESETS",
     "MeetingResult",
     "MemoryEntry",
     "NextStep",
@@ -269,6 +281,7 @@ __all__ = [
     "SANDBOX_PLATFORM",
     "SearchHits",
     "SearchResults",
+    "ServerQuestion",
     "Session",
     "SessionError",
     "SingleAgent",
@@ -289,6 +302,8 @@ __all__ = [
     "UnsupportedLanguageError",
     "WebRequestError",
     "all_tools",
+    "answer_in_terminal",
+    "approve_in_terminal",
     "available_resources",
     "biomni_package_directory",
     "biomni_session_tools",

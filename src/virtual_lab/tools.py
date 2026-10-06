@@ -7,7 +7,7 @@ and will be called with the name anyway unless the description rules it out.
 """
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -63,12 +63,16 @@ class Tool:
     :param function: The callable that runs the tool. Its return value is sent to the model
         as text: a string as it is, a dict, list, or pydantic model as JSON, and anything else
         as str() writes it.
+    :param instructions: How to use the tool together with others it belongs with, such as the
+        rest of an MCP server's tools, which the agents are told once for all the tools that share
+        them, or None.
     """
 
     name: str
     description: str
     parameters: dict[str, Any]
     function: Callable[..., Any]
+    instructions: str | None = None
 
     @property
     def definition(self) -> ChatCompletionToolParam:
@@ -786,6 +790,23 @@ def all_tools(save_dir: Path | None = None, save_name: str = "discussion") -> tu
     work_dir = save_dir / ARTIFACT_DIR_NAME / save_name
 
     return DATABASE_TOOLS + (structure_file_tool(work_dir),) + data_file_tools(work_dir)
+
+
+def tool_instructions_prompt(tools: Iterable[Tool]) -> str:
+    """Tells a meeting how to use the tools it can call, or its code can, where those who
+    provide them say how, as an MCP server does of its tools.
+
+    :param tools: The tools.
+    :return: The prompt, with the instructions that tools share given once, or an empty string
+        if none of them have any.
+    """
+    notes = dict.fromkeys(
+        tool.instructions.strip() for tool in tools if tool.instructions is not None and tool.instructions.strip()
+    )
+    if not notes:
+        return ""
+
+    return "- How to use some of the tools, as those who provide them say:\n----\n" + "\n\n".join(notes) + "\n----"
 
 
 def tool_output_text(value: Any) -> str:

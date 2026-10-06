@@ -577,6 +577,42 @@ Biomni starts a server again for every call to one of its tools, over stdio only
 
 A server's tools run wherever the server does: one started here runs on your machine, with your permissions, on arguments a model chose, even when the code calling it is in a sandbox, so give a session only the servers you would let that code use. Changing a server's tools, or what it says of them, changes the inputs of every project step held with them.
 
+#### Tools that wait for a person's approval
+
+A tool that spends money, or does what cannot be undone, can be made to wait for a person to approve each call to it. A server's `approval` lists those tools by their names on the server, or by patterns such as `create_*`, or lists under `ask` the tools that wait and under `allow` those of them that do not after all:
+
+```yaml
+mcp_servers:
+  lab:
+    url: "https://lab.example.org/mcp"
+    approval: {ask: ["*"], allow: ["list_*", "get_*"]}   # every tool waits but those that only read
+    instructions: "Estimate an experiment's cost before creating it."
+```
+
+`{ask: ["*"], ...}` also holds for any tool the server adds later, which a list of names would let through. Before each call to a tool that waits, the person at the terminal is shown the tool and its arguments and asked to approve it. Where there is no terminal, as in a script run in the background or one whose stderr goes to a file, every such call is declined. A call made by code in a session that has stopped, such as by running out of time, before the person answers is not made, even if they approve it, since no one would receive its result. `connect_mcp(..., approve=decide)` decides another way: `decide` is called with an `ApprovalRequest`, and the call is made only if it returns `True`. A call that is not approved is not made. It raises `ApprovalDeclined`, which the agent is told of, along with not to make it again unchanged. A name in `ask` that the server has no tool of is warned of, since a call to the tool meant would not wait. The descriptions of the tools that wait say so, so that agents know.
+
+A server can also ask a person something while one of its tools runs, as Proto's server asks before it deploys a tool. Its question is asked at the terminal, a form field by field, or, where it asks the person to go to a web page, by opening the page. `answer=` answers another way: it is called with a `ServerQuestion` and returns the answers by field name, `{}` once the person has gone to the page, or `None` to decline. Where there is no terminal, every question is declined. A question whose tool call has stopped waiting, such as by running out of time, is withdrawn, and the answer is not used.
+
+What a server's `instructions` say, and what the server says itself of how to use its tools, are told to the agents of a meeting given its tools, or a session given them.
+
+#### Paperclip, Adaptyv, and Proto
+
+Three services built for agents doing biology have presets, a server's entry written out already, with what waits for approval and what the agents are told:
+
+| Preset | Service | Needs |
+| --- | --- | --- |
+| `paperclip` | [Paperclip](https://paperclip.gxl.ai): searching and reading the full text of papers, trials, patents, and regulatory documents | An API key in `PAPERCLIP_API_KEY`, from https://paperclip.gxl.ai/keys |
+| `adaptyv` | [Adaptyv's Foundry](https://foundry.adaptyvbio.com): proteins made and tested in a lab, which costs money | An API token in `FOUNDRY_API_TOKEN`, from the Foundry portal |
+| `adaptyv_testing` | Adaptyv's testing sandbox, where nothing is made or charged for | A token in `FOUNDRY_TESTING_TOKEN`, from https://foundry.testing.adaptyvbio.com |
+| `proto` | [Proto](https://github.com/evo-design/proto-tools): over a hundred tools for protein and sequence design, run on your own Modal account | `uv tool install "proto-tools[mcp] @ git+https://github.com/evo-design/proto-tools.git"`, then `modal token new` |
+
+```python
+with connect_mcp(presets=["paperclip", "adaptyv_testing"]) as mcp:
+    hold_meeting(..., tools=mcp.tools)
+```
+
+Or a config names one with `preset`, and anything else its entry gives is used in place of the preset's, such as `lab: {preset: adaptyv, approval: ["*"]}` for every one of Adaptyv's tools to wait. The keys and tokens can be in the environment or in the `.env` file, and where one is missing, the error says where to get it. Every one of Adaptyv's tools waits for approval but those that list, get, or estimate a cost, so no experiment is created, submitted, or paid for without a person approving it. Proto's tools that search, describe, and run deployed tools do not wait, but `deploy_tool`, which builds a tool on Modal at your expense, does. `MCP_PRESETS` lists the presets, with what each needs.
+
 ### Serving tools over MCP
 
 `virtual-lab-mcp` serves tools to any MCP client: Claude Desktop, Claude Code, Cursor, another agent, or `connect_mcp`. It can serve Biomni's tool functions, the `run_code` tool, the database and literature tools above, and tools of your own, in any combination. `python -m virtual_lab.mcp_server` is the same command.

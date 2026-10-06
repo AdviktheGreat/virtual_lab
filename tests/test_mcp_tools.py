@@ -849,6 +849,10 @@ class TestCallingAServerStartedHere:
                 "genes_authorization",
                 "genes_find_genes_v2",
                 "genes_outcome",
+                "genes_count",
+                "genes_confirm",
+                "genes_order",
+                "genes_visit",
             ]
         )
         assert tools["genes_lookup"].description == "Looks a gene up by its symbol.\n\nOnly TP53 is known."
@@ -928,6 +932,7 @@ class TestCallingAServerStartedHere:
             "description": "Looks a gene up by its symbol.\n\nOnly TP53 is known.",
             "parameters": {"properties": {"symbol": {"type": "string"}}, "required": ["symbol"], "type": "object"},
             "function": "virtual_lab.mcp_tools.MCPConnection.call",
+            "instructions": "The tools of the MCP server genes, named genes_ and then their names on the server:\nThe server says of them:\nLook genes up by symbol.",
         }
 
     def test_code_in_a_session_calls_the_tools_by_name(self, genes: MCPTools, tmp_path: Path) -> None:
@@ -1151,7 +1156,7 @@ class TestClosing:
         pid_file = tmp_path / "pid"
 
         with connect_mcp(stdio_config("--pid-file", str(pid_file))) as tools:
-            assert repr(tools) == "MCPTools(genes: 13 tools)"
+            assert repr(tools) == "MCPTools(genes: 17 tools)"
 
         assert tools.closed
         assert wait_until_stopped(int(pid_file.read_text()))
