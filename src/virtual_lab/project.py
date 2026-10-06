@@ -152,12 +152,17 @@ def describe_input(name: str, value: Any) -> Any:
         function = value.function
         while isinstance(function, partial):
             function = function.func
-        return {
+        described = {
             "name": value.name,
             "description": value.description,
             "parameters": describe_value(value.parameters),
             "function": f"{getattr(function, '__module__', None)}.{getattr(function, '__qualname__', type(function).__qualname__)}",
         }
+        # Only where there are any, so that a tool without them is described as it was before
+        # tools could have them
+        if value.instructions is not None:
+            described["instructions"] = value.instructions
+        return described
     if isinstance(value, Resources):
         return describe_value(asdict(value))
     # Which session it is, and where it runs, can differ from one run to the next; the tools its

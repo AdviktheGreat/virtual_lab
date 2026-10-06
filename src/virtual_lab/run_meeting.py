@@ -56,7 +56,7 @@ from virtual_lab.resources import (
 )
 from virtual_lab.session import CODE_TOOL_NAME, Session, own_resources_prompt, session_tool
 from virtual_lab.structured import StructuredOutputError, request_structured_output, save_output
-from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls
+from virtual_lab.tools import PUBMED_TOOL, Tool, run_tool_calls, tool_instructions_prompt
 from virtual_lab.utils import (
     BudgetExceededError,
     CostUnknownError,
@@ -535,6 +535,11 @@ def hold_meeting(
             retrieved = record.resources is not None and bool((record.resources["retrieval"] or {}).get("understood"))
             if selected is not None and (listed := resources_prompt(selected, code_actions, retrieved=retrieved)):
                 session_prompt = f"{session_prompt}\n\n{listed}"
+        # The tools the agents call and those their code does are told of together, since tools
+        # that share instructions, such as one MCP server's, can be given to both
+        session_tools = session.tools if session is not None else ()
+        if instructions := tool_instructions_prompt((*meeting_tools, *session_tools)):
+            session_prompt = f"{session_prompt}\n\n{instructions}" if session_prompt else instructions
 
         # Initial prompt for team meeting
         if meeting_type == "team":

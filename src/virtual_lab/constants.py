@@ -297,6 +297,11 @@ MCP_LOG_TAIL_CHARS = 2_000
 # Most pages an MCP server may list its tools in, so that a server whose pages never end cannot
 # keep a connection from finishing
 MCP_MAX_TOOL_PAGES = 1_000
+# Most characters of what an MCP server says of how to use its tools that the agents are told,
+# so that a server cannot fill their context with it
+MCP_MAX_INSTRUCTIONS_CHARS = 8_000
+# Most characters of a call's arguments shown to a person asked to approve it
+APPROVAL_MAX_ARGUMENT_CHARS = 4_000
 # Where serve_mcp listens over HTTP by default: this machine alone, at http://127.0.0.1:8000/mcp
 MCP_SERVER_HOST = "127.0.0.1"
 MCP_SERVER_PORT = 8000

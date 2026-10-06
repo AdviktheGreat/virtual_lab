@@ -1,22 +1,26 @@
 """An MCP server for the tests of connect_mcp, run as its own process.
 
-python mcp_test_server.py [--pid-file PATH] [--sleep SECONDS] [--say TEXT] [stdio | http PORT | sse PORT | die]
+python mcp_test_server.py [--pid-file PATH] [--sleep SECONDS] [--say TEXT] [--instructions TEXT]
+    [stdio | http PORT | sse PORT | die]
 """
 
 import argparse
 import os
 import sys
 import time
-
-from pydantic import BaseModel
+from typing import Annotated, Literal
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context, Elicit, ElicitationResult, Resolve
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.mcpserver.utilities.types import Image
+from pydantic import BaseModel
 
 server = MCPServer("Test genes", instructions="Look genes up by symbol.")
 # The Authorization header of the last HTTP request, for the tests to check what was sent
 seen = {"authorization": "<none>"}
+# How many times count was called, for the tests to check that a call was not made
+counted = {"calls": 0}
 
 
 class Gene(BaseModel):
@@ -113,6 +117,51 @@ def find_genes(query: str) -> list[str]:
     return [symbol for symbol in ("TP53", "TP63", "TP73", "BRCA1") if symbol.startswith(query)]
 
 
+@server.tool()
+def count() -> int:
+    """Counts the calls made to it."""
+    counted["calls"] += 1
+    return counted["calls"]
+
+
+class GoAhead(BaseModel):
+    approve: bool
+
+
+def ask_to_go_ahead() -> Elicit[GoAhead]:
+    return Elicit("Go ahead with the test?", GoAhead)
+
+
+@server.tool()
+def confirm(answer: Annotated[ElicitationResult[GoAhead], Resolve(ask_to_go_ahead)]) -> str:
+    """Asks a person whether to go ahead, and says what they answered."""
+    return f"{answer.action} {answer.data.approve}" if answer.action == "accept" else answer.action
+
+
+class Order(BaseModel):
+    name: str
+    kind: Literal["protein", "dna"]
+    copies: int = 1
+
+
+def ask_what_to_order() -> Elicit[Order]:
+    return Elicit("What is to be ordered?", Order)
+
+
+@server.tool()
+def order(answer: Annotated[ElicitationResult[Order], Resolve(ask_what_to_order)]) -> dict:
+    """Asks a person what to order, and says what they answered."""
+    return {"action": answer.action, "order": answer.data.model_dump() if answer.action == "accept" else None}
+
+
+@server.tool()
+async def visit(ctx: Context) -> str:
+    """Asks a person to go to a web page, and says whether they agreed to. Only over the protocol
+    before 2026, which lets a server send a request of its own while a tool runs."""
+    answer = await ctx.elicit_url("Pay for the test at this page.", "https://pay.example.org/test", "payment-1")
+    return answer.action
+
+
 def remember_headers(app):
     async def wrapped(scope, receive, send):
         if scope["type"] == "http":
@@ -129,9 +178,12 @@ if __name__ == "__main__":
     parser.add_argument("--pid-file")
     parser.add_argument("--sleep", type=float, default=0.0)
     parser.add_argument("--say", help="Text to write to stderr as the server starts")
+    parser.add_argument("--instructions", help="What the server says of its tools in place of its own, or '' for nothing")
     parser.add_argument("mode", nargs="?", default="stdio")
     parser.add_argument("port", nargs="?", type=int)
     arguments = parser.parse_args()
+    if arguments.instructions is not None:
+        server._lowlevel_server.instructions = arguments.instructions or None
 
     print("the test server is starting", file=sys.stderr, flush=True)
     if arguments.say:
