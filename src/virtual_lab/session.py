@@ -37,6 +37,7 @@ from uuid import uuid4
 
 from pydantic_core import to_jsonable_python
 
+from virtual_lab.approval import asked_for
 from virtual_lab.constants import (
     DEFAULT_EXECUTION_TIMEOUT,
     DEFAULT_SESSION_CPU_LIMIT,
@@ -615,11 +616,13 @@ class Session:
 
         return True
 
-    def answer_call(self, call: dict, request: int, calls: list[dict[str, Any]]) -> None:
+    def answer_call(self, call: dict, request: int, calls: list[dict[str, Any]], finished: threading.Event) -> None:
         """Runs a tool that code called, in a thread of its own, which writes back its reply.
 
         The thread lets the code's time limit stand: if the code is stopped while the tool runs,
         the session is answered and moves on, and the tool's reply, when it comes, is dropped.
+        Whatever the tool asks a person is withdrawn once finished is set, when the code has
+        finished.
         """
         name = call.get("tool")
         arguments = call.get("arguments")
@@ -651,19 +654,27 @@ class Session:
 
         threading.Thread(
             target=self.run_call,
-            args=(process, call.get("call"), tool, arguments, record),
+            args=(process, call.get("call"), tool, arguments, record, finished),
             name=f"virtual-lab-tool-{tool.name}",
             daemon=True,
         ).start()
 
     def run_call(
-        self, process: subprocess.Popen, call: Any, tool: Tool, arguments: dict, record: dict[str, Any]
+        self,
+        process: subprocess.Popen,
+        call: Any,
+        tool: Tool,
+        arguments: dict,
+        record: dict[str, Any],
+        finished: threading.Event,
     ) -> None:
         started = time.monotonic()
         error = None
         self._tool_threads.add(threading.get_ident())
         try:
-            line = json.dumps({"reply": call, "result": jsonable(tool.function(**arguments))})
+            with asked_for(finished):
+                value = tool.function(**arguments)
+            line = json.dumps({"reply": call, "result": jsonable(value)})
             if len(line) > MAX_HOST_TOOL_RESULT_BYTES:
                 error = (
                     f"it returned {len(line):,} bytes of JSON, more than the {MAX_HOST_TOOL_RESULT_BYTES:,} a "
@@ -799,16 +810,23 @@ class Session:
             request["value"] = MAX_SESSION_VALUE_BYTES
         answer: dict | None | bool = None
         calls: list[dict[str, Any]] = []
+        # Set once the code has finished, so that a call it made that is still waiting for a
+        # person's approval is not made after all
+        finished = threading.Event()
 
-        if self.write(self._process, json.dumps(request)):  # type: ignore[arg-type]
-            deadline = started + limit + SESSION_GRACE_SECONDS
-            answer = self.next_answer(deadline)
-            # A call to a tool is answered, and an answer to some other request is not this
-            # one's, and is not a reason to give up on the session while this one's may still come
-            while isinstance(answer, dict) and answer.get("id") != request["id"]:
-                if "call" in answer:
-                    self.answer_call(answer, request["id"], calls)
+        try:
+            if self.write(self._process, json.dumps(request)):  # type: ignore[arg-type]
+                deadline = started + limit + SESSION_GRACE_SECONDS
                 answer = self.next_answer(deadline)
+                # A call to a tool is answered, and an answer to some other request is not this
+                # one's, and is not a reason to give up on the session while this one's may still
+                # come
+                while isinstance(answer, dict) and answer.get("id") != request["id"]:
+                    if "call" in answer:
+                        self.answer_call(answer, request["id"], calls, finished)
+                    answer = self.next_answer(deadline)
+        finally:
+            finished.set()
 
         if isinstance(answer, dict) and answer.get("id") == request["id"]:
             result = self.result_from(answer, normalized, code, time.monotonic() - started)

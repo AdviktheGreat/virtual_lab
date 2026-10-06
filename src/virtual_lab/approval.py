@@ -15,7 +15,8 @@ import math
 import sys
 import threading
 import webbrowser
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,6 +24,11 @@ from virtual_lab.constants import APPROVAL_MAX_ARGUMENT_CHARS
 
 # One question at a time, since calls to tools run at the same time and each could ask
 TERMINAL = threading.Lock()
+
+# What each thread asks on behalf of, which may stop waiting for the answer
+ASKER = threading.local()
+
+WITHDRAWN = "Whatever asked this has stopped waiting for the answer, so it is not used.\n"
 
 YES = frozenset({"y", "yes"})
 TRUE = frozenset({"y", "yes", "true", "1"})
@@ -82,12 +88,35 @@ Approve = Callable[[ApprovalRequest], bool]
 Answer = Callable[[ServerQuestion], dict[str, Any] | None]
 
 
-def terminal_available() -> bool:
-    """Whether there is a person at a terminal to ask."""
+@contextmanager
+def asked_for(finished: threading.Event) -> Iterator[None]:
+    """Has what this thread asks a person withdrawn once finished is set, as when the code that
+    called a tool runs out of time, or a tool call that asked something is cancelled."""
+    previous = getattr(ASKER, "finished", None)
+    ASKER.finished = finished
     try:
-        return sys.stdin is not None and sys.stdin.isatty() and sys.stderr is not None
+        yield
+    finally:
+        ASKER.finished = previous
+
+
+def withdrawn() -> bool:
+    """Whether whatever this thread is asking on behalf of has stopped waiting for the answer."""
+    finished = getattr(ASKER, "finished", None)
+    return finished is not None and finished.is_set()
+
+
+def is_terminal(stream: Any) -> bool:
+    try:
+        return stream is not None and stream.isatty()
     except (AttributeError, ValueError):
         return False
+
+
+def terminal_available() -> bool:
+    """Whether there is a person at a terminal to ask: one who can both see the question, which is
+    written to stderr, and type the answer."""
+    return is_terminal(sys.stdin) and is_terminal(sys.stderr)
 
 
 def say(text: str) -> None:
@@ -98,11 +127,15 @@ def say(text: str) -> None:
 
 
 def read_reply(prompt: str) -> str | None:
-    """A line typed in reply, or None once input has ended."""
+    """A line typed in reply, or None once input has ended, or if the question was withdrawn
+    while the person typed it."""
     say(prompt)
     line = sys.stdin.readline()
     if not line:
         say("\n")
+        return None
+    if withdrawn():
+        say(WITHDRAWN)
         return None
 
     return line.strip()
@@ -133,6 +166,9 @@ def approve_in_terminal(request: ApprovalRequest) -> bool:
             "so it was not made. To approve calls another way, pass approve to connect_mcp."
         )
     with TERMINAL:
+        # Withdrawn while another question had the terminal
+        if withdrawn():
+            return False
         about = first_paragraph(request.description)
         say(
             f"\n{request.tool}, a tool of the MCP server {request.server}, waits for your approval of each call."
@@ -236,6 +272,8 @@ def answer_in_terminal(question: ServerQuestion) -> dict[str, Any] | None:
     if not terminal_available():
         return None
     with TERMINAL:
+        if withdrawn():
+            return None
         say(f"\nThe MCP server {question.server} asks:\n{question.message.strip()}\n")
         if question.url is not None:
             say(f"It asks you to go to {question.url}\n")

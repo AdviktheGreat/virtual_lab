@@ -5,6 +5,8 @@ import io
 import json
 import math
 import sys
+import threading
+import time
 from collections.abc import Iterator
 from importlib import import_module
 from pathlib import Path
@@ -46,8 +48,45 @@ class NotATerminal(io.StringIO):
         return False
 
 
+def at_a_terminal(monkeypatch: pytest.MonkeyPatch, stdin: io.StringIO) -> None:
+    monkeypatch.setattr(sys, "stdin", stdin)
+    # The questions are written to stderr, which pytest captures, and which is shown to a person
+    # at a terminal
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True, raising=False)
+
+
 def typing(monkeypatch: pytest.MonkeyPatch, *lines: str) -> None:
-    monkeypatch.setattr(sys, "stdin", Terminal("".join(f"{line}\n" for line in lines)))
+    at_a_terminal(monkeypatch, Terminal("".join(f"{line}\n" for line in lines)))
+
+
+class TypedTooLate(Terminal):
+    """What a person types, the last line of it after whatever asked has stopped waiting."""
+
+    def __init__(self, lines: list[str], finished: threading.Event) -> None:
+        super().__init__("".join(f"{line}\n" for line in lines))
+        self.left = len(lines)
+        self.finished = finished
+
+    def readline(self, *arguments: Any) -> str:
+        self.left -= 1
+        if self.left == 0:
+            self.finished.set()
+        return super().readline(*arguments)
+
+
+def finished_already() -> threading.Event:
+    finished = threading.Event()
+    finished.set()
+    return finished
+
+
+def eventually(condition: Any, seconds: float = 15) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False
 
 
 def request(**fields: Any) -> ApprovalRequest:
@@ -75,7 +114,7 @@ class TestApprovingAtTheTerminal:
         assert approve_in_terminal(request()) is False
 
     def test_input_that_has_ended_declines(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sys, "stdin", Terminal(""))
+        at_a_terminal(monkeypatch, Terminal(""))
 
         assert approve_in_terminal(request()) is False
 
@@ -135,6 +174,105 @@ class TestApprovingAtTheTerminal:
 
         assert approval.terminal_available() is False
 
+    def test_where_the_question_could_not_be_seen_the_call_is_declined(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        typing(monkeypatch, "y")
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+        with pytest.raises(ApprovalDeclined, match="there is no terminal to ask at"):
+            approve_in_terminal(request())
+
+    def test_without_stderr_there_is_no_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        typing(monkeypatch, "y")
+        monkeypatch.setattr(sys, "stderr", None)
+
+        assert approval.terminal_available() is False
+
+    def test_a_call_whose_caller_has_stopped_waiting_is_declined_without_asking(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        typing(monkeypatch, "y")
+
+        with approval.asked_for(finished_already()):
+            assert approve_in_terminal(request()) is False
+
+        assert capsys.readouterr().err == ""
+        assert sys.stdin.read() == "y\n"
+
+    def test_a_call_approved_after_its_caller_stopped_waiting_is_declined_and_the_person_told(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        finished = threading.Event()
+        at_a_terminal(monkeypatch, TypedTooLate(["y"], finished))
+
+        with approval.asked_for(finished):
+            assert approve_in_terminal(request()) is False
+
+        assert capsys.readouterr().err.endswith("Allow this call? [y/N] " + approval.WITHDRAWN)
+
+
+class TestWithdrawing:
+    def test_nothing_is_withdrawn_unless_asked_for_something_that_finished(self) -> None:
+        assert approval.withdrawn() is False
+        with approval.asked_for(threading.Event()):
+            assert approval.withdrawn() is False
+
+    def test_what_is_asked_for_is_withdrawn_once_it_finishes_and_no_longer_after(self) -> None:
+        finished = threading.Event()
+        with approval.asked_for(finished):
+            finished.set()
+            assert approval.withdrawn() is True
+
+        assert approval.withdrawn() is False
+
+    def test_what_was_asked_for_before_is_asked_for_again_after(self) -> None:
+        with approval.asked_for(finished_already()):
+            with approval.asked_for(threading.Event()):
+                assert approval.withdrawn() is False
+            assert approval.withdrawn() is True
+
+    def test_it_is_only_of_what_this_thread_asks(self) -> None:
+        seen = []
+        with approval.asked_for(finished_already()):
+            other = threading.Thread(target=lambda: seen.append(approval.withdrawn()))
+            other.start()
+            other.join()
+
+        assert seen == [False]
+
+    def test_a_tool_that_code_in_a_session_called_has_its_questions_withdrawn_once_the_code_stops(
+        self, tmp_path: Path
+    ) -> None:
+        from virtual_lab import LocalSession
+        from virtual_lab.custom_tools import tool_from_function
+
+        seen: list[bool] = []
+
+        def ask_slowly() -> str:
+            """Takes a while to be answered."""
+            seen.append(approval.withdrawn())
+            eventually(approval.withdrawn)
+            seen.append(approval.withdrawn())
+            return "answered"
+
+        with LocalSession(tmp_path, warn=False, tools=(tool_from_function(ask_slowly),)) as session:
+            stopped = session.run("ask_slowly()", timeout=1)
+
+            assert stopped.status in ("timeout", "lost")
+            assert eventually(lambda: len(seen) == 2)
+
+        assert seen == [False, True]
+
+    def test_a_tool_that_code_in_a_session_called_and_waited_for_has_nothing_withdrawn(self, tmp_path: Path) -> None:
+        from virtual_lab import LocalSession
+        from virtual_lab.custom_tools import tool_from_function
+
+        def withdrawn_yet() -> bool:
+            """Says whether its questions are withdrawn."""
+            return approval.withdrawn()
+
+        with LocalSession(tmp_path, warn=False, tools=(tool_from_function(withdrawn_yet),)) as session:
+            assert session.evaluate("withdrawn_yet()").value is False
+
 
 def question(**fields: Any) -> ServerQuestion:
     return ServerQuestion(**{"server": "lab", "message": "Go ahead?", **fields})
@@ -156,6 +294,53 @@ class TestAnsweringAtTheTerminal:
         monkeypatch.setattr(sys, "stdin", NotATerminal("y\n"))
 
         assert answer_in_terminal(question(fields=GO)) is None
+
+    def test_where_the_question_could_not_be_seen_it_is_declined(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        typing(monkeypatch, "y")
+        monkeypatch.setattr(sys.stderr, "isatty", lambda: False)
+
+        assert answer_in_terminal(question(fields=GO)) is None
+
+    def test_a_question_withdrawn_before_it_is_asked_is_declined_without_asking(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        typing(monkeypatch, "y")
+
+        with approval.asked_for(finished_already()):
+            assert answer_in_terminal(question(fields=GO)) is None
+
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize(
+        ("fields", "lines"),
+        [(GO, ["y"]), ({}, ["y"]), (ORDER, ["y"]), (ORDER, ["y", "PD-L1 binder"])],
+        ids=["yes or no", "agreeing", "agreeing to a form", "a field of a form"],
+    )
+    def test_a_question_withdrawn_while_the_person_answers_is_declined_and_they_are_told(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fields: dict[str, Any],
+        lines: list[str],
+    ) -> None:
+        finished = threading.Event()
+        at_a_terminal(monkeypatch, TypedTooLate(lines, finished))
+
+        with approval.asked_for(finished):
+            assert answer_in_terminal(question(fields=fields, required=("name", "kind"))) is None
+
+        assert capsys.readouterr().err.endswith(approval.WITHDRAWN)
+
+    def test_a_web_page_is_not_opened_once_its_question_is_withdrawn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        opened: list[str] = []
+        monkeypatch.setattr(approval.webbrowser, "open", opened.append)
+        finished = threading.Event()
+        at_a_terminal(monkeypatch, TypedTooLate(["y"], finished))
+
+        with approval.asked_for(finished):
+            assert answer_in_terminal(question(url="https://pay.example.org/1")) is None
+
+        assert opened == []
 
     def test_the_server_and_its_question_are_shown(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -184,7 +369,7 @@ class TestAnsweringAtTheTerminal:
         assert capsys.readouterr().err.endswith("go? [y/N] ")
 
     def test_a_yes_or_no_question_with_input_ended_is_declined(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sys, "stdin", Terminal(""))
+        at_a_terminal(monkeypatch, Terminal(""))
 
         assert answer_in_terminal(question(fields=GO)) is None
 
@@ -247,7 +432,7 @@ class TestAnsweringAtTheTerminal:
         assert answer_in_terminal(question(fields=ORDER)) is None
 
     def test_a_form_with_input_ended_before_it_is_agreed_to_is_declined(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sys, "stdin", Terminal(""))
+        at_a_terminal(monkeypatch, Terminal(""))
 
         assert answer_in_terminal(question(fields=ORDER)) is None
 
@@ -350,7 +535,7 @@ def stdio_entry(*arguments: str, **entry: Any) -> dict[str, Any]:
 def connect(entry: dict[str, Any], **options: Any) -> Any:
     from virtual_lab.mcp_tools import connect_mcp
 
-    return connect_mcp({"mcp_servers": {"genes": entry}}, timeout=20, **options)
+    return connect_mcp({"mcp_servers": {"genes": entry}}, **{"timeout": 20, **options})
 
 
 def by_name(tools: Any) -> dict[str, Tool]:
@@ -753,6 +938,61 @@ class TestApprovingCalls:
 
             assert count.function() == 1
 
+    def test_a_call_whose_caller_stopped_waiting_before_it_was_approved_is_not_made(self) -> None:
+        finished = threading.Event()
+
+        def approve_too_late(asked: ApprovalRequest) -> bool:
+            finished.set()
+            return True
+
+        with connect(stdio_entry(approval=["count"]), approve=approve_too_late) as tools:
+            count = by_name(tools)["genes_count"]
+            with approval.asked_for(finished):
+                with pytest.raises(
+                    ApprovalDeclined,
+                    match="^The code that called genes_count stopped waiting for a person to approve the call, so it was not made.$",
+                ):
+                    count.function()
+
+            assert count.function() == 1
+
+    def test_a_call_whose_caller_has_stopped_waiting_is_not_asked_about(self, approver: Approver) -> None:
+        with connect(stdio_entry(approval=["count"]), approve=approver) as tools:
+            with approval.asked_for(finished_already()):
+                with pytest.raises(ApprovalDeclined, match="stopped waiting"):
+                    by_name(tools)["genes_count"].function()
+
+        assert approver.asked == []
+
+    def test_a_call_that_does_not_wait_is_made_whether_or_not_its_caller_has_stopped_waiting(self) -> None:
+        with connect(stdio_entry(approval=["echo"]), approve=Approver(False)) as tools:
+            with approval.asked_for(finished_already()):
+                assert by_name(tools)["genes_count"].function() == 1
+
+    def test_code_in_a_session_that_stopped_before_its_call_was_approved_does_not_have_it_made(
+        self, tmp_path: Path
+    ) -> None:
+        from virtual_lab import LocalSession
+
+        answered = threading.Event()
+
+        def approve_once_withdrawn(asked: ApprovalRequest) -> bool:
+            if not answered.is_set():
+                eventually(approval.withdrawn)
+                answered.set()
+            return True
+
+        with connect(stdio_entry(approval=["count"]), approve=approve_once_withdrawn) as tools:
+            with LocalSession(tmp_path, warn=False, tools=tools.tools) as session:
+                stopped = session.run("genes_count()", timeout=1)
+
+                assert stopped.status in ("timeout", "lost")
+                assert answered.wait(15)
+                # Time for a call that should not be made to reach the server first
+                time.sleep(0.5)
+
+            assert by_name(tools)["genes_count"].function() == 1
+
     def test_an_approver_can_decline_with_a_reason_of_its_own(self) -> None:
         approver = Approver(ApprovalDeclined("Over budget."))
         with connect(stdio_entry(approval=["count"]), approve=approver) as tools:
@@ -937,6 +1177,35 @@ class TestAnsweringAServer:
             assert by_name(tools)["genes_confirm"].function() == "accept False"
 
         assert [asked.tool for asked in approver.asked] == ["genes_confirm"]
+
+    def test_a_question_whose_call_ran_out_of_time_is_withdrawn(self) -> None:
+        seen: list[bool] = []
+
+        def answer_slowly(question: ServerQuestion) -> dict[str, Any]:
+            seen.append(approval.withdrawn())
+            eventually(approval.withdrawn)
+            seen.append(approval.withdrawn())
+            return {"approve": True}
+
+        with connect(stdio_entry(), answer=answer_slowly, timeout=1) as tools:
+            with pytest.raises(TimeoutError):
+                by_name(tools)["genes_confirm"].function()
+
+            assert eventually(lambda: len(seen) == 2)
+
+        assert seen == [False, True]
+
+    def test_a_question_answered_in_time_is_not_withdrawn(self) -> None:
+        seen: list[bool] = []
+
+        def answer(question: ServerQuestion) -> dict[str, Any]:
+            seen.append(approval.withdrawn())
+            return {"approve": True}
+
+        with connect(stdio_entry(), answer=answer) as tools:
+            assert by_name(tools)["genes_confirm"].function() == "accept True"
+
+        assert seen == [False]
 
 
 @pytest.mark.usefixtures("legacy")

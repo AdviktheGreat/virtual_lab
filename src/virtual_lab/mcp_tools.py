@@ -46,6 +46,8 @@ from virtual_lab.approval import (
     ServerQuestion,
     answer_in_terminal,
     approve_in_terminal,
+    asked_for,
+    withdrawn,
 )
 from virtual_lab.constants import (
     MCP_CALL_TIMEOUT,
@@ -780,10 +782,18 @@ class MCPConnection:
                 fields={str(name): dict(item) if isinstance(item, dict) else {} for name, item in properties.items()},
                 required=tuple(str(name) for name in required),
             )
+        finished = threading.Event()
+
+        def ask() -> dict[str, Any] | None:
+            with asked_for(finished):
+                return self.answer(question)
+
         try:
             # In a thread, since a person may take a while, and the connections to every server
-            # are served on this loop meanwhile
-            answer = await anyio.to_thread.run_sync(self.answer, question, abandon_on_cancel=True)
+            # are served on this loop meanwhile. The thread is left behind if the call is
+            # cancelled, and the question is withdrawn, so that the answer is not taken for
+            # one to whatever is asked next
+            answer = await anyio.to_thread.run_sync(ask, abandon_on_cancel=True)
         except Exception as error:
             warnings.warn(
                 f"The question the MCP server {self.server.name} asked could not be answered, so it was declined: "
@@ -792,6 +802,8 @@ class MCPConnection:
                 stacklevel=1,
             )
             return ElicitResult(action="decline")
+        finally:
+            finished.set()
         if answer is None:
             return ElicitResult(action="decline")
         if question.url is not None:
@@ -1018,8 +1030,18 @@ class MCPConnection:
         request = ApprovalRequest(
             tool=here, server=self.server.name, server_tool=name, arguments=dict(arguments), description=description
         )
+        late = ApprovalDeclined(
+            f"The code that called {here} stopped waiting for a person to approve the call, so it was not made."
+        )
+        if withdrawn():
+            raise late
         # Only True approves, so that an approver that answers anything else, such as "no", does not
-        if self.approve(request) is not True:
+        approval = self.approve(request)
+        # An approval that comes once the caller has gone would make a call whose result no one
+        # receives, and that the caller may well make again
+        if withdrawn():
+            raise late
+        if approval is not True:
             raise ApprovalDeclined(
                 f"A person declined this call to {here}, so it was not made. Do not make it again unchanged."
             )
@@ -1211,11 +1233,13 @@ def connect_mcp(
     :param presets: Presets to connect to as well, each as a server named after it.
     :param approve: Called with an ApprovalRequest before each call to a tool that waits for
         approval, and makes the call only if it returns True; it may raise ApprovalDeclined to
-        say why not. None asks at the terminal, and declines every call where there is none.
+        say why not. None asks at the terminal, and declines every call where there is none. A
+        call from code in a session that stops before the call is approved is not made.
     :param answer: Called with a ServerQuestion when a server asks a person something, and returns
         the answer: the form's fields by name, {} once the person has gone to a web page the
         question asks them to, or None to decline. None asks at the terminal, and declines
-        where there is none.
+        where there is none. A question whose call stops waiting before it is answered is
+        withdrawn, and asking at the terminal then declines it.
     :raises ImportError: If the MCP SDK is not installed: pip install "virtual-lab[mcp]".
     :raises ValueError: If the config is not one, or uses a variable that is not set, or names
         a preset that is not one, or two tools would share a name.
