@@ -27,6 +27,7 @@ import re
 import shutil
 import tempfile
 import threading
+import time
 import warnings
 from collections.abc import Iterable, Mapping
 from contextlib import AsyncExitStack
@@ -58,6 +59,7 @@ from virtual_lab.constants import (
     MCP_STOP_TIMEOUT,
 )
 from virtual_lab.custom_tools import clean_schema, inline_references
+from virtual_lab.mcp_auth import PausedClock, SignIn
 from virtual_lab.mcp_presets import MCP_PRESETS, preset_entry
 from virtual_lab.records import truncate_text
 from virtual_lab.tools import Tool
@@ -75,6 +77,7 @@ SERVER_KEYS = frozenset(
         "url",
         "httpUrl",
         "headers",
+        "auth",
         "type",
         "transport",
         "enabled",
@@ -107,6 +110,9 @@ MAX_TOOL_NAME_CHARS = 64
 # connection that cannot even say it timed out
 CALL_TIMEOUT_MARGIN = 5.0
 
+# Seconds between looks at whether a person is still signing in, while a wait is paused for it
+SIGN_IN_POLL_SECONDS = 0.5
+
 
 class MCPToolError(RuntimeError):
     """Raised when an MCP server says that a call to one of its tools failed."""
@@ -135,6 +141,7 @@ class MCPServerConfig:
     :param cwd: The directory it starts in, or None for this process's.
     :param url: Where the server is, for http and sse.
     :param headers: Headers sent with every request to it, such as one carrying an API key.
+    :param auth: "oauth" for a server at a URL that is signed in to in a browser, or None.
     :param tools: The names of the tools to offer, or None for all of them.
     :param descriptions: Descriptions the config gives some of them, by name, in place of the
         server's.
@@ -159,6 +166,7 @@ class MCPServerConfig:
     cwd: str | None = None
     url: str | None = field(default=None, repr=False)
     headers: dict[str, str] = field(default_factory=dict, repr=False)
+    auth: str | None = None
     tools: tuple[str, ...] | None = None
     descriptions: dict[str, str] = field(default_factory=dict)
     hidden: dict[str, str] = field(default_factory=dict, repr=False)
@@ -391,11 +399,11 @@ def parse_server(name: Any, entry: Any) -> MCPServerConfig | None:
     except UnsetVariableError as error:
         if preset is None:
             raise
-        raise UnsetVariableError(f"{error}. {preset.setup}") from None
+        raise UnsetVariableError(f"{error}. {preset.setup_for(entry)}") from None
     if parsed is None or preset is None:
         return parsed
 
-    return replace(parsed, setup=preset.setup)
+    return replace(parsed, setup=preset.setup_for(entry))
 
 
 def parse_entry(name: str, entry: Mapping[str, Any]) -> MCPServerConfig | None:
@@ -451,12 +459,18 @@ def parse_entry(name: str, entry: Mapping[str, Any]) -> MCPServerConfig | None:
     if instructions is not None and not isinstance(instructions, str):
         raise TypeError(f"The instructions of the MCP server {name} are text, not {type(instructions).__name__}")
     notes = (instructions or "").strip() or None
+    auth = entry.get("auth")
+    if auth is not None and auth != "oauth":
+        raise ValueError(
+            f'The auth of the MCP server {name} is "oauth", for it to be signed in to in a browser, or left out, not '
+            f"{auth!r}"
+        )
     hidden: dict[str, str] = {}
 
     if transport == "stdio":
         if command is None:
             raise ValueError(f"The MCP server {name} is started by a command, which it does not give")
-        if misplaced := sorted({"headers"} & set(entry)):
+        if misplaced := sorted({"headers", "auth"} & set(entry)):
             raise ValueError(f"The MCP server {name} is started here, so {misplaced[0]} is not used: remove it")
         if isinstance(command, str):
             parts = [command]
@@ -506,6 +520,12 @@ def parse_entry(name: str, entry: Mapping[str, Any]) -> MCPServerConfig | None:
     address = substitute(url, name, hidden)
     if urlsplit(address).scheme not in ("http", "https") or not urlsplit(address).netloc:
         raise ValueError(f"The MCP server {name} is reached at {url!r}, which is not an http:// or https:// URL")
+    headers = text_mapping(entry.get("headers"), name, "headers", hidden)
+    if auth == "oauth" and any(header.lower() == "authorization" for header in headers):
+        raise ValueError(
+            f"The MCP server {name} is signed in to, with auth: oauth, and sent an Authorization header of its own, "
+            "which would take the sign-in's place: give one"
+        )
 
     return MCPServerConfig(
         name=name,
@@ -513,7 +533,8 @@ def parse_entry(name: str, entry: Mapping[str, Any]) -> MCPServerConfig | None:
         transport=transport,
         shown=url,
         url=address,
-        headers=text_mapping(entry.get("headers"), name, "headers", hidden),
+        headers=headers,
+        auth=auth,
         tools=tools,
         descriptions=descriptions,
         hidden=hidden,
@@ -737,6 +758,12 @@ class MCPConnection:
         self.instructions: str | None = None
         # Each tool offered, by its name on the server, with its name and description here
         self.offered: dict[str, tuple[str, str]] = {}
+        # The time spent waiting for a person to sign in, which no time limit counts
+        self.signing_in = PausedClock()
+        # The SDK's OAuth provider, for a server signed in to, kept across connections so that
+        # what it has found of the server's authorization server is kept too
+        self.auth: Any = None
+        self.sign_in: SignIn | None = None
 
     @property
     def described(self) -> str:
@@ -822,16 +849,23 @@ class MCPConnection:
                 command=server.command, args=list(server.args), env=dict(server.env), cwd=server.cwd
             )
             return stdio_client(parameters, errlog=log)
+        # Made again once the client it registered was forgotten, so that a new one is
+        # registered, at a port that is free
+        if server.auth == "oauth" and (self.sign_in is None or self.sign_in.stale):
+            self.sign_in = SignIn(server.name, server.url, self.signing_in)  # type: ignore[arg-type]
+            self.auth = self.sign_in.provider()
         if server.transport == "sse":
             from mcp.client.sse import sse_client
 
-            return sse_client(server.url, headers=dict(server.headers), sse_read_timeout=read_timeout)
+            return sse_client(server.url, headers=dict(server.headers), sse_read_timeout=read_timeout, auth=self.auth)
 
         import httpx2
         from mcp.client.streamable_http import streamable_http_client
 
         http = await stack.enter_async_context(
-            httpx2.AsyncClient(headers=dict(server.headers), timeout=httpx2.Timeout(30.0, read=read_timeout))
+            httpx2.AsyncClient(
+                headers=dict(server.headers), timeout=httpx2.Timeout(30.0, read=read_timeout), auth=self.auth
+            )
         )
         return streamable_http_client(server.url, http_client=http)
 
@@ -884,6 +918,25 @@ class MCPConnection:
 
         raise MCPServerError(f"{self.described} lists its tools in more than {MCP_MAX_TOOL_PAGES:,} pages")
 
+    def wait(self, future: concurrent.futures.Future[Any], timeout: float | None) -> Any:
+        """The future's result, waited for for at most timeout seconds, besides any spent waiting
+        for a person to sign in, which may take them a while.
+
+        :raises concurrent.futures.TimeoutError: If it did not come in time.
+        """
+        if timeout is None:
+            return future.result()
+        started, paused = time.monotonic(), self.signing_in.seconds()
+        while True:
+            left = started + timeout + (self.signing_in.seconds() - paused) - time.monotonic()
+            if left <= 0 and not self.signing_in.paused:
+                raise concurrent.futures.TimeoutError
+            # Whether the future is done is asked rather than told by result raising
+            # TimeoutError, which is also what a future whose work timed out raises
+            concurrent.futures.wait([future], timeout=min(max(left, 0.0), SIGN_IN_POLL_SECONDS) or SIGN_IN_POLL_SECONDS)
+            if future.done():
+                return future.result()
+
     def start(self) -> None:
         """Starts the server, or connects to it, and lists its tools."""
         log = open(self.log_path, "a", encoding="utf-8") if self.log_path is not None else None  # noqa: SIM115
@@ -891,10 +944,10 @@ class MCPConnection:
         holding.task = self.loop.submit(self.hold(holding, log))
         starting = "start" if self.server.transport == "stdio" else "connect to"
         try:
-            client = holding.ready.result(self.start_timeout)
+            client = self.wait(holding.ready, self.start_timeout)
             listing = self.loop.submit(self.list_tools(client))
             try:
-                tools = listing.result(self.start_timeout)
+                tools = self.wait(listing, self.start_timeout)
             except concurrent.futures.TimeoutError:
                 listing.cancel()
                 raise
@@ -998,7 +1051,7 @@ class MCPConnection:
         call = self.loop.submit(client.call_tool(name, arguments, read_timeout_seconds=self.timeout))
         too_slow = TimeoutError(f"The MCP server {self.server.name} did not answer within {self.timeout} seconds")
         try:
-            result = call.result(None if self.timeout is None else self.timeout + CALL_TIMEOUT_MARGIN)
+            result = self.wait(call, None if self.timeout is None else self.timeout + CALL_TIMEOUT_MARGIN)
         except concurrent.futures.TimeoutError:
             call.cancel()
             raise too_slow from None
@@ -1164,7 +1217,7 @@ def connect_mcp(
     servers: Iterable[str] | None = None,
     timeout: float | None = MCP_CALL_TIMEOUT,
     start_timeout: float = MCP_START_TIMEOUT,
-    presets: Iterable[str] | None = None,
+    presets: Iterable[str] | Mapping[str, Mapping[str, Any]] | None = None,
     approve: Approve | None = None,
     answer: Answer | None = None,
 ) -> MCPTools:
@@ -1215,6 +1268,11 @@ def connect_mcp(
     given its tools, or a session given them. What a server asks a person while one of its tools
     runs, as Proto's server asks before it deploys a tool, is passed on to a person to answer.
 
+    A server at a URL whose entry says auth: oauth is signed in to in a browser, the first time it
+    is connected to, and the sign-in is kept, in ~/.virtual_lab/mcp_auth, for the next; see
+    virtual_lab.mcp_auth. The time a person takes to sign in is not counted against timeout or
+    start_timeout.
+
     A preset is a server's entry written out already, for Paperclip's literature, Adaptyv's lab,
     or Proto's design tools: {"lab": {"preset": "adaptyv"}} in a config, with anything else the
     entry gives used in place of the preset's, or presets=["adaptyv"] for a server named after
@@ -1230,7 +1288,8 @@ def connect_mcp(
     :param timeout: The most seconds a call to a tool may take, or None for no limit.
     :param start_timeout: The most seconds a server may take to start, or be connected to, and
         list its tools. A server run with npx or docker may first have to be downloaded.
-    :param presets: Presets to connect to as well, each as a server named after it.
+    :param presets: Presets to connect to as well, each as a server named after it: their names,
+        or a mapping of each name to changes to it, such as {"paperclip": {"auth": "oauth"}}.
     :param approve: Called with an ApprovalRequest before each call to a tool that waits for
         approval, and makes the call only if it returns True; it may raise ApprovalDeclined to
         say why not. None asks at the terminal, and declines every call where there is none. A
@@ -1263,14 +1322,25 @@ def connect_mcp(
     if config is None and presets is None:
         raise ValueError("connect_mcp connects to the servers of a config, or to presets, or both: give one")
     entries = read_config(config) if config is not None else {}
-    for preset in [presets] if isinstance(presets, str) else list(presets or ()):
+    if isinstance(presets, str):
+        changed: dict[Any, Any] = {presets: {}}
+    elif isinstance(presets, Mapping):
+        changed = dict(presets)
+    else:
+        changed = {preset: {} for preset in presets or ()}
+    for preset, changes in changed.items():
         if preset not in MCP_PRESETS:
             raise ValueError(f"There is no MCP preset {preset!r}: the presets are {', '.join(MCP_PRESETS)}")
+        if not isinstance(changes, Mapping):
+            raise TypeError(
+                f"The changes to the preset {preset} are a mapping, such as {{'auth': 'oauth'}}, not "
+                f"{type(changes).__name__}"
+            )
         if preset in entries:
             raise ValueError(
                 f"The MCP config already has a server {preset}: give it preset: {preset} there, or name it otherwise"
             )
-        entries[preset] = {"preset": preset}
+        entries[preset] = {**changes, "preset": preset}
     if servers is None:
         chosen = list(entries)
     else:

@@ -7,8 +7,10 @@ preset, and anything else the entry gives is used in place of the preset's:
 
     mcp_servers:
       lab: {preset: adaptyv_testing}
+      papers: {preset: paperclip, auth: oauth}     # signed in to, in place of an API key
 
-or connect_mcp(presets=["paperclip", "proto"]) connects to presets by their own names.
+or connect_mcp(presets=["paperclip", "proto"]) connects to presets by their own names, and
+connect_mcp(presets={"paperclip": {"auth": "oauth"}}) with changes to them.
 """
 
 import copy
@@ -73,6 +75,18 @@ PROTO_ALLOWED = (
 )
 
 
+PROTO_HOSTED_INSTRUCTIONS = """\
+Proto's hosted server runs bioinformatics tools, among them structure prediction, inverse
+folding, protein and DNA language models, binder design, and database lookups, with nothing
+installed here, under the Proto account signed in to, which may be charged for what is run.
+Before the first call to a tool, find it and read what it takes with the server's tools for
+doing so, and see a valid input where one is given. Run small batches before large ones.
+
+Some calls, such as any that deploys a tool, wait for a person to approve them, and fail if they
+do not. If a call is declined, do not make it again unchanged: say what was declined, and go on
+without it."""
+
+
 @dataclass(frozen=True)
 class MCPPreset:
     """A ready-made config for one MCP server.
@@ -80,11 +94,31 @@ class MCPPreset:
     :param entry: The server's entry in a config.
     :param about: What the server is, in a few words.
     :param setup: What to do before connecting, said when it cannot be connected to.
+    :param credential: The header that carries the server's API key, which is left out where
+        the server is signed in to instead, with auth: oauth; or None.
+    :param signing_in: What to know of signing in to the server, said in place of setup where it
+        is signed in to; or None.
     """
 
     entry: dict[str, Any] = field(repr=False)
     about: str
     setup: str = field(repr=False)
+    credential: str | None = field(default=None, repr=False)
+    signing_in: str | None = field(default=None, repr=False)
+
+    def setup_for(self, entry: dict[str, Any]) -> str:
+        """What to do before connecting to the server as an entry using the preset describes it."""
+        if entry.get("auth") == "oauth" and self.signing_in is not None:
+            return self.signing_in
+        return self.setup
+
+
+def signing_in(service: str, account: str) -> str:
+    return (
+        f"{service} is signed in to with {account}: the first connection opens its sign-in page in your browser, "
+        "and the sign-in is kept for the next, in ~/.virtual_lab/mcp_auth unless VIRTUAL_LAB_MCP_AUTH_DIR says "
+        f'elsewhere. sign_out_mcp("<preset or URL>") forgets it.'
+    )
 
 
 ADAPTYV_APPROVAL = {"ask": ["*"], "allow": list(ADAPTYV_READING)}
@@ -100,8 +134,11 @@ MCP_PRESETS: MappingProxyType[str, MCPPreset] = MappingProxyType(
             about="Paperclip: search and read papers, trials, patents, and regulatory documents",
             setup=(
                 "Paperclip needs an API key, which starts gxl_, in PAPERCLIP_API_KEY, in the environment or the .env "
-                "file. Make one at https://paperclip.gxl.ai/keys."
+                "file. Make one at https://paperclip.gxl.ai/keys, or sign in instead, with auth: oauth in the "
+                "server's entry."
             ),
+            credential="X-API-Key",
+            signing_in=signing_in("Paperclip", "your Paperclip account"),
         ),
         "adaptyv": MCPPreset(
             # The trailing slash is part of the address the server knows itself by
@@ -115,9 +152,12 @@ MCP_PRESETS: MappingProxyType[str, MCPPreset] = MappingProxyType(
             setup=(
                 "Adaptyv's Foundry needs an API token in FOUNDRY_API_TOKEN, in the environment or the .env file. Make "
                 "one in the Foundry portal, https://foundry.adaptyvbio.com, under Organization, Settings, Tokens. A "
-                "read-only one, made with /tokens/attenuate, is enough to list and read experiments. To try it "
-                "without ordering anything, use the preset adaptyv_testing."
+                "read-only one, made with /tokens/attenuate, is enough to list and read experiments. Or sign in "
+                "instead, with auth: oauth in the server's entry. To try it without ordering anything, use the preset "
+                "adaptyv_testing."
             ),
+            credential="Authorization",
+            signing_in=signing_in("Adaptyv's Foundry", "your Foundry account"),
         ),
         "adaptyv_testing": MCPPreset(
             entry={
@@ -133,8 +173,11 @@ MCP_PRESETS: MappingProxyType[str, MCPPreset] = MappingProxyType(
             about="Adaptyv Foundry's testing sandbox, where nothing is ordered or charged",
             setup=(
                 "Adaptyv's testing sandbox needs a token of its own, in FOUNDRY_TESTING_TOKEN, in the environment or "
-                "the .env file. Make an account and a token at https://foundry.testing.adaptyvbio.com."
+                "the .env file. Make an account and a token at https://foundry.testing.adaptyvbio.com, or sign in "
+                "instead, with auth: oauth in the server's entry."
             ),
+            credential="Authorization",
+            signing_in=signing_in("Adaptyv's testing sandbox", "an account of the sandbox"),
         ),
         "proto": MCPPreset(
             entry={
@@ -146,8 +189,19 @@ MCP_PRESETS: MappingProxyType[str, MCPPreset] = MappingProxyType(
             setup=(
                 "Proto's server runs here, with proto-tools-mcp, and runs tools on your Modal account. Install it with "
                 'uv tool install "proto-tools[mcp] @ git+https://github.com/evo-design/proto-tools.git", sign in to '
-                "Modal with modal token new, and deploy the tools you want with proto-tools deploy --apps <name>."
+                "Modal with modal token new, and deploy the tools you want with proto-tools deploy --apps <name>. Or "
+                "use the preset proto_hosted, which needs nothing installed."
             ),
+        ),
+        "proto_hosted": MCPPreset(
+            entry={
+                "url": "https://mcp.evodesign.org/mcp",
+                "auth": "oauth",
+                "approval": {"ask": ["*"], "allow": list(PROTO_ALLOWED)},
+                "instructions": PROTO_HOSTED_INSTRUCTIONS,
+            },
+            about="Proto's hosted server: its tools with nothing installed here, signed in to with a Proto account",
+            setup=signing_in("Proto's hosted server", "a Proto account, from https://proto.evodesign.org"),
         ),
     }
 )
@@ -165,4 +219,12 @@ def preset_entry(server: str, entry: dict[str, Any]) -> tuple[dict[str, Any], MC
     preset = MCP_PRESETS[name]
 
     # A copy, so that nothing done with the entry changes the preset
-    return {**copy.deepcopy(preset.entry), **{key: value for key, value in entry.items() if key != "preset"}}, preset
+    filled = copy.deepcopy(preset.entry)
+    given = {key: value for key, value in entry.items() if key != "preset"}
+    # A server signed in to is not sent the API key it would otherwise be, nor needs one set
+    if given.get("auth") == "oauth" and preset.credential is not None and "headers" in filled:
+        filled["headers"] = {key: value for key, value in filled["headers"].items() if key != preset.credential}
+        if not filled["headers"]:
+            del filled["headers"]
+
+    return {**filled, **given}, preset

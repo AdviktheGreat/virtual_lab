@@ -601,17 +601,55 @@ Three services built for agents doing biology have presets, a server's entry wri
 
 | Preset | Service | Needs |
 | --- | --- | --- |
-| `paperclip` | [Paperclip](https://paperclip.gxl.ai): searching and reading the full text of papers, trials, patents, and regulatory documents | An API key in `PAPERCLIP_API_KEY`, from https://paperclip.gxl.ai/keys |
-| `adaptyv` | [Adaptyv's Foundry](https://foundry.adaptyvbio.com): proteins made and tested in a lab, which costs money | An API token in `FOUNDRY_API_TOKEN`, from the Foundry portal |
-| `adaptyv_testing` | Adaptyv's testing sandbox, where nothing is made or charged for | A token in `FOUNDRY_TESTING_TOKEN`, from https://foundry.testing.adaptyvbio.com |
+| `paperclip` | [Paperclip](https://paperclip.gxl.ai): searching and reading the full text of papers, trials, patents, and regulatory documents | An API key in `PAPERCLIP_API_KEY`, from https://paperclip.gxl.ai/keys, or signing in with `auth: oauth` |
+| `adaptyv` | [Adaptyv's Foundry](https://foundry.adaptyvbio.com): proteins made and tested in a lab, which costs money | An API token in `FOUNDRY_API_TOKEN`, from the Foundry portal, or signing in with `auth: oauth` |
+| `adaptyv_testing` | Adaptyv's testing sandbox, where nothing is made or charged for | A token in `FOUNDRY_TESTING_TOKEN`, from https://foundry.testing.adaptyvbio.com, or signing in with `auth: oauth` |
 | `proto` | [Proto](https://github.com/evo-design/proto-tools): over a hundred tools for protein and sequence design, run on your own Modal account | `uv tool install "proto-tools[mcp] @ git+https://github.com/evo-design/proto-tools.git"`, then `modal token new` |
+| `proto_hosted` | Proto's hosted server, at `https://mcp.evodesign.org/mcp`: the same tools, with nothing installed here | Signing in with a Proto account, from https://proto.evodesign.org |
 
 ```python
 with connect_mcp(presets=["paperclip", "adaptyv_testing"]) as mcp:
     hold_meeting(..., tools=mcp.tools)
+
+with connect_mcp(presets={"paperclip": {"auth": "oauth"}, "proto_hosted": {}}) as mcp:
+    hold_meeting(..., tools=mcp.tools)                   # signed in to, with no API keys
 ```
 
-Or a config names one with `preset`, and anything else its entry gives is used in place of the preset's, such as `lab: {preset: adaptyv, approval: ["*"]}` for every one of Adaptyv's tools to wait. The keys and tokens can be in the environment or in the `.env` file, and where one is missing, the error says where to get it. Every one of Adaptyv's tools waits for approval but those that list, get, or estimate a cost, so no experiment is created, submitted, or paid for without a person approving it. Proto's tools that search, describe, and run deployed tools do not wait, but `deploy_tool`, which builds a tool on Modal at your expense, does. `MCP_PRESETS` lists the presets, with what each needs.
+Or a config names one with `preset`, and anything else its entry gives is used in place of the preset's, such as `lab: {preset: adaptyv, approval: ["*"]}` for every one of Adaptyv's tools to wait. The keys and tokens can be in the environment or in the `.env` file, and where one is missing, the error says where to get it. Every one of Adaptyv's tools waits for approval but those that list, get, or estimate a cost, so no experiment is created, submitted, or paid for without a person approving it. Proto's tools that search, describe, and run deployed tools do not wait, but `deploy_tool`, which builds a tool on Modal at your expense, does, as does any other tool either server has or adds. `MCP_PRESETS` lists the presets, with what each needs.
+
+#### Signing in to a server
+
+A server at a URL whose entry has `auth: oauth` is signed in to in your browser, the first time it is connected to, rather than sent an API key. Proto's hosted server is always signed in to; Paperclip's and Adaptyv's can be, in place of their keys, which a preset signed in to is then neither sent nor needs set:
+
+```yaml
+mcp_servers:
+  proto: {preset: proto_hosted}
+  papers: {preset: paperclip, auth: oauth}
+  search:
+    url: "https://search.example.org/mcp"
+    auth: oauth
+```
+
+`connect_mcp` finds the server's authorization server, registers with it, and opens its sign-in page, with the MCP SDK's OAuth client, which uses PKCE. Once you have signed in, the browser is sent back to `http://127.0.0.1` on a port of this machine's, where the sign-in is received. The tokens are kept in `~/.virtual_lab/mcp_auth`, or the directory `VIRTUAL_LAB_MCP_AUTH_DIR` names, in a file for each server that only you can read, and are refreshed as they expire, so the next connection needs no sign-in. Anyone who can read the file can use the account, so treat it as you would a password. `sign_out_mcp("proto_hosted")`, or the server's URL, forgets a sign-in, so the next connection signs in again, as another account, say.
+
+Where no browser can be opened, as over SSH, the sign-in page's address is shown at the terminal, to be opened anywhere, and the address the browser ends at, which may not load, is pasted back. Where there is neither a browser nor a terminal, as in a script run in the background, the connection fails and says so: connect once where there is one, and the sign-in kept is used from then on. The time you take to sign in, up to 10 minutes, is not counted against `start_timeout` or `timeout`.
+
+#### Proto's tools in code
+
+Code in a session can also call Proto's tools as a Python library, rather than through its server, by running in the interpreter Proto is installed in. Its tools run on your Modal account with `device="modal"`, which finds your Modal token in your home directory, or on Proto's servers with `device="proto"`, which needs an API key in `PROTO_API_KEY`, from https://proto.evodesign.org/settings/workspace/keys:
+
+```python
+with LocalSession(
+    Path("results/session"),
+    python=str(Path.home() / ".local/share/uv/tools/proto-tools/bin/python"),   # where uv tool install puts it
+    forward_env=("PROTO_API_KEY",),
+    software={"proto_tools": "Proto: run_esmfold, run_alphafold2, and over a hundred more run_* functions, "
+                             "each taking an Input and a Config, such as ESMFoldConfig(device='proto')."},
+) as session:
+    hold_meeting(..., session=session)
+```
+
+Code run this way is not asked about first, as a call through a server is, so give a session Proto's library only where you would let its code spend on your accounts.
 
 ### Serving tools over MCP
 
