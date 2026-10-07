@@ -98,6 +98,7 @@ from virtual_lab.literature import (
     search_articles,
     search_preprints,
 )
+from virtual_lab.mcp_auth import SignInError, sign_out_mcp
 from virtual_lab.mcp_presets import MCP_PRESETS, MCPPreset
 from virtual_lab.mcp_tools import MCPServerError, MCPToolError, MCPTools, connect_mcp
 from virtual_lab.memory import Finding, Findings, LabMemory, MemoryEntry
@@ -284,6 +285,7 @@ __all__ = [
     "ServerQuestion",
     "Session",
     "SessionError",
+    "SignInError",
     "SingleAgent",
     "SolverContext",
     "Structure",
@@ -352,6 +354,7 @@ __all__ = [
     "session_executor",
     "session_tool",
     "session_tools_prompt",
+    "sign_out_mcp",
     "structure_file_tool",
     "tool_from_function",
     "tools_for",

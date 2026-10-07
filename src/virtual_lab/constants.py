@@ -302,6 +302,12 @@ MCP_MAX_TOOL_PAGES = 1_000
 MCP_MAX_INSTRUCTIONS_CHARS = 8_000
 # Most characters of a call's arguments shown to a person asked to approve it
 APPROVAL_MAX_ARGUMENT_CHARS = 4_000
+# Seconds a person has to sign in to an MCP server in their browser. The time it takes is not
+# counted against the time a server has to be connected to, or a call to finish
+MCP_SIGN_IN_TIMEOUT = 600.0
+# Where the sign-ins to MCP servers are kept, and the variable that puts them elsewhere
+MCP_AUTH_DIRECTORY = "~/.virtual_lab/mcp_auth"
+MCP_AUTH_DIRECTORY_VARIABLE = "VIRTUAL_LAB_MCP_AUTH_DIR"
 # Where serve_mcp listens over HTTP by default: this machine alone, at http://127.0.0.1:8000/mcp
 MCP_SERVER_HOST = "127.0.0.1"
 MCP_SERVER_PORT = 8000
