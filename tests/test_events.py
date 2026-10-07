@@ -594,3 +594,69 @@ class TestAsk:
 
         assert reply.content == "All at once."
         assert written == ["All at once."]
+
+
+class TestEndingEvents:
+    def test_on_event_failing_when_told_of_the_end_does_not_undo_a_saved_meeting(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def on_event(event: MeetingEvent) -> None:
+            if event.kind == "finished":
+                raise ValueError("The interface closed")
+
+        project = Project(tmp_path, GOAL)
+        result = project.meeting(
+            "individual", "Compute a number.", name="first", team_member=team_member, on_event=on_event
+        )
+
+        assert result.transcript_path.is_file()
+        assert [step.status for step in project.steps] == ["completed"]
+        assert "on_event failed when told the meeting had finished: ValueError('The interface closed')" in (
+            capsys.readouterr().out
+        )
+
+        # Carried on, the meeting is read back rather than held and paid for again
+        Project(tmp_path, GOAL).meeting("individual", "Compute a number.", name="first", team_member=team_member)
+        assert len(fake_client.completions.calls) == 1
+
+    def test_on_event_failing_when_told_the_project_ended_leaves_its_report_and_log_agreeing(
+        self, fake_client: FakeClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fake_client.completions.parsed_responses.extend(
+            [plan("Task 1"), decide("finish", done=2, answer="A."), review(True)]
+        )
+
+        def on_event(event: MeetingEvent | ProjectEvent) -> None:
+            if isinstance(event, ProjectEvent) and event.kind == "finished":
+                raise ValueError("The interface closed")
+
+        report = run_project(Project(tmp_path, GOAL), team_lead=LEAD, critic=CRITIC, team=(), on_event=on_event)
+
+        assert report.status == "finished"
+        assert json.loads((tmp_path / "research_log.json").read_text())["status"] == "finished"
+        assert json.loads((tmp_path / "report.json").read_text())["status"] == "finished"
+        assert "on_event failed when told the project had ended: ValueError('The interface closed')" in (
+            capsys.readouterr().out
+        )
+
+    def test_on_event_failing_as_the_budget_runs_out_is_logged_as_the_error(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        from test_planning import CALL_COST
+
+        fake_client.completions.parsed_responses.extend(
+            [plan("Task 1"), decide("individual_meeting", participants=["Principal Investigator"], agenda="One.")]
+        )
+
+        def on_event(event: MeetingEvent | ProjectEvent) -> None:
+            if isinstance(event, ProjectEvent) and event.kind == "round":
+                raise ValueError("The interface closed")
+
+        project = Project(tmp_path, GOAL, max_cost=7.5 * CALL_COST)
+        with pytest.raises(ValueError, match="interface closed"):
+            run_project(project, team_lead=LEAD, critic=CRITIC, team=(), on_event=on_event)
+
+        log = json.loads((tmp_path / "research_log.json").read_text())
+        assert log["status"] == "failed"
+        assert log["error"] == {"type": "ValueError", "message": "The interface closed"}
+        assert not (tmp_path / "report.json").exists()

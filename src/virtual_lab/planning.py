@@ -335,7 +335,8 @@ def run_project(
         on_event is, so that the project can be followed live. A meeting read back from disk is
         told of by one "read_back" event. The project's own on_event, if it was given one as a
         meeting option, is still called first. An exception it raises stops the project the way
-        any other error does.
+        any other error does, except from the project's "finished" event, once the report is
+        saved, which is warned about.
     :raises ProjectStateError: If the project's directory holds steps taken with other inputs:
         another team lead, critic, team, max_team_size, meeting_rounds, or memory, a
         findings_per_step that changes which findings a step is given, or an executor or a
@@ -535,11 +536,15 @@ class ProjectRun:
 
             return self.finish("out_of_rounds", f"The project took all {self.max_rounds} of its rounds without finishing.")
         except ProjectBudgetExceededError as error:
-            if self.rounds and self.rounds[-1].outcome == "running":
-                self.rounds[-1].outcome = "out_of_budget"
-                self.finish_round(self.rounds[-1])
-            when = f"in round {number}" if number else "before its first round"
-            return self.finish("out_of_budget", f"The project ran out of budget {when}: {error}.")
+            try:
+                if self.rounds and self.rounds[-1].outcome == "running":
+                    self.rounds[-1].outcome = "out_of_budget"
+                    self.finish_round(self.rounds[-1])
+                when = f"in round {number}" if number else "before its first round"
+                return self.finish("out_of_budget", f"The project ran out of budget {when}: {error}.")
+            except BaseException as failure:
+                self.save_log("failed", failure)
+                raise
         except BaseException as error:
             self.save_log("failed", error)
             raise
@@ -1099,6 +1104,10 @@ class ProjectRun:
         write_atomically(save_dir / REPORT_FILE_NAME, json.dumps(report.to_dict(), indent=4).encode("utf-8"))
         write_atomically(save_dir / REPORT_MARKDOWN_FILE_NAME, report.to_markdown().encode("utf-8"))
         print(f"The project ended: {status}. {reason} The report is in {save_dir / REPORT_MARKDOWN_FILE_NAME}")
-        self.emit("finished", self.rounds[-1].number if self.rounds else None, reason, report=report.to_dict())
+        # The report is saved by now, so a failure here is not the project's
+        try:
+            self.emit("finished", self.rounds[-1].number if self.rounds else None, reason, report=report.to_dict())
+        except Exception as event_error:
+            print(f"Warning: on_event failed when told the project had ended: {event_error!r}")
 
         return report

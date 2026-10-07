@@ -235,11 +235,12 @@ def hold_meeting(
         every message added to the transcript, every tool call and run of code, and every
         response's usage, and as it finishes or fails, so that it can be followed live, as in
         the web interface. An exception it raises stops the meeting the way any other failure
-        does, except from the "failed" event, which is warned about so as not to hide the error
-        that ended the meeting.
+        does, except from the "finished" event, once the meeting is saved, and the "failed"
+        event, so as not to hide the error that ended the meeting; those are warned about.
     :param stream: Whether on_event is also told of each reply as it is written, with "writing"
         events. A reply's usage is asked for with it, which OpenAI-compatible servers that do not
-        report the usage of a streamed reply leave out, making its cost unknown.
+        report the usage of a streamed reply leave out, making its cost unknown. A server that
+        refuses to be asked fails the request; give its chat model stream_usage=False.
     :raises BudgetExceededError: Before a request, if the meeting has already spent max_cost.
     :raises CostUnknownError: If max_cost is given and a model's cost, or a response's usage,
         cannot be known.
@@ -971,16 +972,20 @@ def hold_meeting(
     )
     transcript_path = save_dir / f"{save_name}.json"
 
-    emit(
-        "finished",
-        text=summary,
-        transcript_path=str(transcript_path),
-        record_path=str(record_path),
-        output_path=str(output_path) if output_path is not None else None,
-        output=structured_output.model_dump(mode="json") if structured_output is not None else None,
-        usage=usage.to_dict(),
-        elapsed_time=record.elapsed_seconds,
-    )
+    # The meeting is saved and paid for by now, so a failure here is not the meeting's
+    try:
+        emit(
+            "finished",
+            text=summary,
+            transcript_path=str(transcript_path),
+            record_path=str(record_path),
+            output_path=str(output_path) if output_path is not None else None,
+            output=structured_output.model_dump(mode="json") if structured_output is not None else None,
+            usage=usage.to_dict(),
+            elapsed_time=record.elapsed_seconds,
+        )
+    except Exception as event_error:
+        print(f"Warning: on_event failed when told the meeting had finished: {event_error!r}")
 
     return MeetingResult(
         summary=summary,
