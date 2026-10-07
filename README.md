@@ -50,7 +50,7 @@ cd virtual_lab
 pip install -e .
 ```
 
-Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`.
+Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`. Saving meetings as PDFs needs the `pdf` extra and the Pango library (see [Saving a meeting or a project as a document](#saving-a-meeting-or-a-project-as-a-document)).
 
 
 ## Models and API keys
@@ -151,6 +151,24 @@ hold_meeting(..., on_event=show, stream=True)
 - An exception `on_event` raises stops the meeting the way any other failure does, saving what was done under `save_dir/partial/`, even while a reply is being written. This is how a person can stop a meeting part way through a reply. One it raises when told the meeting finished, which is saved by then, or failed, which would hide the error that ended it, is only warned about.
 - With `stream`, every reply is asked for with its usage, so what it cost is still known. OpenAI-compatible servers that leave the usage of a streamed reply out make the cost unknown, as they would without streaming, and one that refuses to be asked fails the request; a model told not to stream its usage (`stream_usage=False`) is left as told. A model that cannot stream sends its reply whole, as one `writing` event. Structured outputs, and the request that chooses resources, are not streamed.
 - `Project` takes `on_event` and `stream` as options for its meetings, and neither makes a finished meeting a different one, so a project carried on with or without them reads its meetings back. A meeting read back is told of by one `read_back` event, with its summary and where it is saved.
+
+### Saving a meeting or a project as a document
+
+Biomni saves its agent's conversation as a PDF. A meeting can be saved as one too, or as a page of HTML, laid out as a meeting: its agenda, team, and summary first, then the discussion round by round, each agent in a colour of its own, with the code each agent ran, what it printed, and the figures it drew, then what the meeting cost. A project is saved as its report, with every meeting it finished after it if asked for, each from a new page.
+
+```python
+from virtual_lab import save_meeting_html, save_meeting_pdf, save_project_pdf
+
+save_meeting_pdf("results/discussion.json")            # results/discussion.pdf
+save_meeting_html("results/discussion.json")           # results/discussion.html, which needs no extra
+save_project_pdf("project", meetings=True)             # project/report.pdf
+```
+
+- A PDF needs WeasyPrint, which `pip install "virtual-lab[pdf]"` installs, and the Pango library it draws text with, which pip cannot: `brew install pango` on macOS, or `apt install libpango-1.0-0 libpangoft2-1.0-0` on Debian and Ubuntu. Without them a PDF is refused with `PDFExportError`, saying what to install, and HTML can still be saved.
+- Everything is read from what was saved, so any meeting can be saved as a document at any time, including one that failed, from `partial/`, and a transcript saved before meetings kept records, which is shown from the transcript alone.
+- The prompts each agent was given are left out, since the agenda stands for them; `include_prompts=True` shows them. A tool's or the session's output is cut to `max_output_chars`, 6,000 characters by default, from the middle.
+- What the agents wrote is rendered as Markdown, with any HTML in it shown as text, and the document carries its figures, so a PDF is made without fetching anything: an image an agent linked to, on the web or on disk, is left out. A figure is read only from the session's own directory.
+- `meeting_html` and `project_html` return the document rather than saving it.
 
 
 ## Running the code that agents write
