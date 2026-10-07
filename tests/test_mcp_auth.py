@@ -16,6 +16,7 @@ import time
 import urllib.request
 import webbrowser
 from collections.abc import Iterator
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -34,7 +35,7 @@ from virtual_lab.mcp_auth import (  # noqa: E402
     sign_in_path,
 )
 from virtual_lab.mcp_presets import preset_entry  # noqa: E402
-from virtual_lab.mcp_tools import MCPConnection, MCPServerError, parse_server  # noqa: E402
+from virtual_lab.mcp_tools import MCPConnection, MCPServerConfig, MCPServerError, parse_server  # noqa: E402
 
 SERVER = str(Path(__file__).with_name("mcp_test_server.py"))
 
@@ -338,6 +339,8 @@ class TestSigningIn:
             time.sleep(0.05)
             said += capsys.readouterr().err
         assert "stopped waiting for the answer" in said
+        # The person is told that the prompt still waiting for a line is done with
+        assert "Signed in to the MCP server genes in the browser: press Enter to go on." in said
 
     def test_a_pasted_address_of_another_sign_in_is_refused(
         self, oauth_server: OAuthServer, browser: Browser, monkeypatch: pytest.MonkeyPatch
@@ -537,6 +540,29 @@ class TestTheAddressSentBackTo:
                 asyncio.run(signing_in.redirect("https://auth.example.org/authorize?state=s"))
         assert signing_in.storage.stored_client() is None
         assert not signing_in.clock.paused
+        assert signing_in.stale
+
+    def test_a_connection_whose_client_was_forgotten_signs_in_with_a_new_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The provider, kept across connections to the server, still holds the client forgotten
+        # and its port, so it is made again
+        url = "https://mcp.example.org/sse"
+        server = MCPServerConfig(name="genes", prefix="genes", transport="sse", shown=url, url=url, auth="oauth")
+        connection = MCPConnection(server, None, Path("."), None, 1.0)  # type: ignore[arg-type]
+
+        async def transport() -> Any:
+            async with AsyncExitStack() as stack:
+                await connection.transport(stack, None)
+            return connection.sign_in, connection.auth
+
+        first, provider = asyncio.run(transport())
+        assert asyncio.run(transport()) == (first, provider)
+        assert first is not None
+        first.stale = True
+        second, remade = asyncio.run(transport())
+        assert second is not first and remade is not provider
+        assert not second.stale
 
     def test_where_no_browser_opens_nor_is_there_a_terminal_the_listener_is_closed(
         self, monkeypatch: pytest.MonkeyPatch

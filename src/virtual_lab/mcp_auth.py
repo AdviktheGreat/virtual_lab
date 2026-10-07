@@ -280,6 +280,9 @@ class SignIn:
         self.received: asyncio.Future[dict[str, str]] | None = None
         self.state: str | None = None
         self.pasting = False
+        # Whether the client registered for this sign-in's port was forgotten, and the provider
+        # made for it is not to be used again
+        self.stale = False
 
     def provider(self) -> Any:
         """The SDK's OAuth provider for the server, as httpx's auth."""
@@ -339,6 +342,7 @@ class SignIn:
             except OSError as error:
                 # Registered again at the next connection, with a port that is free then
                 self.storage.forget_client()
+                self.stale = True
                 raise SignInError(
                     f"Signing in to the MCP server {self.server} needs port {self.port} of this machine, which is in "
                     f"use: {error}. Connect again to sign in at another."
@@ -378,6 +382,8 @@ class SignIn:
                     # that asyncio does not warn that it never was
                     if not pasting.cancel() and not pasting.cancelled():
                         pasting.exception()
+                if self.received in done and not pasting.done():
+                    say(f"\nSigned in to the MCP server {self.server} in the browser: press Enter to go on.\n")
                 answer = self.received.result() if self.received in done else pasting.result()
             else:
                 try:

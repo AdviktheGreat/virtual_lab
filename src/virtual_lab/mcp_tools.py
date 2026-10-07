@@ -763,6 +763,7 @@ class MCPConnection:
         # The SDK's OAuth provider, for a server signed in to, kept across connections so that
         # what it has found of the server's authorization server is kept too
         self.auth: Any = None
+        self.sign_in: SignIn | None = None
 
     @property
     def described(self) -> str:
@@ -848,8 +849,11 @@ class MCPConnection:
                 command=server.command, args=list(server.args), env=dict(server.env), cwd=server.cwd
             )
             return stdio_client(parameters, errlog=log)
-        if server.auth == "oauth" and self.auth is None:
-            self.auth = SignIn(server.name, server.url, self.signing_in).provider()  # type: ignore[arg-type]
+        # Made again once the client it registered was forgotten, so that a new one is
+        # registered, at a port that is free
+        if server.auth == "oauth" and (self.sign_in is None or self.sign_in.stale):
+            self.sign_in = SignIn(server.name, server.url, self.signing_in)  # type: ignore[arg-type]
+            self.auth = self.sign_in.provider()
         if server.transport == "sse":
             from mcp.client.sse import sse_client
 
