@@ -39,6 +39,7 @@ from virtual_lab.constants import (
     PROJECT_FILE_NAME,
     PROJECT_MEETINGS_DIR_NAME,
 )
+from virtual_lab.events import MeetingEvent
 from virtual_lab.execution import Executor
 from virtual_lab.llm import ModelSource, resolve_chat_models
 from virtual_lab.provenance import MeetingRecord, describe_value, utc_timestamp
@@ -70,9 +71,9 @@ REPAIR_OPTIONS = frozenset(
     }
 )
 
-# Options that decide what a step costs or how it is sent, not what it produces, so changing one
-# does not make a finished step a different step
-NOT_INPUTS = frozenset({"max_cost", "on_usage", "before_request", "max_retries", "chat_model"})
+# Options that decide what a step costs, how it is sent, or who is told of it as it goes, not what
+# it produces, so changing one does not make a finished step a different step
+NOT_INPUTS = frozenset({"max_cost", "on_usage", "before_request", "max_retries", "chat_model", "on_event", "stream"})
 
 
 class ProjectBudgetExceededError(BudgetExceededError):
@@ -397,7 +398,8 @@ class Project:
             meeting_001, meeting_002, and so on, in the order meetings are asked for. Give each
             meeting held from another thread a name of its own, since that order is not fixed.
         :param options: Anything else hold_meeting takes, over the project's meeting_options.
-            A max_cost here limits the meeting as well as the project's limit.
+            A max_cost here limits the meeting as well as the project's limit. An on_event is
+            told of a meeting read back from disk by one "read_back" event.
         :raises ProjectBudgetExceededError: If the project has spent its max_cost, before the
             meeting or during it.
         :raises ProjectStateError: If the project already held a meeting under this name with
@@ -415,7 +417,22 @@ class Project:
         name = self._name_step("meeting", name)
         done = self._begin(name, "meeting", fingerprint_inputs(hold_meeting, arguments))
         if done is not None:
-            return self._read_meeting(done, arguments.get("output_schema"))
+            result = self._read_meeting(done, arguments.get("output_schema"))
+            if (on_event := arguments.get("on_event")) is not None:
+                on_event(
+                    MeetingEvent(
+                        kind="read_back",
+                        meeting=name,
+                        text=result.summary,
+                        data={
+                            "transcript_path": str(result.transcript_path),
+                            "record_path": str(result.record_path),
+                            "output_path": str(result.output_path) if result.output_path is not None else None,
+                            "usage": result.usage.to_dict(),
+                        },
+                    )
+                )
+            return result
 
         project_limited = False
         try:

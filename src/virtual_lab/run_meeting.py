@@ -1,13 +1,15 @@
 """Runs a meeting with LLM agents."""
 
+import copy
 import hashlib
+import itertools
 import json
 import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from openai import OpenAI
@@ -20,6 +22,7 @@ from virtual_lab.actions import describe_tool_output, find_code_action, observat
 from virtual_lab.agent import Agent
 from virtual_lab.llm import ModelReply, ModelSource, ask, resolve_chat_models
 from virtual_lab.completions import check_temperature, ran_without_temperature, send_request
+from virtual_lab.events import MeetingEvent, MeetingEventKind, OnMeetingEvent
 from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
     DEFAULT_MAX_RETRIES,
@@ -153,6 +156,8 @@ def hold_meeting(
     max_tool_iterations: int | None = None,
     resources: Literal["retrieve", "all", "none"] | Resources = "retrieve",
     commercial_mode: bool = False,
+    on_event: OnMeetingEvent | None = None,
+    stream: bool = False,
 ) -> MeetingResult:
     """Runs a meeting with LLM agents and returns everything it produced.
 
@@ -226,6 +231,16 @@ def hold_meeting(
     :param commercial_mode: Whether to leave out data and know-how that may not be used
         commercially, as Biomni's commercial mode does. It does not check the tools' own licenses;
         see the license_info.md that ships with Biomni's package.
+    :param on_event: Called with a MeetingEvent as the meeting goes: as it starts, at every turn,
+        every message added to the transcript, every tool call and run of code, and every
+        response's usage, and as it finishes or fails, so that it can be followed live, as in
+        the web interface. An exception it raises stops the meeting the way any other failure
+        does, except from the "finished" event, once the meeting is saved, and the "failed"
+        event, so as not to hide the error that ended the meeting; those are warned about.
+    :param stream: Whether on_event is also told of each reply as it is written, with "writing"
+        events. A reply's usage is asked for with it, which OpenAI-compatible servers that do not
+        report the usage of a streamed reply leave out, making its cost unknown. A server that
+        refuses to be asked fails the request; give its chat model stream_usage=False.
     :raises BudgetExceededError: Before a request, if the meeting has already spent max_cost.
     :raises CostUnknownError: If max_cost is given and a model's cost, or a response's usage,
         cannot be known.
@@ -256,6 +271,9 @@ def hold_meeting(
 
     if code_actions == "tags" and session is None:
         raise ValueError('code_actions="tags" runs code in a session, so it needs a session')
+
+    if stream and on_event is None:
+        raise ValueError("stream tells on_event of each reply as it is written, so it needs an on_event")
 
     if isinstance(resources, Resources):
         if session is None:
@@ -362,6 +380,16 @@ def hold_meeting(
         chat_models={model: describe_chat_model(llm) for model, llm in llms.items()},
     )
 
+    # The round events are told of in, from 1, and None outside the rounds
+    event_round: int | None = None
+    request_numbers = itertools.count(1)
+
+    # The kind is positional only, so that a message's own kind can be told of in data
+    def emit(kind: MeetingEventKind, /, speaker: str | None = None, text: str = "", **data: Any) -> None:
+        if on_event is not None:
+            event = MeetingEvent(kind=kind, meeting=save_name, round=event_round, speaker=speaker, text=text, data=data)
+            on_event(event)
+
     def check_budget() -> None:
         """Stops the meeting before a request it has no money left for."""
         if max_cost is not None and (spent := usage.compute_cost()) >= max_cost:
@@ -378,12 +406,26 @@ def hold_meeting(
         if on_usage is not None:
             on_usage(usage)
 
+        emit("usage", **usage.to_dict())
+
     def ask_agent(
         agent: Agent,
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolParam] | None,
+        speaking: bool = True,
     ) -> ModelReply:
-        """Asks an agent for its next message, without a temperature if its model refuses one."""
+        """Asks an agent for its next message, without a temperature if its model refuses one.
+
+        :param speaking: Whether the reply is the agent's say in the meeting, which is streamed
+            to on_event with stream, rather than a request made for the meeting's sake.
+        """
+        on_text = None
+        if stream and speaking:
+            request = next(request_numbers)
+
+            def on_text(text: str) -> None:
+                emit("writing", speaker=agent.title, text=text, request=request, model=agent.model)
+
         return send_request(
             lambda sent_temperature: ask(
                 llms[agent.model],
@@ -392,10 +434,26 @@ def hold_meeting(
                 tools=tools or None,
                 max_tokens=max_completion_tokens,
                 reader=agent.name,
+                on_text=on_text,
             ),
             model=agent.model,
             temperature=temperature,
         )
+
+    def add_turn(speaker: str, message: str, kind: str, **recorded: Any) -> None:
+        """Adds a message to the transcript and the record, and tells on_event of it."""
+        discussion.append({"agent": speaker, "message": message})
+        record.record_turn(speaker=speaker, kind=kind, **recorded)
+        emit("message", speaker=speaker, text=message, kind=kind, index=len(discussion) - 1)
+
+    def tell_cells() -> None:
+        """Tells on_event of the code the session has run since it was last told."""
+        nonlocal cells_told
+        if session is None:
+            return
+        for cell in session.history[cells_told:]:
+            emit("cell", **cell.to_dict(), plot_paths=[str(session.directory / plot) for plot in cell.plots])
+        cells_told = len(session.history)
 
     # Started before the first request, so that a session that cannot start, such as one whose
     # image was never built, fails the meeting before anything is spent. The session may have
@@ -449,7 +507,7 @@ def hold_meeting(
         check_context_length(messages=retrieval_messages, model=chooser.model)
         check_budget()
         retrieval_usage = MeetingUsage()
-        reply = ask_agent(agent=chooser, messages=retrieval_messages, tools=None)
+        reply = ask_agent(agent=chooser, messages=retrieval_messages, tools=None, speaking=False)
         count_usage(chooser.model, reply.usage, retrieval_usage)
 
         chosen = parse_retrieval(reply.content)
@@ -520,10 +578,27 @@ def hold_meeting(
     # Initialize messages for API calls
     messages: list[ChatCompletionMessageParam] = []
 
+    # The cells of the session's history on_event has been told of
+    cells_told = first_cell
+
+    emit(
+        "started",
+        meeting_type=meeting_type,
+        agenda=agenda,
+        agenda_questions=list(agenda_questions),
+        num_rounds=num_rounds,
+        team=[describe_agent(agent) for agent in team],
+        tools=[tool.name for tool in meeting_tools],
+        max_cost=max_cost,
+        session=session.describe() if session is not None else None,
+    )
+
     try:
         session_prompt = ""
         if session is not None:
             selected = choose_resources()
+            if record.resources is not None:
+                emit("resources", **copy.deepcopy(record.resources))
             session_prompt = code_session_prompt(
                 code_actions=code_actions,
                 working_directory=session.where_code_runs(),
@@ -557,12 +632,12 @@ def hold_meeting(
             if session_prompt:
                 initial_content = f"{initial_content}\n\n{session_prompt}"
             messages.append({"role": "user", "content": initial_content})
-            discussion.append({"agent": "User", "message": initial_content})
-            record.record_turn(speaker="User", kind="prompt")
+            add_turn("User", initial_content, "prompt")
 
         # Loop through rounds
         for round_index in trange(num_rounds + 1, desc="Rounds (+ Final Round)"):
             round_num = round_index + 1
+            event_round = round_num
 
             # Loop through team and elicit responses
             for agent in tqdm(team, desc="Team"):
@@ -616,8 +691,8 @@ def hold_meeting(
 
                 # Add prompt as user message
                 messages.append({"role": "user", "content": prompt})
-                discussion.append({"agent": "User", "message": prompt})
-                record.record_turn(speaker="User", kind="prompt")
+                add_turn("User", prompt, "prompt")
+                emit("turn", speaker=agent.title, name=agent.name, model=agent.model)
 
                 # A turn can span several API calls when the agent uses tools, so its usage is
                 # accumulated separately from the meeting total
@@ -676,6 +751,7 @@ def hold_meeting(
 
                     if action is not None:
                         assert session is not None
+                        emit("code", speaker=agent.title, text=action.said, code=action.code, language=action.language)
                         try:
                             report = observation(
                                 session.run(action.code, language=action.language),
@@ -683,23 +759,33 @@ def hold_meeting(
                             )
                         except Exception as error:
                             report = f"<observation>\nThe code could not be run: {error}\n</observation>"
+                        tell_cells()
 
                         # Kept in the meeting as the agent said it, so that everyone after sees
                         # the code and what it printed
                         messages.append({"role": "assistant", "name": agent.name, "content": action.said})
-                        discussion.append({"agent": agent.title, "message": action.said})
-                        record.record_turn(speaker=agent.title, kind="code_action", name=agent.name, model=agent.model)
+                        add_turn(agent.title, action.said, "code_action", name=agent.name, model=agent.model)
 
                         messages.append({"role": "user", "content": report})
-                        discussion.append({"agent": "Session", "message": report})
-                        record.record_turn(speaker="Session", kind="code_output")
+                        add_turn("Session", report, "code_output")
                     else:
                         turn_tool_calls.extend(describe_tool_call(tool_call) for tool_call in reply.tool_calls)
+
+                        emit(
+                            "tool_calls",
+                            speaker=agent.title,
+                            text=reply.content,
+                            calls=[
+                                {"id": call.id, "name": call.function.name, "arguments": call.function.arguments}
+                                for call in reply.tool_calls
+                            ],
+                        )
 
                         # Run the tools and get outputs
                         tool_outputs, tool_messages = run_tool_calls(
                             tool_calls=list(reply.tool_calls), tools=meeting_tools
                         )
+                        tell_cells()
 
                         # Add the assistant's message with tool_calls to the messages
                         assistant_tool_message: ChatCompletionAssistantMessageParam = {
@@ -720,8 +806,7 @@ def hold_meeting(
                             describe_tool_output(tool_call, output, CODE_TOOL_NAME)
                             for tool_call, output in zip(reply.tool_calls, tool_outputs)
                         )
-                        discussion.append({"agent": "Tool", "message": tool_output_content})
-                        record.record_turn(speaker="Tool", kind="tool_output")
+                        add_turn("Tool", tool_output_content, "tool_output")
 
                         # Code written beside a tool call is not run, and the agent must know
                         # that, or it will take the call's output for the code's
@@ -732,8 +817,7 @@ def hold_meeting(
                                 "\n</observation>"
                             )
                             messages.append({"role": "user", "content": skipped})
-                            discussion.append({"agent": "Session", "message": skipped})
-                            record.record_turn(speaker="Session", kind="code_output")
+                            add_turn("Session", skipped, "code_output")
 
                     # Send the results back on the next iteration
                     agent_messages = [agent.message] + messages
@@ -765,10 +849,10 @@ def hold_meeting(
                 # agents tell whose turn they are reading; without it every prior turn arrives as
                 # the reader's own words, which pushes the whole meeting towards agreement.
                 messages.append({"role": "assistant", "name": agent.name, "content": response_content})
-                discussion.append({"agent": agent.title, "message": response_content})
-                record.record_turn(
-                    speaker=agent.title,
-                    kind="response",
+                add_turn(
+                    agent.title,
+                    response_content,
+                    "response",
                     name=agent.name,
                     model=agent.model,
                     input_tokens=turn_usage.input_tokens,
@@ -786,6 +870,8 @@ def hold_meeting(
                 if round_index == num_rounds:
                     break
 
+        event_round = None
+
         # Ask whoever closed the meeting to restate its conclusions against the schema. This is a
         # separate pass rather than a constraint on the final turn so that the structured answer
         # is drawn from the complete meeting, including that final summary.
@@ -793,8 +879,7 @@ def hold_meeting(
             closing_agent = team[0]
             extraction_prompt = structured_output_prompt(agent=closing_agent)
             messages.append({"role": "user", "content": extraction_prompt})
-            discussion.append({"agent": "User", "message": extraction_prompt})
-            record.record_turn(speaker="User", kind="prompt")
+            add_turn("User", extraction_prompt, "prompt")
 
             agent_messages = [closing_agent.message] + messages
             check_context_length(messages=agent_messages, model=closing_agent.model)
@@ -819,10 +904,10 @@ def hold_meeting(
             count_usage(closing_agent.model, structured_reply.usage, extraction_usage)
 
             output_json = json.dumps(structured_output.model_dump(mode="json"), indent=4)
-            discussion.append({"agent": closing_agent.title, "message": output_json})
-            record.record_turn(
-                speaker=closing_agent.title,
-                kind="structured_output",
+            add_turn(
+                closing_agent.title,
+                output_json,
+                "structured_output",
                 name=closing_agent.name,
                 model=closing_agent.model,
                 input_tokens=extraction_usage.input_tokens,
@@ -843,14 +928,27 @@ def hold_meeting(
         # every match to load_summaries, which would treat a truncated meeting as a summary.
         record.finish(usage=usage, elapsed_time=time.time() - start_time, error=error)
 
+        partial_path = None
         if discussion:
             partial_dir = save_dir / PARTIAL_MEETING_DIR_NAME
             save_meeting(save_dir=partial_dir, save_name=save_name, discussion=discussion)
             save_session(partial_dir)
             save_record(save_dir=partial_dir, save_name=save_name, record=record)
-            print(f"Meeting failed. Partial discussion saved to {partial_dir / f'{save_name}.json'}")
+            partial_path = partial_dir / f"{save_name}.json"
+            print(f"Meeting failed. Partial discussion saved to {partial_path}")
         print("Usage before the failure:")
         usage.print_summary(elapsed_time=time.time() - start_time)
+        event_round = None
+        try:
+            emit(
+                "failed",
+                text=str(error) or type(error).__name__,
+                type=type(error).__name__,
+                partial_path=str(partial_path) if partial_path is not None else None,
+                usage=usage.to_dict(),
+            )
+        except Exception as event_error:
+            print(f"Warning: on_event failed when told the meeting had failed: {event_error!r}")
         raise
 
     close_record(record, usage, team)
@@ -872,6 +970,22 @@ def hold_meeting(
         if structured_output is not None
         else None
     )
+    transcript_path = save_dir / f"{save_name}.json"
+
+    # The meeting is saved and paid for by now, so a failure here is not the meeting's
+    try:
+        emit(
+            "finished",
+            text=summary,
+            transcript_path=str(transcript_path),
+            record_path=str(record_path),
+            output_path=str(output_path) if output_path is not None else None,
+            output=structured_output.model_dump(mode="json") if structured_output is not None else None,
+            usage=usage.to_dict(),
+            elapsed_time=record.elapsed_seconds,
+        )
+    except Exception as event_error:
+        print(f"Warning: on_event failed when told the meeting had finished: {event_error!r}")
 
     return MeetingResult(
         summary=summary,
@@ -879,7 +993,7 @@ def hold_meeting(
         usage=usage,
         record=record,
         discussion=tuple(discussion),
-        transcript_path=save_dir / f"{save_name}.json",
+        transcript_path=transcript_path,
         record_path=record_path,
         output_path=output_path,
     )

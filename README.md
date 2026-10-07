@@ -114,6 +114,44 @@ except BudgetExceededError as error:
 - A failed or interrupted meeting, including one stopped by its limit or by Ctrl-C, saves its turns and its record, with the usage up to that point, under `save_dir/partial/`.
 - Several models (GPT-5 and its mini, nano, and pro versions among them) refuse any temperature but their default. When the API refuses the temperature, the request is sent again without it, the model is remembered for the rest of the process, and the record lists it under `models_at_default_temperature`.
 
+### Following a meeting as it happens
+
+Biomni's agent yields each step of its work once the step is done, which is what its web interface shows. A meeting does the same through `on_event`, which is called with a `MeetingEvent` for everything that happens, and with `stream=True` it is also told of each reply as it is written, word by word:
+
+```python
+from virtual_lab import MeetingEvent, hold_meeting
+
+def show(event: MeetingEvent) -> None:
+    if event.kind == "turn":
+        print(f"\n--- {event.speaker}, round {event.round} ---")
+    elif event.kind == "writing":
+        print(event.text, end="\r")
+    elif event.kind == "cell":
+        print(f"Ran {event.data['language']} ({event.data['status']}), figures: {event.data['plot_paths']}")
+    elif event.kind == "usage" and event.data["cost"] is not None:
+        print(f"Spent so far: ${event.data['cost']:.4f}")
+
+hold_meeting(..., on_event=show, stream=True)
+```
+
+| Kind | When | What it holds |
+| --- | --- | --- |
+| `started` | The meeting begins | `data`: the meeting type, agenda, questions, rounds, team, tools, `max_cost`, and session |
+| `resources` | The resources of Biomni's environment are chosen | `data`: what the record says of them |
+| `turn` | An agent's turn begins | `speaker`, `round`, and `data`: its name and model |
+| `writing` | More of a reply is written, with `stream` | `text`: the reply so far, which replaces the last with the same `data["request"]` |
+| `message` | A message is added to the transcript | `speaker`, `text`, and `data`: its kind (`prompt`, `response`, `code_action`, `code_output`, `tool_output`, or `structured_output`) and its index |
+| `tool_calls` | Tools are about to run | `data["calls"]`: each call's id, name, and arguments, in full |
+| `code` | Code from `<execute>` tags is about to run | `data`: the code and its language |
+| `cell` | Code ran in the session, from tags or `run_code` | `data`: the run, as `CellResult.to_dict` gives it, and `plot_paths`, where its figures are |
+| `usage` | A response came back | `data`: the usage so far, with its `cost`, or `None` if unknown |
+| `finished` | The meeting is saved | `text`: the summary, and `data`: where it was saved, the structured output, the usage, and how long it took |
+| `failed` | The meeting stopped with an error | `text`: the error, and `data`: its type, where the partial transcript is, and the usage |
+
+- An exception `on_event` raises stops the meeting the way any other failure does, saving what was done under `save_dir/partial/`, even while a reply is being written. This is how a person can stop a meeting part way through a reply. One it raises when told the meeting finished, which is saved by then, or failed, which would hide the error that ended it, is only warned about.
+- With `stream`, every reply is asked for with its usage, so what it cost is still known. OpenAI-compatible servers that leave the usage of a streamed reply out make the cost unknown, as they would without streaming, and one that refuses to be asked fails the request; a model told not to stream its usage (`stream_usage=False`) is left as told. A model that cannot stream sends its reply whole, as one `writing` event. Structured outputs, and the request that chooses resources, are not streamed.
+- `Project` takes `on_event` and `stream` as options for its meetings, and neither makes a finished meeting a different one, so a project carried on with or without them reads its meetings back. A meeting read back is told of by one `read_back` event, with its summary and where it is saved.
+
 
 ## Running the code that agents write
 
@@ -335,6 +373,7 @@ print(report.answer)
 - A run ends `finished` when the critic accepts an answer, `out_of_budget` when the project's `max_cost` runs out, `out_of_rounds` after `max_rounds` rounds, `stalled` after `max_stalled_rounds` rounds in a row without one more of the plan's tasks done, or `stopped` by the approve hook. Running out of budget ends it with a report, not an error.
 - Every meeting is told the goal, the team, and the plan as it stands, and is given what the work so far found, as `memory` says (below). A decision that cannot be carried out, such as one naming someone not on the team, is recorded and the team lead is told why in the next round.
 - `approve` is called with each round's number and decision before it is carried out, and returns the decision to carry out, which it may change, or `None` to stop the project. With none, the project runs on its own.
+- `on_event` is called with a `ProjectEvent` when the team is chosen or changed (`team`), the plan is made (`plan`), each step is decided (`decided`, before `approve` is asked), code is run (`code`), each round ends (`round`), and the project ends (`finished`, with the report), and with every `MeetingEvent` of every meeting it holds, so a project can be followed as it happens. The `Project`'s own `on_event`, if it has one, is called first. An exception it raises stops the project like any other error, except when it is told the project ended, once the report is saved, which is only warned about.
 - `research_log.json` records every round, with the decision as proposed and as carried out, and every change to the team, and is saved after every round. The run ends with `report.json` and `report.md`: the answer, or the last one the critic did not accept and its objections, the team, the plan, every round, and the cost. A run that fails with any other error leaves no report, and the log says what the error was.
 - Every step is a step of the project, so a run that stopped is carried on by running it again on the same directory: the steps it took are read back for nothing. Nothing a step is asked depends on `max_cost`, `max_rounds`, or `max_stalled_rounds`, so they can be raised to carry a project on. For the same reason, the team lead is not told how many rounds or how much money is left. Every decision carried out, whether the approve hook changed it or there was no hook, is kept in the log and not asked about again, however far a later run gets before it stops; one the hook stopped is asked about again.
 

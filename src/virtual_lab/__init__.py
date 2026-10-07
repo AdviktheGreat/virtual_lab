@@ -76,6 +76,7 @@ from virtual_lab.evaluation import (
     TeamMeeting,
     run_benchmark,
 )
+from virtual_lab.events import MeetingEvent, ProjectEvent
 from virtual_lab.execution import (
     DockerExecutor,
     DockerUnavailableError,
@@ -251,6 +252,7 @@ __all__ = [
     "MCPToolError",
     "MCPTools",
     "MCP_PRESETS",
+    "MeetingEvent",
     "MeetingResult",
     "MemoryEntry",
     "NextStep",
@@ -261,6 +263,7 @@ __all__ = [
     "PredictedStructure",
     "Project",
     "ProjectBudgetExceededError",
+    "ProjectEvent",
     "ProjectReport",
     "ProjectRound",
     "ProjectStateError",
