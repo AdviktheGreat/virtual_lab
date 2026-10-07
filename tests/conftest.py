@@ -1,14 +1,21 @@
 """Shared fixtures for building fake OpenAI and HTTP responses without hitting either."""
 
 import json
+import re
 from importlib import import_module
 from typing import Any
 
 import pytest
 from requests.structures import CaseInsensitiveDict
 from openai.types import CompletionUsage
-from openai.types.chat import ChatCompletion, ChatCompletionMessage
+from openai.types.chat import ChatCompletion, ChatCompletionChunk, ChatCompletionMessage
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import (
+    Choice as ChunkChoice,
+    ChoiceDelta,
+    ChoiceDeltaToolCall,
+    ChoiceDeltaToolCallFunction,
+)
 from openai.types.chat.chat_completion_message_tool_call import (
     ChatCompletionMessageToolCall,
     Function,
@@ -123,8 +130,68 @@ def parsed_response(
     )
 
 
+def stream_chunks(response: ChatCompletion, include_usage: bool) -> list[ChatCompletionChunk]:
+    """Splits a completion into the chunks the API streams it as: the text a word at a time, each
+    tool call in two halves, then why it stopped, and its usage last if it was asked for."""
+    choice = response.choices[0]
+    message = choice.message
+    deltas: list[ChoiceDelta] = [ChoiceDelta(role="assistant", content="")]
+    deltas += [ChoiceDelta(content=word) for word in re.findall(r"\S+\s*|\s+", message.content or "")]
+    for index, call in enumerate(message.tool_calls or []):
+        arguments = call.function.arguments
+        half = len(arguments) // 2
+        deltas.append(
+            ChoiceDelta(
+                tool_calls=[
+                    ChoiceDeltaToolCall(
+                        index=index,
+                        id=call.id,
+                        type="function",
+                        function=ChoiceDeltaToolCallFunction(name=call.function.name, arguments=arguments[:half]),
+                    )
+                ]
+            )
+        )
+        rest = ChoiceDeltaToolCallFunction(arguments=arguments[half:])
+        deltas.append(ChoiceDelta(tool_calls=[ChoiceDeltaToolCall(index=index, function=rest)]))
+
+    def chunk(choices: list[ChunkChoice], usage: CompletionUsage | None = None) -> ChatCompletionChunk:
+        return ChatCompletionChunk(
+            id=response.id,
+            model=response.model,
+            object="chat.completion.chunk",
+            created=0,
+            choices=choices,
+            usage=usage,
+            system_fingerprint=response.system_fingerprint,
+        )
+
+    chunks = [chunk([ChunkChoice(index=0, delta=delta)]) for delta in deltas]
+    chunks.append(chunk([ChunkChoice(index=0, delta=ChoiceDelta(), finish_reason=choice.finish_reason)]))
+    if include_usage:
+        chunks.append(chunk([], usage=response.usage))
+
+    return chunks
+
+
+class FakeStream:
+    """Stands in for the stream the SDK returns for a request made with stream=True."""
+
+    def __init__(self, chunks: list[ChatCompletionChunk]) -> None:
+        self.chunks = chunks
+
+    def __enter__(self) -> "FakeStream":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+    def __iter__(self) -> Any:
+        return iter(self.chunks)
+
+
 class FakeCompletions:
-    """Stands in for client.chat.completions, replaying queued responses."""
+    """Stands in for client.chat.completions, replaying queued responses, streamed when asked."""
 
     def __init__(self) -> None:
         self.responses: list[ChatCompletion | BaseException] = []
@@ -132,16 +199,20 @@ class FakeCompletions:
         self.calls: list[dict[str, Any]] = []
         self.parse_calls: list[dict[str, Any]] = []
 
-    def create(self, **kwargs: Any) -> ChatCompletion:
+    def create(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
 
         if not self.responses:
-            return text_response()
-
-        response = self.responses.pop(0)
+            response: ChatCompletion | BaseException = text_response()
+        else:
+            response = self.responses.pop(0)
 
         if isinstance(response, BaseException):
             raise response
+
+        if kwargs.get("stream"):
+            include_usage = bool((kwargs.get("stream_options") or {}).get("include_usage"))
+            return FakeStream(stream_chunks(response, include_usage))
 
         return response
 

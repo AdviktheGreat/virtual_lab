@@ -25,7 +25,15 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    message_chunk_to_message,
+)
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
@@ -561,6 +569,34 @@ def reply_from(message: AIMessage) -> ModelReply:
     )
 
 
+def streamed(runnable: Any, messages: list[BaseMessage], on_text: Callable[[str], None]) -> AIMessage:
+    """Asks a model for its response as it is written, telling on_text of the text so far each
+    time more arrives, and returns the whole response once it has."""
+    gathered: AIMessageChunk | None = None
+    told = ""
+
+    for chunk in runnable.stream(messages):
+        # A model that cannot stream, or is told not to, sends its whole response as one message
+        if isinstance(chunk, AIMessage) and not isinstance(chunk, AIMessageChunk) and gathered is None:
+            if text := text_of(chunk):
+                on_text(text)
+            return chunk
+        if not isinstance(chunk, AIMessageChunk):
+            raise TypeError(f"Expected an AIMessageChunk from the model, got {type(chunk).__name__}")
+        gathered = chunk if gathered is None else gathered + chunk
+        if (text := text_of(gathered)) != told:
+            told = text
+            on_text(text)
+
+    if gathered is None:
+        raise RuntimeError("The model sent nothing back")
+
+    message = message_chunk_to_message(gathered)
+    assert isinstance(message, AIMessage)
+
+    return message
+
+
 def ask(
     llm: BaseChatModel,
     messages: list[ChatCompletionMessageParam],
@@ -568,6 +604,7 @@ def ask(
     tools: list[ChatCompletionToolParam] | None = None,
     max_tokens: int | None = None,
     reader: str | None = None,
+    on_text: Callable[[str], None] | None = None,
 ) -> ModelReply:
     """Sends a meeting's messages to a model and normalises what comes back.
 
@@ -577,15 +614,22 @@ def ask(
     :param tools: Tool definitions in OpenAI's format, or None to offer none.
     :param max_tokens: The most tokens the response may use, or None for the model's own limit.
     :param reader: The name of the agent being asked, for models that cannot read names.
+    :param on_text: Called with the text of the reply so far each time more of it arrives, which
+        has the reply streamed. A model that cannot stream sends it all at once.
     :return: The reply.
     """
     model = configure(llm, temperature, max_tokens)
+    # LangChain asks OpenAI's own API for the usage of a streamed response, but no other server
+    # that speaks its protocol, and a reply without its usage has an unknown cost. One told
+    # not to send it is left as it was told.
+    streams_usage = "stream_usage" in getattr(type(model), "model_fields", {})
+    if on_text is not None and streams_usage and model.stream_usage is None:  # type: ignore[attr-defined]
+        model = model.model_copy(update={"stream_usage": True})
     runnable = model.bind_tools(tools) if tools else model
     speaker_names = reads_speaker_names(llm)
     # OpenAI accepts earlier tool calls in a request that offers no tools; others may not
-    message = runnable.invoke(
-        to_langchain_messages(messages, reader, speaker_names, tool_blocks=bool(tools) or speaker_names)
-    )
+    converted = to_langchain_messages(messages, reader, speaker_names, tool_blocks=bool(tools) or speaker_names)
+    message = runnable.invoke(converted) if on_text is None else streamed(runnable, converted, on_text)
 
     if not isinstance(message, AIMessage):
         raise TypeError(f"Expected an AIMessage from the model, got {type(message).__name__}")

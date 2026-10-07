@@ -29,11 +29,13 @@ from pydantic import BaseModel, Field
 from virtual_lab.agent import Agent
 from virtual_lab.artifacts import CodeArtifacts
 from virtual_lab.constants import MEMORY_FILE_NAME, REPORT_FILE_NAME, REPORT_MARKDOWN_FILE_NAME, RESEARCH_LOG_FILE_NAME
+from virtual_lab.events import MeetingEvent, OnProjectEvent, ProjectEvent, ProjectEventKind
 from virtual_lab.execution import Executor
 from virtual_lab.memory import Findings, LabMemory, MemoryEntry
 from virtual_lab.project import REPAIR_OPTIONS, Project, ProjectBudgetExceededError
 from virtual_lab.prompts import CODING_RULES, PRINCIPAL_INVESTIGATOR, SCIENTIFIC_CRITIC
 from virtual_lab.provenance import describe_agent
+from virtual_lab.run_meeting import MeetingResult
 from virtual_lab.schemas import AgentSpec, TeamRoster, normalize_title
 from virtual_lab.utils import write_atomically
 
@@ -265,6 +267,7 @@ def run_project(
     repair_options: dict[str, Any] | None = None,
     memory: Memory = "pick",
     findings_per_step: int = 8,
+    on_event: OnProjectEvent | None = None,
 ) -> ProjectReport:
     """Runs a project to its goal, with its team lead deciding each step, and reports how it ended.
 
@@ -326,6 +329,13 @@ def run_project(
     :param memory: How each step is given what the work before it found: "pick", "bm25", or
         "summaries", as above.
     :param findings_per_step: The most findings a step is given with "bm25".
+    :param on_event: Called with a ProjectEvent when the team is chosen or changed, the plan is
+        made, each step is decided, code is run, each round ends, and the project ends, and with
+        a MeetingEvent for everything that happens in each of its meetings, as hold_meeting's
+        on_event is, so that the project can be followed live. A meeting read back from disk is
+        told of by one "read_back" event. The project's own on_event, if it was given one as a
+        meeting option, is still called first. An exception it raises stops the project the way
+        any other error does.
     :raises ProjectStateError: If the project's directory holds steps taken with other inputs:
         another team lead, critic, team, max_team_size, meeting_rounds, or memory, a
         findings_per_step that changes which findings a step is given, or an executor or a
@@ -369,6 +379,7 @@ def run_project(
         repair_options=dict(repair_options or {}),
         memory=memory,
         findings_per_step=findings_per_step,
+        on_event=on_event,
     ).run()
 
 
@@ -433,6 +444,7 @@ class ProjectRun:
         repair_options: dict[str, Any],
         memory: Memory = "pick",
         findings_per_step: int = 8,
+        on_event: OnProjectEvent | None = None,
     ) -> None:
         self.project = project
         self.team_lead = team_lead
@@ -448,6 +460,7 @@ class ProjectRun:
         self.repair_options = repair_options
         self.memory_mode = memory
         self.findings_per_step = findings_per_step
+        self.on_event = on_event
         # Built again on every run from the steps, which are read back, so it is what they found
         self.memory = LabMemory()
 
@@ -465,6 +478,29 @@ class ProjectRun:
         log = project.save_dir / RESEARCH_LOG_FILE_NAME
         saved = json.loads(log.read_text(encoding="utf-8")) if log.is_file() else {}
         self.approvals: dict[int, dict[str, Any]] = {int(number): entry for number, entry in saved.get("approvals", {}).items()}
+
+    # Telling the caller
+
+    # Positional only, so that the round's record can be told of in data under its own name
+    def emit(self, kind: ProjectEventKind, round: int | None = None, text: str = "", /, **data: Any) -> None:
+        if self.on_event is not None:
+            self.on_event(ProjectEvent(kind=kind, round=round, text=text, data=data))
+
+    def meeting(self, meeting_type: Literal["team", "individual"], agenda: str, **options: Any) -> MeetingResult:
+        """Holds a meeting for the project, as Project.meeting does, telling on_event of what
+        happens in it as well as the project's own on_event."""
+        if self.on_event is not None:
+            own = self.project.meeting_options.get("on_event")
+            on_event = self.on_event
+
+            def tell(event: MeetingEvent) -> None:
+                if own is not None:
+                    own(event)
+                on_event(event)
+
+            options["on_event"] = tell
+
+        return self.project.meeting(meeting_type, agenda, **options)
 
     def run(self) -> ProjectReport:
         # A report left from an earlier run would say how a run that is no longer the last ended
@@ -512,7 +548,7 @@ class ProjectRun:
 
     def choose_team(self) -> None:
         taken = f"Do not include yourself or the {self.critic.title}, who are on the project already."
-        result = self.project.meeting(
+        result = self.meeting(
             "individual",
             f"You are leading a research project with this goal:\n\n{self.project.goal}\n\nChoose the team of "
             f"scientists you need for it, at most {self.max_team_size}, each with the expertise the goal calls "
@@ -555,7 +591,7 @@ class ProjectRun:
             "team can do in meetings and, where it helps, in code, and keep the plan to what the goal needs."
         )
         if self.team:
-            result = self.project.meeting(
+            result = self.meeting(
                 "team",
                 agenda,
                 name="plan",
@@ -566,7 +602,7 @@ class ProjectRun:
                 output_schema=ResearchPlan,
             )
         else:
-            result = self.project.meeting(
+            result = self.meeting(
                 "individual",
                 agenda,
                 name="plan",
@@ -578,6 +614,7 @@ class ProjectRun:
             )
         assert isinstance(result.output, ResearchPlan)
         self.plan = [PlanTask(task=task, status="to do") for task in result.output.tasks]
+        self.emit("plan", plan=[task.model_dump(mode="json") for task in self.plan])
         self.history.append(Event("The plan the team made", result.summary, shown=True, work=True))
 
     # Each round
@@ -588,6 +625,7 @@ class ProjectRun:
         :return: How the project ended, if it ended in this round.
         """
         proposed = self.decide(number)
+        self.emit("decided", number, proposed=proposed.model_dump(mode="json"))
         approved = self.approval(number, proposed)
         round_ = ProjectRound(
             number=number,
@@ -665,7 +703,7 @@ class ProjectRun:
             "step does not use empty."
         )
         agenda = "\n\n".join(parts)
-        result = self.project.meeting(
+        result = self.meeting(
             "individual",
             agenda,
             name=f"round_{number:02d}_decision",
@@ -769,7 +807,7 @@ class ProjectRun:
         if decision.action == "team_meeting":
             members = tuple(self.member(title, [*self.team, self.critic]) for title in decision.participants)
             round_.steps.append(f"{prefix}_meeting")
-            result = self.project.meeting(
+            result = self.meeting(
                 "team",
                 decision.agenda,
                 name=f"{prefix}_meeting",
@@ -792,7 +830,7 @@ class ProjectRun:
         elif decision.action == "individual_meeting":
             member = self.member(decision.participants[0], [self.team_lead, *self.team])
             round_.steps.append(f"{prefix}_meeting")
-            result = self.project.meeting(
+            result = self.meeting(
                 "individual",
                 decision.agenda,
                 name=f"{prefix}_meeting",
@@ -815,7 +853,7 @@ class ProjectRun:
             author = self.member(decision.participants[0], [self.team_lead, *self.team])
             assert self.executor is not None
             round_.steps.append(f"{prefix}_code")
-            result = self.project.meeting(
+            result = self.meeting(
                 "individual",
                 decision.agenda,
                 name=f"{prefix}_code",
@@ -828,10 +866,11 @@ class ProjectRun:
             assert isinstance(result.output, CodeArtifacts)
             round_.steps.append(f"{prefix}_run")
             outcome = self.project.repair(result.output, author, self.executor, name=f"{prefix}_run", **self.repair_options)
+            self.emit("code", number, outcome.report(), name=f"{prefix}_run", succeeded=outcome.succeeded)
             found: tuple[str, ...] = ()
             if findings is not None:
                 round_.steps.append(f"{prefix}_findings")
-                stated = self.project.meeting(
+                stated = self.meeting(
                     "individual",
                     f"The code you wrote for this agenda was run:\n\n{decision.agenda}\n\nWhat came of running it:\n\n"
                     f"{outcome.report()}\n\nSay what the run established. If it failed, or showed nothing, say so, and "
@@ -865,7 +904,7 @@ class ProjectRun:
 
         else:
             round_.steps.append(f"{prefix}_review")
-            result = self.project.meeting(
+            result = self.meeting(
                 "individual",
                 f"The {self.team_lead.title} proposes to end the project with this answer:\n\n{decision.answer}\n\n"
                 "Review it against the project's goal and the work done, as given above. The goal "
@@ -1007,10 +1046,14 @@ class ProjectRun:
                 "why": why,
             }
         )
+        team = [describe_agent(agent) for agent in self.team]
+        self.emit("team", number or None, team=team, change=self.team_changes[-1])
 
     def finish_round(self, round_: ProjectRound) -> None:
         round_.team = [agent.title for agent in self.team]
         round_.tasks_done = self.tasks_done()
+        plan = [task.model_dump(mode="json") for task in self.plan]
+        self.emit("round", round_.number, round=asdict(round_), plan=plan)
 
     def describe(self, status: str, error: BaseException | None = None) -> dict[str, Any]:
         return {
@@ -1056,5 +1099,6 @@ class ProjectRun:
         write_atomically(save_dir / REPORT_FILE_NAME, json.dumps(report.to_dict(), indent=4).encode("utf-8"))
         write_atomically(save_dir / REPORT_MARKDOWN_FILE_NAME, report.to_markdown().encode("utf-8"))
         print(f"The project ended: {status}. {reason} The report is in {save_dir / REPORT_MARKDOWN_FILE_NAME}")
+        self.emit("finished", self.rounds[-1].number if self.rounds else None, reason, report=report.to_dict())
 
         return report
