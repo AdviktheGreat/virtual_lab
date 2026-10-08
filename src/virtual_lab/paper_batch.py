@@ -21,6 +21,7 @@ import hashlib
 import io
 import json
 import math
+import os
 import random
 import re
 import time
@@ -160,9 +161,11 @@ def key_from(text: str) -> str:
 def papers_in(directory: Path | str, recursive: bool = False) -> list[Paper]:
     """The papers in a directory: its PDF, text, Markdown, and LaTeX files, in name order.
 
-    A file's key is its path in the directory, so two papers never share a key; if cleaning two
-    different paths down to a key gives one, the second is told apart by a few characters of a
-    hash of its path. Hidden files are left out.
+    A file's key is its path in the directory, cleaned to letters, digits, and '.', '_', '-'. A
+    path that cleaning changes, such as one with a space or in a folder, gets a few characters of
+    a hash of the path as well, so that two paths never share a key and a path's key does not
+    depend on what else is in the directory, which would otherwise send a result to another
+    paper. Hidden files and folders are left out.
 
     :param directory: Where the papers are.
     :param recursive: Whether to look in the directories within it too.
@@ -174,25 +177,31 @@ def papers_in(directory: Path | str, recursive: bool = False) -> list[Paper]:
         raise NotADirectoryError(f"There is no directory of papers at {directory}")
 
     suffixes = {".pdf", *TEXT_SUFFIXES}
-    candidates = directory.rglob("*") if recursive else directory.glob("*")
-    files = sorted(
-        (path for path in candidates if path.is_file() and path.suffix.lower() in suffixes),
-        key=lambda path: path.relative_to(directory).as_posix(),
-    )
+    found: list[Path] = []
+    for folder, folders, names in os.walk(directory):
+        # Pruned here, so that a hidden folder such as .git or .venv is not walked
+        folders[:] = [name for name in folders if not name.startswith(".")] if recursive else []
+        found += [
+            Path(folder, name)
+            for name in names
+            if not name.startswith(".") and Path(name).suffix.lower() in suffixes and Path(folder, name).is_file()
+        ]
 
     papers: list[Paper] = []
     taken: set[str] = set()
-    for path in files:
-        relative = path.relative_to(directory)
-        if any(part.startswith(".") for part in relative.parts):
-            continue
-
-        key = key_from(relative.as_posix())
-        if key in taken:
-            digest = hashlib.sha1(relative.as_posix().encode("utf-8")).hexdigest()[:8]
+    for path in sorted(found, key=lambda path: path.relative_to(directory).as_posix()):
+        relative = path.relative_to(directory).as_posix()
+        key = key_from(relative)
+        # Compared without regard to case, since a result is a file, and a file system may not
+        # tell 'A.pdf' from 'a.pdf'
+        if key != relative or key.casefold() in taken:
+            digest = hashlib.sha1(relative.encode("utf-8")).hexdigest()[:8]
             key = f"{key[:140]}-{digest}"
-        taken.add(key)
+        taken.add(key.casefold())
         papers.append(Paper(key=key, title=path.stem, path=path))
+
+    if len(taken) != len(papers):
+        raise ValueError(f"Two papers in {directory} have paths that cannot be told apart as keys")
 
     return papers
 
@@ -263,8 +272,9 @@ def biorxiv_papers(
             kept[paper.doi] = paper
 
         cursor += len(records)
-        total = as_int(as_dict(next(iter(as_list(response.get("messages"))), None)).get("total"), 0) or 0
-        if cursor >= total or (not random_sample and len(kept) >= limit):
+        # A listing that gives no total is read until a page is empty, or max_pages
+        total = as_int(as_dict(next(iter(as_list(response.get("messages"))), None)).get("total"), None)
+        if (total is not None and cursor >= total) or (not random_sample and len(kept) >= limit):
             break
 
     papers = list(kept.values())
@@ -350,6 +360,8 @@ class PaperResult:
     :param cost: What reading it cost, in USD, or None if that cannot be worked out.
     :param error: Why it was unavailable or failed.
     :param elapsed: How long it took, in seconds.
+    :param digest: The SHA-256 of the file it was read from, if it had one, which tells a result
+        that is of the paper from one that only has the same key.
     """
 
     paper: Paper
@@ -363,6 +375,7 @@ class PaperResult:
     cost: float | None = 0.0
     error: str | None = None
     elapsed: float = 0.0
+    digest: str = ""
 
     def __post_init__(self) -> None:
         if self.status not in STATUSES:
@@ -381,6 +394,7 @@ class PaperResult:
             "cost": self.cost,
             "error": self.error,
             "elapsed": self.elapsed,
+            "digest": self.digest,
         }
 
     @classmethod
@@ -399,6 +413,7 @@ class PaperResult:
             cost=data.get("cost", 0.0),
             error=data.get("error"),
             elapsed=data.get("elapsed", 0.0),
+            digest=data.get("digest", ""),
         )
 
 
@@ -473,6 +488,48 @@ def load_result(path: Path) -> PaperResult | None:
 
 def save_json(path: Path, data: Any) -> None:
     write_atomically(path, json.dumps(data, indent=4).encode("utf-8"))
+
+
+def file_digest(path: Path | None) -> str:
+    """The SHA-256 of a file, or an empty string if there is no file, or it cannot be read."""
+    if path is None:
+        return ""
+
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as file:
+            while block := file.read(1 << 20):
+                digest.update(block)
+    except OSError:
+        return ""
+
+    return digest.hexdigest()
+
+
+REUSE = "reuse"
+AGAIN = "again"
+CONFLICT = "conflict"
+
+
+def resume_decision(saved: PaperResult, paper: Paper, digest: str) -> str:
+    """What to do with a result saved under a paper's key: REUSE it, read the paper AGAIN, or
+    refuse it as the CONFLICT of a different paper's.
+
+    A result is of the same paper if the DOIs and PMCID are, and, for a file, the contents are. A
+    file that cannot be read now is taken to be the same, so that a result is not lost with it. A
+    file that has changed since, or was missing when its result was saved, is read again, but only
+    where it is at the same path: another file under the same key is another paper, and its
+    results are not written over.
+    """
+    earlier = saved.paper
+    if (earlier.doi, earlier.published_doi, earlier.pmcid) != (paper.doi, paper.published_doi, paper.pmcid):
+        return CONFLICT
+    if not digest or digest == saved.digest:
+        return REUSE
+    if not saved.digest or earlier.path == paper.path:
+        return AGAIN
+
+    return CONFLICT
 
 
 def read_papers(
@@ -564,7 +621,12 @@ def read_papers(
     }
     run_path = save_dir / RUN_FILE
     if run_path.is_file():
-        earlier = json.loads(run_path.read_text(encoding="utf-8"))
+        try:
+            earlier = json.loads(run_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"{run_path} cannot be read: {error}. Delete it to start the run again.") from error
+        if not isinstance(earlier, dict):
+            raise ValueError(f"{run_path} does not hold a run. Delete it to start the run again.")
         if earlier != run:
             different = ", ".join(name for name in run if earlier.get(name) != run[name])
             raise ValueError(
@@ -586,111 +648,133 @@ def read_papers(
         if on_progress is not None:
             on_progress(line)
 
+    # Every result already saved is checked against its paper before any is read, so that a run
+    # is refused rather than stopped half way, or worse, written over another's
+    plan: dict[str, tuple[PaperResult | None, str, str]] = {}
+    conflicts: list[str] = []
+    for paper in asked:
+        saved = load_result(save_dir / RESULTS_DIR / f"{paper.key}.json")
+        digest = file_digest(paper.path)
+        decision = resume_decision(saved, paper, digest) if saved is not None else AGAIN
+        if decision == CONFLICT:
+            conflicts.append(paper.key)
+        plan[paper.key] = (saved, digest, decision)
+    if conflicts:
+        shown = ", ".join(conflicts[:5]) + (f", and {len(conflicts) - 5} more" if len(conflicts) > 5 else "")
+        raise ValueError(
+            f"{save_dir} holds results of other papers under the keys {shown}. Save this run somewhere else, "
+            f"or delete those results."
+        )
+
     started_with = spent()
     results: dict[str, PaperResult] = {}
     stopped: str | None = None
     failures_in_a_row = 0
 
-    for number, paper in enumerate(asked, 1):
-        path = save_dir / RESULTS_DIR / f"{paper.key}.json"
-        saved = load_result(path)
-        if saved is not None and (saved.status == READ or not retry_failed):
-            results[paper.key] = saved
-            continue
+    # Whatever ends the loop, even Ctrl-C, the report and the counts are written, so that what was
+    # read is counted
+    try:
+        for number, paper in enumerate(asked, 1):
+            path = save_dir / RESULTS_DIR / f"{paper.key}.json"
+            saved, digest, decision = plan[paper.key]
+            if saved is not None and decision == REUSE and (saved.status == READ or not retry_failed):
+                results[paper.key] = saved
+                continue
 
-        limits: list[float] = []
-        if max_cost is not None or max_cost_per_paper is not None:
-            so_far = spent()
-            if so_far is None:
-                stopped = "What the run has spent cannot be worked out, so its limits cannot be enforced"
-                break
-            if max_cost is not None:
-                if so_far >= max_cost:
-                    stopped = f"The run spent ${so_far:.4f}, which reaches its max_cost of ${max_cost:.4f}"
+            limits: list[float] = []
+            if max_cost is not None or max_cost_per_paper is not None:
+                so_far = spent()
+                if so_far is None:
+                    stopped = "What the run has spent cannot be worked out, so its limits cannot be enforced"
                     break
-                limits.append(max_cost)
-            if max_cost_per_paper is not None:
-                limits.append(so_far + max_cost_per_paper)
+                if max_cost is not None:
+                    if so_far >= max_cost:
+                        stopped = f"The run spent ${so_far:.4f}, which reaches its max_cost of ${max_cost:.4f}"
+                        break
+                    limits.append(max_cost)
+                if max_cost_per_paper is not None:
+                    limits.append(so_far + max_cost_per_paper)
 
-        say(f"Paper {number} of {len(asked)}: {paper.label}")
-        began = time.time()
-        result: PaperResult
+            say(f"Paper {number} of {len(asked)}: {paper.label}")
+            if saved is not None and decision == AGAIN:
+                say("  Its file has changed since it was read, so it is read again")
+            began = time.time()
+            result: PaperResult
 
-        try:
-            text = paper_text(paper)
-        except (PaperUnavailableError, RecordNotFoundError, FileNotFoundError, ValueError) as error:
-            result = PaperResult(paper=paper, status=UNAVAILABLE, error=f"{type(error).__name__}: {error}")
-        except ImportError:
-            raise
-        except Exception as error:
-            result = PaperResult(paper=paper, status=FAILED, error=f"{type(error).__name__}: {error}")
-        else:
             try:
-                reading = extract_paper_findings(
-                    text,
-                    model=model,
-                    chunk_size=chunk_size,
-                    chunk_overlap=chunk_overlap,
-                    max_chars=max_chars,
-                    max_consolidation_chars=max_consolidation_chars,
-                    temperature=temperature,
-                    max_cost=min(limits) if limits else None,
-                    max_completion_tokens=max_completion_tokens,
-                    chat_models={model: llm},
-                    usage=run_usage,
-                    on_progress=lambda line: say(f"  {line}"),
-                )
-            except PaperBudgetExceededError as error:
-                # Either the run's limit or this paper's, and only the run's stops the run
-                if max_cost is not None and error.spent >= max_cost:
-                    stopped = (
-                        f"The run spent ${error.spent:.4f}, which reaches its max_cost of ${max_cost:.4f}, "
-                        f"while reading {paper.key}, which is left unfinished"
-                    )
-                    break
-                result = failure(paper, error, "reached its limit on spending")
-            except PaperReadingError as error:
-                result = failure(paper, error)
+                text = paper_text(paper)
+            except (PaperUnavailableError, RecordNotFoundError, FileNotFoundError, ValueError) as error:
+                result = PaperResult(paper=paper, status=UNAVAILABLE, error=f"{type(error).__name__}: {error}")
+            except ImportError:
+                raise
             except Exception as error:
                 result = PaperResult(paper=paper, status=FAILED, error=f"{type(error).__name__}: {error}")
             else:
-                result = PaperResult(
-                    paper=paper,
-                    status=READ,
-                    findings=reading.findings,
-                    chunks=reading.chunks,
-                    characters=reading.characters,
-                    truncated_from=reading.truncated_from,
-                    failed_chunks=reading.failed_chunks,
-                    usage=reading.usage.to_dict(),
-                    cost=reading.cost,
-                )
+                try:
+                    reading = extract_paper_findings(
+                        text,
+                        model=model,
+                        chunk_size=chunk_size,
+                        chunk_overlap=chunk_overlap,
+                        max_chars=max_chars,
+                        max_consolidation_chars=max_consolidation_chars,
+                        temperature=temperature,
+                        max_cost=min(limits) if limits else None,
+                        max_completion_tokens=max_completion_tokens,
+                        chat_models={model: llm},
+                        usage=run_usage,
+                        on_progress=lambda line: say(f"  {line}"),
+                    )
+                except PaperBudgetExceededError as error:
+                    # Either the run's limit or this paper's, and only the run's stops the run
+                    if max_cost is not None and error.spent >= max_cost:
+                        stopped = (
+                            f"The run spent ${error.spent:.4f}, which reaches its max_cost of ${max_cost:.4f}, "
+                            f"while reading {paper.key}, which is left unfinished"
+                        )
+                        break
+                    result = failure(paper, error, "reached its limit on spending")
+                except PaperReadingError as error:
+                    result = failure(paper, error)
+                except Exception as error:
+                    result = PaperResult(paper=paper, status=FAILED, error=f"{type(error).__name__}: {error}")
+                else:
+                    result = PaperResult(
+                        paper=paper,
+                        status=READ,
+                        findings=reading.findings,
+                        chunks=reading.chunks,
+                        characters=reading.characters,
+                        truncated_from=reading.truncated_from,
+                        failed_chunks=reading.failed_chunks,
+                        usage=reading.usage.to_dict(),
+                        cost=reading.cost,
+                    )
 
-        result = replace(result, elapsed=round(time.time() - began, 3))
-        save_json(path, result.to_dict())
-        results[paper.key] = result
+            result = replace(result, elapsed=round(time.time() - began, 3), digest=digest)
+            save_json(path, result.to_dict())
+            results[paper.key] = result
 
-        # A paper with no text to read is no sign that anything is wrong, so it neither adds to
-        # a run of failures nor ends one
-        if result.status == FAILED:
-            failures_in_a_row += 1
-        elif result.status == READ:
-            failures_in_a_row = 0
-        if max_consecutive_failures is not None and failures_in_a_row >= max_consecutive_failures:
-            stopped = f"{failures_in_a_row} papers in a row failed, the last with {result.error}"
-            break
-
-    finished = [results[paper.key] for paper in asked if paper.key in results]
-    ended_with = spent()
-    report = PaperRunReport(
-        results=finished,
-        papers=len(asked),
-        spent=ended_with - started_with if ended_with is not None and started_with is not None else None,
-        stopped=stopped,
-        save_dir=save_dir,
-    )
-    save_json(save_dir / REPORT_FILE, report.to_dict())
-    summarize_papers(save_dir)
+            # A paper with no text to read is no sign that anything is wrong, so it neither adds to
+            # a run of failures nor ends one
+            if result.status == FAILED:
+                failures_in_a_row += 1
+            elif result.status == READ:
+                failures_in_a_row = 0
+            if max_consecutive_failures is not None and failures_in_a_row >= max_consecutive_failures:
+                stopped = f"{failures_in_a_row} papers in a row failed, the last with {result.error}"
+                break
+    finally:
+        ended_with = spent()
+        report = PaperRunReport(
+            results=[results[paper.key] for paper in asked if paper.key in results],
+            papers=len(asked),
+            spent=ended_with - started_with if ended_with is not None and started_with is not None else None,
+            stopped=stopped,
+            save_dir=save_dir,
+        )
+        save_json(save_dir / REPORT_FILE, report.to_dict())
+        summarize_papers(save_dir)
 
     return report
 
@@ -845,6 +929,7 @@ def combine_paper_summaries(save_dirs: Sequence[Path | str], output_dir: Path | 
     :param save_dirs: Directories that summarize_papers wrote a frequency summary in.
     :param output_dir: Where to write the total.
     :raises FileNotFoundError: If a directory has no frequency summary.
+    :raises ValueError: If a frequency summary cannot be read.
     :return: The total, with the number of papers the directories' summaries were made of.
     """
     totals: dict[str, Counter[str]] = {"tasks": Counter(), "databases": Counter(), "software": Counter()}
@@ -856,8 +941,14 @@ def combine_paper_summaries(save_dirs: Sequence[Path | str], output_dir: Path | 
         if not path.is_file():
             raise FileNotFoundError(f"{directory} has no {FREQUENCY_FILE}. Summarize it with summarize_papers first.")
 
-        frequencies = json.loads(path.read_text(encoding="utf-8"))
-        papers += as_int(frequencies.get("papers"), 0) or 0
+        try:
+            frequencies = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"{path} cannot be read: {error}") from error
+        if not isinstance(frequencies, dict):
+            raise ValueError(f"{path} does not hold a summary. Summarize {directory} again with summarize_papers.")
+
+        papers += max(as_int(frequencies.get("papers"), 0) or 0, 0)
         for kind in totals:
             for name, count in as_dict(frequencies.get(kind)).items():
                 key = normalize_name(name)
@@ -953,30 +1044,34 @@ def read_biorxiv_subjects(
             return None
 
     started_with = spent()
-    for subject in subjects:
-        papers = biorxiv_papers(
-            since,
-            until,
-            subject=subject,
-            limit=papers_per_subject,
-            published_only=published_only,
-            random_sample=random_sample,
-            seed=seed,
-            max_pages=max_pages,
-        )
-        if not papers:
-            continue
+    try:
+        for subject in subjects:
+            papers = biorxiv_papers(
+                since,
+                until,
+                subject=subject,
+                limit=papers_per_subject,
+                published_only=published_only,
+                random_sample=random_sample,
+                seed=seed,
+                max_pages=max_pages,
+            )
+            if not papers:
+                continue
 
-        directory = save_dir / key_from(subject.lower())
-        directories[subject] = directory
-        report = read_papers(papers, directory, usage=shared, **options)
-        reports[subject] = report
-        if report.stopped is not None:
-            stopped = f"While reading {subject}: {report.stopped}"
-            break
+            directory = save_dir / key_from(subject.lower())
+            directories[subject] = directory
+            report = read_papers(papers, directory, usage=shared, **options)
+            reports[subject] = report
+            if report.stopped is not None:
+                stopped = f"While reading {subject}: {report.stopped}"
+                break
+    finally:
+        # A subject that was being read when this was interrupted has its counts too, since every
+        # run writes them as it ends
+        read = [directory for directory in directories.values() if (directory / FREQUENCY_FILE).is_file()]
+        combined = combine_paper_summaries(read, save_dir)
 
-    directories = {subject: directory for subject, directory in directories.items() if subject in reports}
-    combined = combine_paper_summaries(list(directories.values()), save_dir)
     ended_with = spent()
 
     return SubjectsReport(

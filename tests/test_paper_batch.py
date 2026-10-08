@@ -1,8 +1,11 @@
 """Tests for reading many papers and counting what they share."""
 
 import csv
+import hashlib
 import json
+import os
 import random
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +41,7 @@ from conftest import TEST_MODEL, FakeClient, FakeListing, biorxiv_record, make_u
 from test_papers import CHUNK, DESEQ, PAPER, database, findings, package, queue, task
 
 SHORT = "One short paper about differential expression."
+TASK_NAME = "RNA-seq differential expression with DESeq2"
 
 
 def write_papers(directory: Path, *texts: str) -> list[Paper]:
@@ -69,15 +73,58 @@ class TestPapersIn:
         (tmp_path / ".git" / "hidden.txt").write_text("text")
 
         assert [paper.key for paper in papers_in(tmp_path)] == ["top.txt"]
-        assert [paper.key for paper in papers_in(tmp_path, recursive=True)] == ["sub_deep.txt", "top.txt"]
+        deep = [paper.key for paper in papers_in(tmp_path, recursive=True)]
+        assert len(deep) == 2 and deep[0].startswith("sub_deep.txt-") and deep[1] == "top.txt"
 
-    def test_two_paths_that_clean_to_one_key_are_told_apart(self, tmp_path: Path) -> None:
+    def test_the_hidden_directories_are_not_walked(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / ".venv" / "lib").mkdir(parents=True)
+        (tmp_path / ".venv" / "lib" / "notes.txt").write_text("text")
+        (tmp_path / "visible").mkdir()
+        (tmp_path / "visible" / "paper.txt").write_text("text")
+        visited: list[str] = []
+        real = os.walk
+
+        def watching(top: Any, *args: Any, **kwargs: Any) -> Any:
+            for folder, folders, names in real(top, *args, **kwargs):
+                visited.append(Path(folder).name)
+                yield folder, folders, names
+
+        monkeypatch.setattr(paper_batch.os, "walk", watching)
+
+        papers_in(tmp_path, recursive=True)
+
+        assert sorted(visited) == sorted([tmp_path.name, "visible"])
+
+    def test_two_paths_that_clean_to_one_key_are_told_apart_whatever_else_is_in_the_directory(
+        self, tmp_path: Path
+    ) -> None:
         (tmp_path / "a b.txt").write_text("text")
+        before = {paper.path.name: paper.key for paper in papers_in(tmp_path)}
         (tmp_path / "a_b.txt").write_text("text")
+
+        after = {paper.path.name: paper.key for paper in papers_in(tmp_path)}
+
+        assert after["a_b.txt"] == "a_b.txt" and after["a b.txt"].startswith("a_b.txt-")
+        # Adding a file that sorts after it must not give it another key: a result is saved under it
+        assert before["a b.txt"] == after["a b.txt"]
+
+    def test_names_that_differ_only_in_case_do_not_share_a_result_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "B.txt").write_text("text")
+        (tmp_path / "b.TXT").write_text("text")
+        real = os.walk
+
+        def listing_both(top: Any, *args: Any, **kwargs: Any) -> Any:
+            # On a file system that does not tell the two apart, there is one file and both names open it
+            for folder, folders, _ in real(top, *args, **kwargs):
+                yield folder, folders, ["B.txt", "b.TXT"]
+
+        monkeypatch.setattr(paper_batch.os, "walk", listing_both)
 
         keys = [paper.key for paper in papers_in(tmp_path)]
 
-        assert len(set(keys)) == 2 and keys[0] == "a_b.txt" and keys[1].startswith("a_b.txt-")
+        assert len(keys) == 2 and len({key.casefold() for key in keys}) == 2
 
     def test_a_directory_that_is_not_there_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(NotADirectoryError, match="no directory of papers"):
@@ -189,6 +236,13 @@ class TestBiorxivPapers:
         assert first == again == random.Random(42).sample(everything, 3)
         assert other == random.Random(7).sample(everything, 3)
         assert first != other
+
+    def test_a_listing_that_gives_no_total_is_read_until_a_page_is_empty(self, listing: FakeListing) -> None:
+        listing.report_total = False
+
+        papers = biorxiv_papers("2024-01-01", "2024-01-31", limit=100)
+
+        assert len(papers) == 7 and [url.split("/")[-2] for url, _ in listing.calls] == ["0", "2", "4", "6", "7"]
 
     def test_a_sample_reads_the_whole_listing(self, listing: FakeListing) -> None:
         biorxiv_papers("2024-01-01", "2024-01-31", limit=1, random_sample=True)
@@ -386,12 +440,13 @@ class TestReadPapers:
         assert report.unavailable == 1 and "could not be read as a PDF" in (report.results[0].error or "")
 
     def test_the_papers_that_could_not_be_read_are_read_again_only_if_asked(
-        self, fake_client: FakeClient, tmp_path: Path
+        self, fake_client: FakeClient, tmp_path: Path, europe_pmc: dict[str, Any]
     ) -> None:
-        path = tmp_path / "later.txt"
-        papers = [Paper(key="later.txt", path=path)]
+        papers = [Paper(key="p", doi="10.1101/x", published_doi="10.9/x")]
         assert self.read(fake_client, papers, tmp_path / "out").unavailable == 1
-        path.write_text(SHORT)
+        open_text = ArticleText(article=open_article("PMC7"), sections=(("Methods", SHORT),))
+        europe_pmc["articles"]["10.9/x"] = open_article("PMC7")
+        europe_pmc["texts"]["PMC7"] = open_text
         queue(fake_client, DESEQ, DESEQ)
 
         assert self.read(fake_client, papers, tmp_path / "out").unavailable == 1
@@ -400,6 +455,143 @@ class TestReadPapers:
         again = self.read(fake_client, papers, tmp_path / "out", retry_failed=True)
 
         assert (again.read, again.unavailable) == (1, 0) and len(fake_client.completions.parse_calls) == 2
+
+    def test_a_result_records_the_digest_of_the_file_it_was_read_from(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(fake_client, DESEQ, DESEQ)
+        papers = write_papers(tmp_path / "in", SHORT)
+
+        report = self.read(fake_client, papers, tmp_path / "out")
+
+        assert report.results[0].digest == hashlib.sha256(SHORT.encode()).hexdigest()
+        saved = load_result(tmp_path / "out" / "results" / "paper1.txt.json")
+        assert saved is not None and saved.digest == report.results[0].digest
+
+    def test_another_papers_results_under_the_same_keys_are_refused_before_anything_is_read(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(fake_client, *[DESEQ] * 4)
+        self.read(fake_client, write_papers(tmp_path / "a", SHORT, SHORT + " one"), tmp_path / "out")
+        before = (tmp_path / "out" / "results" / "paper1.txt.json").read_text()
+        others = write_papers(tmp_path / "b", "A different paper.", "Another different paper.", "A third.")
+        calls = len(fake_client.completions.parse_calls)
+
+        with pytest.raises(ValueError, match="holds results of other papers under the keys paper1.txt, paper2.txt"):
+            self.read(fake_client, others, tmp_path / "out")
+
+        assert len(fake_client.completions.parse_calls) == calls
+        assert (tmp_path / "out" / "results" / "paper1.txt.json").read_text() == before
+        assert not (tmp_path / "out" / "results" / "paper3.txt.json").exists()
+
+    def test_only_the_first_few_conflicting_keys_are_named(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        queue(fake_client, *[DESEQ] * 14)
+        self.read(fake_client, write_papers(tmp_path / "a", *[f"Paper {n}" for n in range(7)]), tmp_path / "out")
+
+        with pytest.raises(ValueError, match="paper5.txt, and 2 more") as caught:
+            self.read(fake_client, write_papers(tmp_path / "b", *[f"Other {n}" for n in range(7)]), tmp_path / "out")
+
+        assert "paper6.txt" not in str(caught.value)
+
+    @pytest.mark.parametrize(
+        "other",
+        [{"doi": "10.1101/b"}, {"published_doi": "10.9/b"}, {"pmcid": "PMC2"}],
+        ids=["doi", "published doi", "pmcid"],
+    )
+    def test_a_result_is_not_used_for_a_paper_with_another_identifier_under_the_same_key(
+        self, fake_client: FakeClient, tmp_path: Path, europe_pmc: dict[str, Any], other: dict[str, str]
+    ) -> None:
+        first = Paper(key="p", doi="10.1101/a", published_doi="10.9/a", pmcid="PMC1")
+        self.read(fake_client, [first], tmp_path / "out")
+
+        with pytest.raises(ValueError, match="holds results of other papers under the keys p"):
+            self.read(fake_client, [replace(first, **other)], tmp_path / "out")
+
+    def test_the_same_files_in_another_place_carry_on_where_the_run_was(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        queue(fake_client, DESEQ, DESEQ)
+        self.read(fake_client, write_papers(tmp_path / "a", SHORT), tmp_path / "out")
+        moved = write_papers(tmp_path / "elsewhere", SHORT)
+
+        report = self.read(fake_client, moved, tmp_path / "out")
+
+        assert report.read == 1 and report.spent == 0 and len(fake_client.completions.parse_calls) == 2
+
+    def test_a_file_that_has_changed_since_it_was_read_is_read_again_and_a_file_that_is_gone_is_not(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        papers = write_papers(tmp_path / "in", SHORT, "Second.")
+        queue(fake_client, *[DESEQ] * 4)
+        self.read(fake_client, papers, tmp_path / "out")
+        papers[0].path.write_text("The first paper, revised.")  # type: ignore[union-attr]
+        papers[1].path.unlink()  # type: ignore[union-attr]
+        queue(fake_client, DESEQ, DESEQ)
+        lines: list[str] = []
+
+        report = self.read(fake_client, papers, tmp_path / "out", on_progress=lines.append)
+
+        assert report.read == 2 and len(fake_client.completions.parse_calls) == 4 + 2
+        assert "  Its file has changed since it was read, so it is read again" in lines
+        assert lines.count("  Its file has changed since it was read, so it is read again") == 1
+        revised = load_result(tmp_path / "out" / "results" / "paper1.txt.json")
+        assert revised is not None and revised.digest == hashlib.sha256(b"The first paper, revised.").hexdigest()
+
+    def test_a_file_that_was_not_there_when_its_paper_was_tried_is_read_when_it_appears(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "later.txt"
+        papers = [Paper(key="later.txt", path=path)]
+        assert self.read(fake_client, papers, tmp_path / "out").unavailable == 1
+        path.write_text(SHORT)
+        queue(fake_client, DESEQ, DESEQ)
+
+        assert self.read(fake_client, papers, tmp_path / "out").read == 1
+
+    def test_a_file_missing_from_one_place_is_read_from_another_under_the_same_key(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        assert self.read(fake_client, [Paper(key="p", path=tmp_path / "gone.txt")], tmp_path / "out").unavailable == 1
+        (tmp_path / "there.txt").write_text(SHORT)
+        queue(fake_client, DESEQ, DESEQ)
+
+        report = self.read(fake_client, [Paper(key="p", path=tmp_path / "there.txt")], tmp_path / "out")
+
+        assert report.read == 1
+
+    def test_a_run_file_that_cannot_be_read_is_refused_saying_so(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        papers = write_papers(tmp_path / "in", SHORT)
+        (tmp_path / "out").mkdir()
+
+        for content in ["{ not json", "[1, 2]"]:
+            (tmp_path / "out" / "run.json").write_text(content)
+
+            with pytest.raises(ValueError, match="run.json (cannot be read|does not hold a run)"):
+                self.read(fake_client, papers, tmp_path / "out")
+
+        assert fake_client.completions.parse_calls == []
+
+    def test_a_run_that_is_interrupted_still_writes_its_report_and_counts(
+        self, fake_client: FakeClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = paper_batch.extract_paper_findings
+        calls: list[int] = []
+
+        def interrupted(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            if len(calls) > 1:
+                raise KeyboardInterrupt
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(paper_batch, "extract_paper_findings", interrupted)
+        queue(fake_client, DESEQ, DESEQ)
+
+        with pytest.raises(KeyboardInterrupt):
+            self.read(fake_client, write_papers(tmp_path / "in", SHORT, SHORT + " two"), tmp_path / "out")
+
+        report = json.loads((tmp_path / "out" / "report.json").read_text())
+        assert (report["papers"], report["finished"], report["read"]) == (2, 1, 1)
+        assert json.loads((tmp_path / "out" / "frequency_summary.json").read_text())["tasks"] == {TASK_NAME: 1}
 
     def test_a_paper_that_cannot_be_read_by_the_model_is_saved_as_failed_with_what_it_cost(
         self, fake_client: FakeClient, tmp_path: Path
@@ -807,6 +999,24 @@ class TestCombine:
 
         assert combined.tasks == {"PCA": 2} and combined.software == {} and combined.papers == 0
 
+    @pytest.mark.parametrize("content", ["{ not json", "[1, 2]", '"text"', ""])
+    def test_a_summary_that_cannot_be_read_is_refused_naming_it_and_nothing_is_written(
+        self, tmp_path: Path, content: str
+    ) -> None:
+        first = self.write(tmp_path / "a", 1, tasks={"PCA": 1})
+        second = self.write(tmp_path / "b", 1)
+        (second / "frequency_summary.json").write_text(content)
+
+        with pytest.raises(ValueError, match=r"b/frequency_summary.json (cannot be read|does not hold a summary)"):
+            combine_paper_summaries([first, second], tmp_path / "all")
+
+        assert not (tmp_path / "all").exists()
+
+    def test_a_negative_number_of_papers_adds_nothing(self, tmp_path: Path) -> None:
+        directory = self.write(tmp_path / "a", -5, tasks={"PCA": 1})
+
+        assert combine_paper_summaries([directory], tmp_path / "all").papers == 0
+
     def test_a_directory_with_no_summary_is_refused_and_nothing_is_written(self, tmp_path: Path) -> None:
         first = self.write(tmp_path / "a", 1, tasks={"PCA": 1})
 
@@ -892,6 +1102,32 @@ class TestReadBiorxivSubjects:
         assert list(report.reports) == ["neuroscience"]
         assert report.stopped is not None and report.stopped.startswith("While reading neuroscience: ")
         assert report.combined.papers == 1 and not (tmp_path / "out" / "cell_biology").exists()
+
+    def test_an_interrupted_run_still_adds_up_what_was_read(
+        self, fake_client: FakeClient, tmp_path: Path, subjects: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = paper_batch.read_papers
+        asked: list[str] = []
+
+        def interrupted(papers: Any, directory: Path, **options: Any) -> Any:
+            asked.append(directory.name)
+            if len(asked) == 2:
+                raise KeyboardInterrupt
+            return real(papers, directory, **options)
+
+        monkeypatch.setattr(paper_batch, "read_papers", interrupted)
+        queue(fake_client, *[DESEQ] * 4)
+
+        with pytest.raises(KeyboardInterrupt):
+            read_biorxiv_subjects(
+                tmp_path / "out",
+                "2024-01-01",
+                subjects=["neuroscience", "cell biology"],
+                model=TEST_MODEL,
+                client=fake_client,
+            )
+
+        assert json.loads((tmp_path / "out" / "combined_summary.json").read_text())["papers"] == 2
 
     def test_the_subjects_are_biomnis_by_default(
         self, fake_client: FakeClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

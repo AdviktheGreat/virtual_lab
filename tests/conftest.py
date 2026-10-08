@@ -489,6 +489,7 @@ class FakeListing:
     def __init__(self, records: list[dict[str, Any]], page_size: int = 2) -> None:
         self.records = records
         self.page_size = page_size
+        self.report_total = True
         self.calls: list[tuple[str, dict[str, Any]]] = []
 
     def __call__(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
@@ -496,7 +497,9 @@ class FakeListing:
         cursor = int(url.split("/")[-2])
         page = self.records[cursor : cursor + self.page_size]
 
-        return {"messages": [{"status": "ok", "total": str(len(self.records))}], "collection": page}
+        messages = [{"status": "ok", "total": str(len(self.records))}] if self.report_total else [{"status": "ok"}]
+
+        return {"messages": messages, "collection": page}
 
 
 @pytest.fixture
