@@ -387,6 +387,14 @@ def code_repair_prompt(
     )
 
 
+def human_note_prompt(note: str) -> str:
+    """Generates the message that gives the agents a note from the person following the meeting.
+
+    :param note: What the person wrote.
+    """
+    return f"The human researcher overseeing this meeting has added a note:\n\n{note}"
+
+
 def structured_output_prompt(agent: Agent) -> str:
     """Generates the prompt asking an agent to restate the meeting's conclusions as data.
 

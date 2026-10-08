@@ -33,6 +33,7 @@ from typing import Any
 
 from virtual_lab.actions import find_code_action
 from virtual_lab.constants import (
+    HUMAN_SPEAKER,
     METADATA_DIR_NAME,
     PROJECT_FILE_NAME,
     REPORT_FILE_NAME,
@@ -259,6 +260,7 @@ h3 { font-size: 11pt; margin: 18px 0 6px; }
 .turn .speaker .model { font-weight: 400; color: #8b8578; font-size: 8pt; margin-left: 6px; }
 .turn.note { --colour: #b9b2a3; }
 .turn.note .body { font-size: 8.5pt; color: #4a463f; }
+.turn.human { --colour: #24221f; background: #f5f1e6; border-radius: 0 5px 5px 0; padding: 6px 12px; }
 .label { font-size: 7.5pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #8b8578;
   margin: 6px 0 2px; }
 pre, code { font-family: "JetBrains Mono", "SF Mono", "Menlo", "DejaVu Sans Mono", monospace; font-size: 8pt; }
@@ -325,7 +327,7 @@ def kinds_of(meeting: SavedMeeting) -> list[str]:
     if len(turns) == len(meeting.transcript):
         return [turn["kind"] for turn in turns]
 
-    by_speaker = {"User": "prompt", "Tool": "tool_output", "Session": "code_output"}
+    by_speaker = {"User": "prompt", "Tool": "tool_output", "Session": "code_output", HUMAN_SPEAKER: "note"}
     return [by_speaker.get(turn["agent"], "response") for turn in meeting.transcript]
 
 
@@ -476,6 +478,14 @@ def discussion_html(
             text = shorten(without_observation(message) if kind == "code_output" else message, max_output_chars)
             body = markdown(text) if kind == "tool_output" else f'<pre class="output">{escape(text)}</pre>'
             parts.append(f'<div class="turn note"><div class="label">{label}</div><div class="body">{body}</div></div>')
+            continue
+
+        if kind == "note":
+            parts.append(
+                f'<div class="turn human"><div class="speaker">{escape(speaker)}</div>'
+                '<div class="label">A note to the meeting</div>'
+                f'<div class="body">{markdown(message)}</div></div>'
+            )
             continue
 
         if kind == "structured_output":

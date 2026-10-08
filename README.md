@@ -152,6 +152,26 @@ hold_meeting(..., on_event=show, stream=True)
 - With `stream`, every reply is asked for with its usage, so what it cost is still known. OpenAI-compatible servers that leave the usage of a streamed reply out make the cost unknown, as they would without streaming, and one that refuses to be asked fails the request; a model told not to stream its usage (`stream_usage=False`) is left as told. A model that cannot stream sends its reply whole, as one `writing` event. Structured outputs, and the request that chooses resources, are not streamed.
 - `Project` takes `on_event` and `stream` as options for its meetings, and neither makes a finished meeting a different one, so a project carried on with or without them reads its meetings back. A meeting read back is told of by one `read_back` event, with its summary and where it is saved.
 
+### Steering a meeting as it happens
+
+A person following a meeting can steer it as well as watch it. `steer` is called before every agent's turn with a `NextTurn`, which names the meeting, the round, and the agent about to speak, and returns a note or `None`:
+
+```python
+from virtual_lab import NextTurn, hold_meeting
+
+def steer(turn: NextTurn) -> str | None:
+    if turn.speaker == "Scientific Critic":
+        return "Check the controls in the binding assay before anything else."
+    return None
+
+hold_meeting(..., steer=steer)
+```
+
+- A note is added to the discussion after the agent's prompt, introduced as from the human researcher overseeing the meeting, so the agent about to speak reads it last, and everyone after it reads it too. It is kept in the transcript as from `Human researcher`, with the kind `note` in the record and in the `message` event, and saved documents show it. A note that is empty or only spaces is not added.
+- The meeting waits while `steer` does, which is how it is paused: a function that waits for a person to resume holds the meeting before the turn, with nothing sent. `steer` is asked only between turns, so an agent running code or calling tools finishes its turn first.
+- An exception `steer` raises stops the meeting the way any other failure does, saving what was done under `save_dir/partial/`.
+- `Project` takes `steer` as an option for its meetings, which with `run_project` includes the meetings in which the team lead decides each step, so a note can reach the team lead before its next decision. Like `on_event`, it does not make a finished meeting a different one: what was said is in the meeting's transcript, and a project carried on reads it back.
+
 ### Saving a meeting or a project as a document
 
 Biomni saves its agent's conversation as a PDF. A meeting can be saved as one too, or as a page of HTML, laid out as a meeting: its agenda, team, and summary first, then the discussion round by round, each agent in a colour of its own, with the code each agent ran, what it printed, and the figures it drew, then what the meeting cost. A project is saved as its report, with every meeting it finished after it if asked for, each from a new page.
@@ -166,7 +186,7 @@ save_project_pdf("project", meetings=True)             # project/report.pdf
 
 - A PDF needs WeasyPrint, which `pip install "virtual-lab[pdf]"` installs, and the Pango library it draws text with, which pip cannot: `brew install pango` on macOS, or `apt install libpango-1.0-0 libpangoft2-1.0-0` on Debian and Ubuntu. Without them a PDF is refused with `PDFExportError`, saying what to install, and HTML can still be saved.
 - Everything is read from what was saved, so any meeting can be saved as a document at any time, including one that failed, from `partial/`, and a transcript saved before meetings kept records, which is shown from the transcript alone.
-- The prompts each agent was given are left out, since the agenda stands for them; `include_prompts=True` shows them. A tool's or the session's output is cut to `max_output_chars`, 6,000 characters by default, from the middle.
+- The prompts each agent was given are left out, since the agenda stands for them; `include_prompts=True` shows them. Notes a person gave through `steer` are always shown. A tool's or the session's output is cut to `max_output_chars`, 6,000 characters by default, from the middle.
 - What the agents wrote is rendered as Markdown, with any HTML in it shown as text, and the document carries its figures, so neither the HTML nor the PDF fetches anything: an image an agent linked to, on the web or on disk, is shown as a link to it. A figure is read only from the session's own directory.
 - `meeting_html` and `project_html` return the document rather than saving it.
 
@@ -390,7 +410,7 @@ print(report.answer)
 
 - A run ends `finished` when the critic accepts an answer, `out_of_budget` when the project's `max_cost` runs out, `out_of_rounds` after `max_rounds` rounds, `stalled` after `max_stalled_rounds` rounds in a row without one more of the plan's tasks done, or `stopped` by the approve hook. Running out of budget ends it with a report, not an error.
 - Every meeting is told the goal, the team, and the plan as it stands, and is given what the work so far found, as `memory` says (below). A decision that cannot be carried out, such as one naming someone not on the team, is recorded and the team lead is told why in the next round.
-- `approve` is called with each round's number and decision before it is carried out, and returns the decision to carry out, which it may change, or `None` to stop the project. With none, the project runs on its own.
+- `approve` is called with each round's number and decision before it is carried out, and returns the decision to carry out, which it may change, or `None` to stop the project. With none, the project runs on its own. A `steer` given to the `Project` adds a person's notes to its meetings as they go (see [Steering a meeting as it happens](#steering-a-meeting-as-it-happens)).
 - `on_event` is called with a `ProjectEvent` when the team is chosen or changed (`team`), the plan is made (`plan`), each step is decided (`decided`, before `approve` is asked), code is run (`code`), each round ends (`round`), and the project ends (`finished`, with the report), and with every `MeetingEvent` of every meeting it holds, so a project can be followed as it happens. The `Project`'s own `on_event`, if it has one, is called first. An exception it raises stops the project like any other error, except when it is told the project ended, once the report is saved, which is only warned about.
 - `research_log.json` records every round, with the decision as proposed and as carried out, and every change to the team, and is saved after every round. The run ends with `report.json` and `report.md`: the answer, or the last one the critic did not accept and its objections, the team, the plan, every round, and the cost. A run that fails with any other error leaves no report, and the log says what the error was.
 - Every step is a step of the project, so a run that stopped is carried on by running it again on the same directory: the steps it took are read back for nothing. Nothing a step is asked depends on `max_cost`, `max_rounds`, or `max_stalled_rounds`, so they can be raised to carry a project on. For the same reason, the team lead is not told how many rounds or how much money is left. Every decision carried out, whether the approve hook changed it or there was no hook, is kept in the log and not asked about again, however far a later run gets before it stops; one the hook stopped is asked about again.

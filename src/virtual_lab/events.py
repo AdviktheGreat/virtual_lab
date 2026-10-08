@@ -10,6 +10,11 @@ meetings it holds.
 
 An event is told of once it has happened, apart from "tool_calls" and "code", which are told of
 before the tools or code run, so that what is running can be shown while it does.
+
+A meeting can also be steered as it goes, through a function given as steer, which is asked
+before every turn for a note from the person following it. A note is added to the discussion,
+for the agent about to speak and every one after it to read, and the meeting waits while the
+function does, which is how it is paused.
 """
 
 from collections.abc import Callable, Mapping
@@ -51,9 +56,9 @@ class MeetingEvent:
           sent again, as one is without its temperature for a model that refuses one, starts
           again from nothing. Only with stream.
         - "message": a message was added to the transcript. speaker and text are as the
-          transcript has them, and data holds its kind, as the record has it ("prompt",
+          transcript has them, and data holds its kind, as the record has it ("prompt", "note",
           "response", "code_action", "code_output", "tool_output", or "structured_output"), and
-          its index in the transcript.
+          its index in the transcript. A "note" is one a person gave through steer.
         - "tool_calls": an agent called tools, which are about to run. data["calls"] holds each
           one's name and arguments.
         - "code": an agent wrote code, which is about to run in the session. data holds its
@@ -115,7 +120,24 @@ class ProjectEvent:
     data: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class NextTurn:
+    """The turn a meeting is about to take, as the function given as steer is told of it.
+
+    :param meeting: The name the meeting is saved under.
+    :param round: The round, from 1, where the last is num_rounds + 1.
+    :param speaker: The title of the agent about to speak.
+    """
+
+    meeting: str
+    round: int
+    speaker: str
+
+
 OnMeetingEvent = Callable[[MeetingEvent], None]
 
 # What run_project calls, with its own events and those of every meeting it holds
 OnProjectEvent = Callable[[MeetingEvent | ProjectEvent], None]
+
+# What a meeting asks before every turn, for a note from the person following it, or None
+Steer = Callable[[NextTurn], str | None]

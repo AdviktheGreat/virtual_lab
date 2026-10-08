@@ -22,10 +22,11 @@ from virtual_lab.actions import describe_tool_output, find_code_action, observat
 from virtual_lab.agent import Agent
 from virtual_lab.llm import ModelReply, ModelSource, ask, resolve_chat_models
 from virtual_lab.completions import check_temperature, ran_without_temperature, send_request
-from virtual_lab.events import MeetingEvent, MeetingEventKind, OnMeetingEvent
+from virtual_lab.events import MeetingEvent, MeetingEventKind, NextTurn, OnMeetingEvent, Steer
 from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
     DEFAULT_MAX_RETRIES,
+    HUMAN_SPEAKER,
     MAX_RECORDED_ARGUMENT_CHARS,
     MAX_RECORDED_RETRIEVAL_CHARS,
     MAX_TOOL_ITERATIONS,
@@ -35,6 +36,7 @@ from virtual_lab.constants import (
 )
 from virtual_lab.prompts import (
     code_session_prompt,
+    human_note_prompt,
     individual_meeting_agent_prompt,
     individual_meeting_critic_prompt,
     individual_meeting_start_prompt,
@@ -158,6 +160,7 @@ def hold_meeting(
     commercial_mode: bool = False,
     on_event: OnMeetingEvent | None = None,
     stream: bool = False,
+    steer: Steer | None = None,
 ) -> MeetingResult:
     """Runs a meeting with LLM agents and returns everything it produced.
 
@@ -241,6 +244,13 @@ def hold_meeting(
         events. A reply's usage is asked for with it, which OpenAI-compatible servers that do not
         report the usage of a streamed reply leave out, making its cost unknown. A server that
         refuses to be asked fails the request; give its chat model stream_usage=False.
+    :param steer: Called before every agent's turn with the NextTurn, so that a person following
+        the meeting can steer it. It returns a note, or None. A note is added to the discussion
+        after the agent's prompt, as from the human researcher, for that agent and everyone after
+        it to read, and is kept in the transcript with the kind "note". The meeting waits while
+        steer does, which is how it is paused, and an exception it raises stops the meeting the
+        way any other failure does. It is asked only between turns, so a turn in which an agent
+        runs code or calls tools is carried through before the meeting can be paused.
     :raises BudgetExceededError: Before a request, if the meeting has already spent max_cost.
     :raises CostUnknownError: If max_cost is given and a model's cost, or a response's usage,
         cannot be known.
@@ -274,6 +284,9 @@ def hold_meeting(
 
     if stream and on_event is None:
         raise ValueError("stream tells on_event of each reply as it is written, so it needs an on_event")
+
+    if steer is not None and not callable(steer):
+        raise TypeError(f"steer is a function that returns a note or None, not {type(steer).__name__}")
 
     if isinstance(resources, Resources):
         if session is None:
@@ -689,9 +702,22 @@ def hold_meeting(
                         else:
                             prompt = individual_meeting_agent_prompt(critic=meeting_critic, agent=team_member)
 
+                # Asked before the prompt is added, so that a meeting paused here has not yet begun the turn
+                note = None
+                if steer is not None:
+                    note = steer(NextTurn(meeting=save_name, round=round_num, speaker=agent.title))
+                if note is not None and not isinstance(note, str):
+                    raise TypeError(f"steer returns a note or None, not {type(note).__name__}")
+
                 # Add prompt as user message
                 messages.append({"role": "user", "content": prompt})
                 add_turn("User", prompt, "prompt")
+
+                # After the prompt, so that the note is the last thing the agent reads before it answers
+                if note and note.strip():
+                    messages.append({"role": "user", "content": human_note_prompt(note.strip())})
+                    add_turn(HUMAN_SPEAKER, note.strip(), "note")
+
                 emit("turn", speaker=agent.title, name=agent.name, model=agent.model)
 
                 # A turn can span several API calls when the agent uses tools, so its usage is
