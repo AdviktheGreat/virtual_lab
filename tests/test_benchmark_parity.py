@@ -183,7 +183,8 @@ class TestBiomniEval1:
                 if outcome(ours.evaluate, task, number, answer) != outcome(theirs.evaluate, task, number, answer):
                     different.append((task, number, answer))
 
-        assert scored > 7_000 and different == []
+        assert scored > 7_000
+        assert different == []
 
     @pytest.mark.parametrize("truth", ["G1", "G1,G2", "G1, G2 ,G3", " G1 ", "g1,G2", ""])
     def test_the_causal_genes_a_patient_has_are_matched_as_biomni_matches_them(self, theirs: Any, truth: str) -> None:
