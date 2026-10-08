@@ -172,7 +172,7 @@ class TestGenerate:
             and err == "virtual-lab-functions: ValueError: Give the tasks, with --tasks or --task\n"
         )
 
-    def test_a_function_that_cannot_be_made_to_pass_is_named_with_why_and_is_not_a_stop(
+    def test_a_function_that_cannot_be_made_to_pass_is_named_with_why_and_the_exit_status_says_so_without_a_stop(
         self, fake_client: FakeClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         queue(fake_client, fenced(without_docstring("count_reads")), fenced(code("align_reads")))
@@ -181,7 +181,7 @@ class TestGenerate:
             capsys, *generate(tmp_path, "--task", "Count reads", "--task", "Align reads", "--max-attempts", "1")
         )
 
-        assert status == 0
+        assert status == 1 and "Stopped" not in out
         assert "Wrote 1 of 2 functions (1 not run, 1 failed)" in out
         assert (
             "  Failed: count_reads: FunctionGenerationError: No function that can be used was written in 1 attempt"
@@ -219,7 +219,8 @@ class TestGenerate:
             capsys, *generate(tmp_path, *tasks, "--max-attempts", "1", "--quiet", "--keep-going", "--retry-failed")
         )
 
-        assert keeping_going[0] == 0 and "Wrote 0 of 4 functions (4 failed)" in keeping_going[1]
+        assert keeping_going[0] == 1 and "Wrote 0 of 4 functions (4 failed)" in keeping_going[1]
+        assert "Stopped" not in keeping_going[1]
         assert len(fake_client.completions.calls) == 3 + 4
 
     def test_a_failed_function_is_tried_again_only_if_asked(

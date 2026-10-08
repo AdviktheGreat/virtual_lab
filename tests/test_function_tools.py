@@ -197,6 +197,12 @@ class TestCallingInASession:
         assert code.count(SESSION_CACHE) == 3 and "virtual_lab_generated_count_lines" in code
         assert "globals().setdefault" in code
 
+    def test_the_code_names_the_source_it_defines_the_function_from(self) -> None:
+        corrected = SOURCE.replace("return {", "return {'x': 1, ")
+
+        assert session_call_code("count_lines", SOURCE, {}) != session_call_code("count_lines", corrected, {})
+        assert session_call_code("count_lines", SOURCE, {}) == session_call_code("count_lines", SOURCE, {})
+
 
 class TestCallingInASessionThatRuns:
     """The same, in a session that runs code, which is this machine's own."""
@@ -218,6 +224,33 @@ class TestCallingInASessionThatRuns:
         assert second["calls"] == first["calls"] + 1
         names = session.evaluate("sorted(name for name in globals() if not name.startswith('_'))").value
         assert "count_lines" not in names and "CALLS" not in names and "json" not in names
+
+    def test_a_function_that_was_corrected_is_defined_again_in_a_session_that_is_still_open(
+        self, session: LocalSession, data: Path
+    ) -> None:
+        name = "count_corrected"
+        before = SOURCE.replace("count_lines", name)
+        after = before.replace('"lines": len(lines)', '"lines": len(lines) * 10')
+
+        first = tool_from_source(before, name, session=session).function(path=str(data))
+        corrected = tool_from_source(after, name, session=session).function(path=str(data))
+        again = tool_from_source(after, name, session=session).function(path=str(data))
+
+        assert first["lines"] == 3 and first["calls"] == 1
+        assert corrected["lines"] == 30 and corrected["calls"] == 1
+        assert again["lines"] == 30 and again["calls"] == 2
+
+    def test_a_function_whose_correction_fails_to_define_is_tried_again_and_not_taken_for_defined(
+        self, session: LocalSession, data: Path
+    ) -> None:
+        name = "count_unfixed"
+        before = SOURCE.replace("count_lines", name)
+        broken = before.replace("import json", "import no_such_library_anywhere")
+        tool_from_source(before, name, session=session).function(path=str(data))
+
+        for _ in range(2):
+            with pytest.raises(FunctionToolError, match="no_such_library_anywhere"):
+                tool_from_source(broken, name, session=session).function(path=str(data))
 
     def test_what_a_function_printed_before_it_failed_is_in_the_error(
         self, session: LocalSession, tmp_path: Path

@@ -23,6 +23,7 @@ from virtual_lab.function_generator import (
     FunctionGenerationError,
     FunctionRunReport,
     FunctionTask,
+    FunctionUsageUnknownError,
     GeneratedFunction,
     brief_of,
     check_function_name,
@@ -448,11 +449,11 @@ class TestGenerateFunction:
         queue(fake_client, silent, fenced(code()))
 
         with pytest.raises(
-            FunctionGenerationError, match="did not report what it used, so max_cost cannot be enforced"
+            FunctionUsageUnknownError, match="did not report what it used, so max_cost cannot be enforced"
         ) as raised:
             generate_function("Count reads", name="count_reads", model=TEST_MODEL, max_cost=1.0)
 
-        assert raised.value.source == without_docstring() + "\n"
+        assert raised.value.source == without_docstring() + "\n" and isinstance(raised.value, FunctionGenerationError)
 
     def test_without_a_price_a_function_is_written_and_its_cost_is_not_known(self, fake_client: FakeClient) -> None:
         queue(fake_client, fenced(code()))
@@ -995,6 +996,25 @@ class TestGenerateFunctions:
         assert load_function(self.directory(tmp_path), "count_reads") is None
         assert not (self.directory(tmp_path) / "count_reads.py").exists()
         queue(fake_client, good("count_reads"))
+
+        assert self.run(tmp_path, ["Count reads", "Align reads"]).unverified == 2
+
+    def test_a_response_that_did_not_report_its_usage_is_not_remembered_as_the_tasks_failure(
+        self, tmp_path: Path, fake_client: FakeClient
+    ) -> None:
+        silent = text_response(fenced(without_docstring()))
+        silent.usage = None
+        queue(fake_client, silent, good("align_reads"))
+
+        report = self.run(tmp_path, ["Count reads", "Align reads"], max_cost=1.0)
+
+        first = report.results[0]
+        assert first.status == FAILED and first.error is not None
+        assert first.error.startswith("FunctionUsageUnknownError: A response did not report what it used")
+        assert load_function(self.directory(tmp_path), "count_reads") is None
+        assert report.stopped is not None and "cannot be enforced" in report.stopped
+        assert len(fake_client.completions.calls) == 1
+        queue(fake_client, good("count_reads"), good("align_reads"))
 
         assert self.run(tmp_path, ["Count reads", "Align reads"]).unverified == 2
 

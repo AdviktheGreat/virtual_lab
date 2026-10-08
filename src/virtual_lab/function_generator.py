@@ -130,6 +130,14 @@ class FunctionGenerationError(RuntimeError):
         self.usage = usage
 
 
+class FunctionUsageUnknownError(FunctionGenerationError):
+    """Raised when a response did not say what it used, so that max_cost could no longer be enforced.
+
+    What the model made of the task is not the cause, and so a run does not keep a record of it as
+    the task's failure: another run, with a provider that reports its usage, may write the function.
+    """
+
+
 class FunctionBudgetExceededError(BudgetExceededError):
     """Raised before a request that the limit on writing functions leaves no room for.
 
@@ -374,9 +382,10 @@ def generate_function(
     :param on_progress: Called with a line saying what is being done, before each request.
     :raises ValueError: If an option or the name is out of range, or the task too long.
     :raises FunctionBudgetExceededError: Before a request, if max_cost has been reached.
-    :raises FunctionGenerationError: If no usable function was written, or a response did not
-        report its usage so that max_cost could no longer be enforced. It holds the last code
+    :raises FunctionGenerationError: If no usable function was written. It holds the last code
         that could be read as Python.
+    :raises FunctionUsageUnknownError: If a response did not report its usage so that max_cost
+        could no longer be enforced, which is a FunctionGenerationError that holds the same.
     :return: The function, "verified" if the executor imported it and otherwise "unverified".
     """
     check_generation_options(model, temperature, max_attempts, max_completion_tokens, max_cost)
@@ -399,7 +408,7 @@ def generate_function(
             if max_cost is not None and (spent := limited.compute_cost()) >= max_cost:
                 raise FunctionBudgetExceededError(spent, max_cost, source=source, usage=own)
         except CostUnknownError as error:
-            raise FunctionGenerationError(
+            raise FunctionUsageUnknownError(
                 f"A response did not report what it used, so max_cost cannot be enforced: {error}",
                 source=source,
                 usage=own,
@@ -689,8 +698,8 @@ def generate_functions(
     A task whose function cannot be made to pass is saved as failed, with the last code written
     for it, and the run goes on. Three failures in a row stop it, since that is more likely a
     missing key or no network than three bad tasks. A task stopped by a limit is not saved, and nor
-    is one that failed of an error that is not about it, such as a key that is wrong, so that the
-    next run writes it.
+    is one that failed of an error that is not about it, such as a key that is wrong, or a response
+    that did not report its usage so that a limit could not be kept, so that the next run writes it.
 
     :param tasks: The tasks, in the order to write them.
     :param save_dir: Where to save the functions, and where an earlier run of them was saved.
@@ -823,6 +832,10 @@ def generate_functions(
                     )
                     break
                 written = failed_function(task, name, model, error, "reached its limit on spending")
+            except FunctionUsageUnknownError as error:
+                # What the provider reported, not what the model made of the task
+                remember = False
+                written = failed_function(task, name, model, error)
             except FunctionGenerationError as error:
                 written = failed_function(task, name, model, error)
             except Exception as error:

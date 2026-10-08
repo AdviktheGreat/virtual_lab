@@ -11,6 +11,7 @@ its files and libraries, and what it does is contained. Running it in this proce
 has to be asked for.
 """
 
+import hashlib
 import json
 import sys
 import threading
@@ -32,8 +33,8 @@ from virtual_lab.tools import Tool
 # the traceback is
 MAX_FAILURE_OUTPUT_CHARS = 2_000
 
-# Where a session keeps the modules of the functions it has run, by function, so that one is
-# defined once and not on every call
+# Where a session keeps the modules of the functions it has run, by function, each with a digest
+# of the source it was defined from, so that one is defined once and not on every call
 SESSION_CACHE = "__virtual_lab_functions__"
 
 
@@ -42,19 +43,22 @@ class FunctionToolError(RuntimeError):
 
 
 def session_call_code(name: str, source: str, arguments: dict[str, Any]) -> str:
-    """The code that calls a function in a session: it defines the function from its source the
-    first time, as a module of its own, so that it adds nothing else to the session's names, and
-    ends in a single expression whose value is what the function returns."""
+    """The code that calls a function in a session: it defines the function from its source, as a
+    module of its own so that it adds nothing else to the session's names, the first time, and
+    again if the source is not the one defined before, such as a function a person has corrected
+    in a session that is still open. It ends in a single expression whose value is what the
+    function returns."""
     module_name = f"{GENERATED_MODULE}_{name}"
+    digest = hashlib.sha256(source.encode()).hexdigest()
 
     return (
-        f"if {name!r} not in globals().setdefault({SESSION_CACHE!r}, {{}}):\n"
-        f"    {SESSION_CACHE}[{name!r}] = (lambda module: (\n"
+        f"if globals().setdefault({SESSION_CACHE!r}, {{}}).get({name!r}, (None,))[0] != {digest!r}:\n"
+        f"    {SESSION_CACHE}[{name!r}] = ({digest!r}, (lambda module: (\n"
         f"        __import__('sys').modules.__setitem__({module_name!r}, module),\n"
         f"        exec(compile({source!r}, {f'{name}.py'!r}, 'exec'), module.__dict__),\n"
         f"        module,\n"
-        f"    )[2])(__import__('types').ModuleType({module_name!r}))\n"
-        f"getattr({SESSION_CACHE}[{name!r}], {name!r})(**__import__('json').loads({json.dumps(arguments)!r}))\n"
+        f"    )[2])(__import__('types').ModuleType({module_name!r})))\n"
+        f"getattr({SESSION_CACHE}[{name!r}][1], {name!r})(**__import__('json').loads({json.dumps(arguments)!r}))\n"
     )
 
 

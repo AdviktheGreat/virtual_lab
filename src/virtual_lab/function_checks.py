@@ -10,8 +10,8 @@ syntax tree, so that nothing the model wrote is run to find it out. A function i
 file parses, defines a function named for the task, with a docstring, and a type hint for each
 parameter, of a type a model can send as JSON, and nothing in the file runs the task when it is
 imported. The parameters are read into a signature without evaluating the file: a type hint is
-evaluated only if it is made of names from a few standard modules and nothing else, so that no
-call, and no attribute that is not public, is ever made.
+evaluated only if it is made of names that typing exports and nothing else, so that no call is
+ever made, and no attribute is read that is not one of the types a module exports.
 """
 
 import ast
@@ -277,10 +277,18 @@ def hint_names(tree: ast.Module) -> dict[str, Any]:
             for alias in statement.names:
                 if alias.name == "*":
                     names.update({name: getattr(module, name) for name in getattr(module, "__all__", ())})
-                elif not alias.name.startswith("_") and hasattr(module, alias.name):
+                elif alias.name in getattr(module, "__all__", ()):
                     names[alias.asname or alias.name] = getattr(module, alias.name)
 
     return names
+
+
+def shown(node: ast.AST, max_chars: int = 100) -> str:
+    """The code of a node, cut short, or a stand-in for one too deeply nested to write out."""
+    try:
+        return ast.unparse(node)[:max_chars]
+    except (RecursionError, MemoryError, ValueError):
+        return "<code nested too deeply to show>"
 
 
 def hint_value(node: ast.expr, names: dict[str, Any]) -> Any:
@@ -293,21 +301,30 @@ def hint_value(node: ast.expr, names: dict[str, Any]) -> Any:
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         try:
             node = ast.parse(node.value.strip(), mode="eval").body
-        except SyntaxError as error:
-            raise ValueError(f"{node.value!r} is not a type") from error
+        except (SyntaxError, ValueError, MemoryError, RecursionError) as error:
+            raise ValueError(f"{node.value[:60]!r} is not a type") from error
 
     for part in ast.walk(node):
         if not isinstance(part, HINT_NODES):
-            raise ValueError(f"it is made of more than names: {ast.unparse(node)}")
-        if isinstance(part, ast.Attribute) and part.attr.startswith("_"):
-            raise ValueError(f"it names {part.attr}, which is not public")
+            raise ValueError(f"it is made of more than names: {shown(node)}")
+        if isinstance(part, ast.Attribute):
+            if part.attr.startswith("_"):
+                raise ValueError(f"it names {part.attr}, which is not public")
+            # A name that is public can still lead on to the rest of the process: typing.sys.modules
+            # A name that is not known at all is left for the evaluation to refuse as one
+            if not isinstance(part.value, ast.Name) or part.value.id in names:
+                owner = names.get(part.value.id) if isinstance(part.value, ast.Name) else None
+                if not isinstance(owner, types.ModuleType) or part.attr not in getattr(owner, "__all__", ()):
+                    raise ValueError(
+                        f"{shown(part)} is not a type that an imported module has, such as typing.Optional"
+                    )
         if isinstance(part, ast.BinOp) and not isinstance(part.op, ast.BitOr):
             raise ValueError("only | may join types")
         if isinstance(part, ast.UnaryOp) and not isinstance(part.op, ast.USub):
             raise ValueError("only a minus sign may stand before a number")
 
-    expression = ast.fix_missing_locations(ast.Expression(body=node))
     try:
+        expression = ast.fix_missing_locations(ast.Expression(body=node))
         # Nothing in it can call anything, and there are no builtins for a name to reach
         return eval(compile(expression, "<type hint>", "eval"), {"__builtins__": {}}, names)  # noqa: S307
     except NameError as error:
@@ -362,19 +379,19 @@ def read_signature(function: ast.FunctionDef, names: dict[str, Any]) -> tuple[in
             annotation = hint_value(argument.annotation, names)
         except ValueError as error:
             problems.append(
-                f"The type hint of parameter {argument.arg}, {ast.unparse(argument.annotation)}, cannot be used: "
+                f"The type hint of parameter {argument.arg}, {shown(argument.annotation)}, cannot be used: "
                 f"{error}. {HINT_ADVICE}"
             )
             return None
         if (why := not_json(annotation)) is not None:
             problems.append(
-                f"The type hint of parameter {argument.arg}, {ast.unparse(argument.annotation)}, cannot be used: "
+                f"The type hint of parameter {argument.arg}, {shown(argument.annotation)}, cannot be used: "
                 f"{why}. {HINT_ADVICE}"
             )
             return None
         if default is not None and any(isinstance(part, ast.Call) for part in ast.walk(default)):
             problems.append(
-                f"The default of parameter {argument.arg}, {ast.unparse(default)[:60]}, is computed when the file is "
+                f"The default of parameter {argument.arg}, {shown(default, 60)}, is computed when the file is "
                 "imported, once, not each time the function is called. Default it to None and compute it inside."
             )
             return None
@@ -484,7 +501,7 @@ def import_problems(tree: ast.Module) -> list[str]:
     for statement in module_level(tree.body):
         if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
             problems.append(
-                f"Line {statement.lineno} runs {ast.unparse(statement.value)[:60]} at the top level, so importing "
+                f"Line {statement.lineno} runs {shown(statement.value, 60)} at the top level, so importing "
                 "the file runs it. Importing must only define things: put it under `if __name__ == '__main__':`."
             )
         elif isinstance(statement, ast.For | ast.While):

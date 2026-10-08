@@ -172,7 +172,7 @@ def command_generate(arguments: argparse.Namespace) -> int:
         if result.status == FAILED:
             print(f"  Failed: {result.name}: {result.error}")
 
-    return 0 if report.stopped is None else 1
+    return 0 if report.stopped is None and report.failed == 0 else 1
 
 
 def command_list(arguments: argparse.Namespace) -> int:
@@ -198,7 +198,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     :param argv: The arguments, defaulting to the command line's.
     :return: The exit status: 0 when it did everything asked, 1 when a run stopped early, for a
-        limit or a run of failures, 2 when it failed with an error, and 130 when it was interrupted.
+        limit or a run of failures, or a function could not be written, 2 when it failed with an
+        error, and 130 when it was interrupted.
     """
     arguments = build_parser().parse_args(argv)
 

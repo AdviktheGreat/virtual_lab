@@ -1,5 +1,6 @@
 """Tests for reading a function that a model wrote, without running it."""
 
+import ast
 import inspect
 import re
 import sys
@@ -17,6 +18,7 @@ from virtual_lab.function_checks import (
     fenced_blocks,
     read_function,
     script_name,
+    shown,
 )
 
 GOOD = '''
@@ -412,6 +414,84 @@ class TestWhatIsWrongWithAFunction:
     )
     def test_hints_from_typing_are_read_however_they_are_imported_or_written(self, hint: str, extra: str) -> None:
         assert read_function(function_with(f"x: {hint}", extra=extra), "count_reads")
+
+    @pytest.mark.parametrize(
+        ("hint", "extra"),
+        [
+            ("typing.sys.modules['os'].environ['VL_SECRET']", "import typing\n"),
+            ("t.sys.modules['os'].environ['VL_SECRET']", "import typing as t\n"),
+            ("sys.modules['os'].environ['VL_SECRET']", "from typing import sys\n"),
+            ("sys.modules['os'].environ['VL_SECRET']", "from typing import *\n"),
+            ('\'typing.sys.modules["os"].environ["VL_SECRET"]\'', "import typing\n"),
+            ("Optional.__args__", "from typing import Optional\n"),
+        ],
+    )
+    def test_a_hint_cannot_reach_the_rest_of_the_process_through_a_module_and_nothing_of_it_is_shown(
+        self, hint: str, extra: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("VL_SECRET", "hunter2")
+
+        (problem,) = problems_of(function_with(f"x: {hint}", extra=extra))
+
+        assert "hunter2" not in problem
+
+    @pytest.mark.parametrize(
+        ("hint", "extra"),
+        [
+            ("typing.sys", "import typing\n"),
+            ("typing.os", "import typing\n"),
+            ("t.sys", "import typing as t\n"),
+            ("typing.Optional.copy_with", "import typing\n"),
+            ("str.join", ""),
+            ("list.append", ""),
+            ("a.b.c", ""),
+        ],
+    )
+    def test_an_attribute_that_a_module_does_not_export_as_a_type_is_refused_with_what_to_use(
+        self, hint: str, extra: str
+    ) -> None:
+        (problem,) = problems_of(function_with(f"x: {hint}", extra=extra))
+
+        assert "is not a type that an imported module has, such as typing.Optional" in problem
+
+    def test_a_name_that_typing_does_not_export_is_not_taken_from_it(self) -> None:
+        (problem,) = problems_of(function_with("x: sys", extra="from typing import sys\n"))
+
+        assert "sys is not one of the types a tool takes" in problem
+
+    def test_what_typing_exports_is_taken_from_it_by_name_alias_or_star(self) -> None:
+        for hint, extra in [
+            ("Optional[str]", "from typing import Optional\n"),
+            ("Opt[str]", "from typing import Optional as Opt\n"),
+            ("Optional[str]", "from typing import *\n"),
+            ("typing.Optional[typing.List[str]]", "import typing\n"),
+            ("typing.Optional[str]", "import typing as typing\n"),
+        ]:
+            assert read_function(function_with(f"x: {hint}", extra=extra), "count_reads")
+
+    @pytest.mark.parametrize(
+        "hint",
+        ["-" * 3000 + "1", "-" * 90_000 + "1", "not " * 20_000 + "1", "a" + ".a" * 30_000, "1" + "|1" * 40_000],
+        ids=["minus-3000", "minus-90000", "not-20000", "attribute-30000", "union-40000"],
+    )
+    def test_a_hint_written_as_a_string_too_deep_to_read_is_a_problem_and_not_an_error(self, hint: str) -> None:
+        (problem,) = problems_of(function_with(f"x: {hint!r}"))
+
+        assert problem.startswith("The type hint of parameter x, '") and "cannot be used" in problem
+        assert len(problem) < 800
+
+    def test_a_hint_in_a_string_that_is_not_python_is_cut_short_in_the_problem(self) -> None:
+        (problem,) = problems_of(function_with(f"x: {'(' + 'a' * 500!r}"))
+
+        assert "is not a type" in problem and "a" * 100 not in problem
+
+    def test_code_too_deep_to_write_out_is_shown_as_such(self) -> None:
+        deep: ast.expr = ast.Constant(1)
+        for _ in range(5000):
+            deep = ast.UnaryOp(ast.USub(), deep)
+
+        assert shown(deep) == "<code nested too deeply to show>"
+        assert shown(ast.parse("a.b(c)", mode="eval").body, 3) == "a.b"
 
     def test_a_hint_that_calls_something_is_refused_and_not_run(self, tmp_path: Path) -> None:
         marker = tmp_path / "ran"
