@@ -120,10 +120,23 @@ class PaperReadingError(RuntimeError):
 
 
 class PaperBudgetExceededError(BudgetExceededError):
-    """Raised before a request that the limit on reading papers leaves no room for."""
+    """Raised before a request that the limit on reading papers leaves no room for.
 
-    def __init__(self, spent: float, limit: float) -> None:
+    :param findings: What the chunks read so far showed, merged but not filtered, or None if no
+        chunk had been read. It has been paid for, so it is kept.
+    :param usage: What this reading used before it stopped.
+    """
+
+    def __init__(
+        self,
+        spent: float,
+        limit: float,
+        findings: PaperFindings | None = None,
+        usage: MeetingUsage | None = None,
+    ) -> None:
         super().__init__(spent=spent, limit=limit, what="reading")
+        self.findings = findings
+        self.usage = usage
 
 
 @dataclass
@@ -252,13 +265,15 @@ def split_text(
 
 
 def truncate_text(text: str, max_chars: int) -> str:
-    """Cuts a text to at most max_chars, at the last end of a sentence, or failing that the last
-    space, so that it does not stop in the middle of a word or a number."""
+    """Cuts a text to at most max_chars, at the last end of a sentence in its second half, or
+    failing that the last space, so that it does not stop in the middle of a word or a number."""
     if len(text) <= max_chars:
         return text
 
     head = text[:max_chars]
-    sentence_ends = [match.end() for match in re.finditer(r"[.!?](?=\s)", head)]
+    # Only a sentence end in the second half counts, so that an 'e.g.' near the start of a text
+    # without other full stops does not cut it to a few words
+    sentence_ends = [match.end() for match in re.finditer(r"[.!?](?=\s)", head) if match.end() >= max_chars / 2]
     if sentence_ends:
         return head[: sentence_ends[-1]]
 
@@ -268,8 +283,12 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 
 def normalize_name(name: str) -> str:
-    """A name as it is compared, so that 'DESeq2', 'deseq2 ', and 'Deseq-2' are not three."""
-    return re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    """A name as it is compared, so that 'DESeq2', 'deseq2 ', and 'Deseq-2' are not three.
+
+    Case, spaces, and punctuation do not tell names apart, but letters in any script do, and so
+    do + and #, so that C, C++, and C# stay three.
+    """
+    return re.sub(r"[^\w+#]|_", "", name.casefold())
 
 
 def fill_blanks(kept: BaseModel, other: BaseModel) -> BaseModel:
@@ -395,7 +414,7 @@ def read_paper(path: Path | str) -> str:
     :param path: The file.
     :raises FileNotFoundError: If there is no such file.
     :raises ValueError: If the file is not a type this reads, is too large, or is a PDF that
-        cannot be read, or that is encrypted or has more than MAX_PAPER_PAGES pages.
+        cannot be read, or that needs a password or has more than MAX_PAPER_PAGES pages.
     :raises ImportError: If it is a PDF and pypdf is not installed.
     :return: The text.
     """
@@ -431,7 +450,14 @@ def pdf_text(data: bytes, name: str = "the PDF") -> str:
     except Exception as error:
         raise ValueError(f"{name} could not be read as a PDF: {error}") from error
     if encrypted:
-        raise ValueError(f"{name} is encrypted, so its text cannot be read")
+        # Many publishers lock a PDF against copying and printing only, which needs no password
+        # to open, so only a PDF that asks for one is refused
+        try:
+            opened = reader.decrypt("")
+        except Exception as error:
+            raise ValueError(f"{name} is encrypted and could not be opened: {error}") from error
+        if not opened:
+            raise ValueError(f"{name} needs a password, so its text cannot be read")
 
     try:
         pages = len(reader.pages)
@@ -466,7 +492,9 @@ def extract_paper_findings(
     The text is cut into chunks, each is read, and the findings of all of them are merged, one
     to each name, and consolidated by one more request that applies the same filter to the
     paper as a whole. If the findings are too many for one request they are consolidated in
-    batches, and then those results again.
+    batches, and then those results again, until they fit one request, or stop getting smaller,
+    or MAX_CONSOLIDATION_PASSES passes are made. In the last two cases what the last pass
+    returned is the result, which may not have been consolidated as a whole.
 
     A chunk the model cannot answer, because it refuses or its answer does not fit the schema,
     is left out and recorded in failed_chunks, so that one chunk does not cost the paper; if
@@ -489,10 +517,11 @@ def extract_paper_findings(
     :param on_progress: Called with a line saying what is being done, before each request.
     :raises ValueError: If the text is empty, or a size is out of range, or the model is not
         priced and max_cost is given.
-    :raises PaperBudgetExceededError: Before a request, if max_cost has been reached.
-    :raises CostUnknownError: If max_cost is given and a response's usage was not reported.
-    :raises PaperReadingError: If no chunk could be read, or the consolidation failed, in which
-        case the error holds the merged findings.
+    :raises PaperBudgetExceededError: Before a request, if max_cost has been reached. It holds
+        the findings of the chunks read so far, unfiltered.
+    :raises PaperReadingError: If no chunk could be read, or the consolidation failed, or a
+        response did not report its usage so that max_cost could no longer be enforced. In the
+        last two cases the error holds the merged findings of the chunks, unfiltered.
     :return: What was found, and what it took.
     """
     if max_chars is not None and max_chars < 1:
@@ -552,6 +581,16 @@ def extract_paper_findings(
 
         return found
 
+    def stopped(error: PaperBudgetExceededError | CostUnknownError, found: PaperFindings | None) -> Exception:
+        if isinstance(error, PaperBudgetExceededError):
+            return PaperBudgetExceededError(error.spent, error.limit, findings=found, usage=own)
+
+        return PaperReadingError(
+            f"A response did not report what it used, so max_cost cannot be enforced: {error}",
+            findings=found,
+            usage=own,
+        )
+
     read: list[PaperFindings] = []
     failed: dict[int, str] = {}
     for number, chunk in enumerate(chunks, 1):
@@ -562,6 +601,8 @@ def extract_paper_findings(
             )
         except StructuredOutputError as error:
             failed[number] = str(error)[:MAX_FAILURE_CHARS]
+        except (PaperBudgetExceededError, CostUnknownError) as error:
+            raise stopped(error, merge_findings(read) if read else None) from error
 
     if len(failed) == len(chunks):
         raise PaperReadingError(
@@ -576,7 +617,7 @@ def extract_paper_findings(
                 ask(CONSOLIDATION_PROMPT, f"EXTRACTED INFORMATION FROM PAPER CHUNKS:\n{batch.model_dump_json()}")
                 for batch in batches
             )
-            if len(batches) == 1 or size_of(consolidated) >= size_of(findings):
+            if len(batches) == 1 or consolidated.is_empty() or size_of(consolidated) >= size_of(findings):
                 return consolidated
             findings = consolidated
 
@@ -592,6 +633,8 @@ def extract_paper_findings(
             raise PaperReadingError(
                 f"The findings of the chunks could not be consolidated: {error}", findings=merged, usage=own
             ) from error
+        except (PaperBudgetExceededError, CostUnknownError) as error:
+            raise stopped(error, merged) from error
 
     return PaperReading(
         findings=findings,

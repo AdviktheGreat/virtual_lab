@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from virtual_lab import papers
 from virtual_lab.papers import (
@@ -141,13 +141,26 @@ class TestTruncateText:
 
         assert cut == "The cutoff was"
 
+    def test_a_sentence_end_near_the_start_is_not_where_a_long_text_is_cut(self) -> None:
+        text = "See e.g. " + "word " * 20
+
+        cut = truncate_text(text, 60)
+
+        assert len(cut) > 50 and cut.endswith("word")
+
     def test_a_text_with_no_sentence_or_space_is_cut_where_it_must_be(self) -> None:
         assert truncate_text("x" * 40, 10) == "x" * 10
 
 
 class TestMerging:
     def test_names_are_compared_without_case_or_punctuation(self) -> None:
-        assert normalize_name(" DESeq-2 ") == normalize_name("deseq 2") == "deseq 2"
+        assert normalize_name(" DESeq-2 ") == normalize_name("deseq 2") == normalize_name("DESEQ2") == "deseq2"
+
+    def test_names_in_any_script_are_kept_and_c_and_its_successors_are_not_one(self) -> None:
+        assert normalize_name("β-catenin") == "βcatenin" != normalize_name("beta-catenin")
+        assert normalize_name("遺伝子") == "遺伝子"
+        assert len({normalize_name(name) for name in ["C", "C++", "C#"]}) == 3
+        assert normalize_name("...") == normalize_name("_") == ""
 
     def test_one_item_is_kept_for_each_name_and_the_first_is_as_written(self) -> None:
         merged = merge_findings(
@@ -291,8 +304,20 @@ class TestReadPaper:
         writer.write(output)
         (tmp_path / "paper.pdf").write_bytes(output.getvalue())
 
-        with pytest.raises(ValueError, match="encrypted"):
+        with pytest.raises(ValueError, match="needs a password"):
             read_paper(tmp_path / "paper.pdf")
+
+    def test_a_pdf_locked_only_against_copying_is_read(self, tmp_path: Path) -> None:
+        pytest.importorskip("cryptography")
+        from pypdf import PdfReader, PdfWriter
+
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(pdf_of("Open text"))))
+        writer.encrypt("", owner_password="owner", algorithm="AES-256")
+        output = io.BytesIO()
+        writer.write(output)
+        (tmp_path / "paper.pdf").write_bytes(output.getvalue())
+
+        assert "Open text" in read_paper(tmp_path / "paper.pdf")
 
     def test_a_pdf_with_more_pages_than_a_paper_has_is_refused(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -461,6 +486,15 @@ class TestExtractPaperFindings:
         assert all(size_of(batch) <= 2_000 for batch in asked[:3])
         assert [item.task_name for item in asked[3].tasks] == ["Task 0", "Task 1"]
 
+    def test_batches_that_leave_nothing_are_not_asked_about_again(self, fake_client: FakeClient) -> None:
+        many = findings([task(f"Task {number}", description="d" * 400) for number in range(8)])
+        queue(fake_client, many, findings(), findings(), findings(), findings(), findings())
+
+        reading = read(fake_client, max_consolidation_chars=2_000)
+
+        assert len(fake_client.completions.parse_calls) == 6
+        assert reading.findings.is_empty()
+
     def test_batches_that_do_not_make_the_findings_smaller_are_not_asked_again(self, fake_client: FakeClient) -> None:
         many = findings([task(f"Task {number}", description="d" * 400) for number in range(8)])
         queue(fake_client, many, findings(), findings(), many, many, many)
@@ -537,6 +571,39 @@ class TestBudget:
 
         assert len(fake_client.completions.parse_calls) == 1
         assert caught.value.spent == pytest.approx(0.0025) and caught.value.limit == 0.002
+        assert caught.value.findings == DESEQ and caught.value.usage.num_calls == 1
+
+    def test_a_limit_met_before_any_chunk_is_read_leaves_no_findings(self, fake_client: FakeClient) -> None:
+        with pytest.raises(PaperBudgetExceededError) as caught:
+            read(fake_client, max_cost=0.0)
+
+        assert caught.value.findings is None and caught.value.usage.num_calls == 0
+
+    def test_a_limit_met_in_the_consolidation_keeps_what_the_chunks_found(self, fake_client: FakeClient) -> None:
+        first = findings([task("STAR alignment")])
+        second = findings([task("DESeq2 analysis")])
+        queue(fake_client, first, second, findings(databases=[database("GEO")]), DESEQ, usage=self.big())
+
+        with pytest.raises(PaperBudgetExceededError) as caught:
+            read(fake_client, max_cost=0.0075)
+
+        assert len(fake_client.completions.parse_calls) == 3
+        assert caught.value.findings == merge_findings([first, second, findings(databases=[database("GEO")])])
+        assert caught.value.usage.num_calls == 3
+
+    def test_a_response_that_does_not_say_what_it_used_stops_a_limited_reading_with_the_findings(
+        self, fake_client: FakeClient
+    ) -> None:
+        # A schema's own validators fail inside the SDK, before there is a response to count
+        with pytest.raises(ValidationError) as invalid:
+            PaperFindings.model_validate({})
+        queue(fake_client, DESEQ, invalid.value, DESEQ)
+
+        with pytest.raises(PaperReadingError, match="did not report what it used") as caught:
+            read(fake_client, max_cost=1.0)
+
+        assert caught.value.findings == DESEQ and caught.value.usage.num_calls == 2
+        assert len(fake_client.completions.parse_calls) == 2
 
     def test_reading_stops_when_the_limit_is_reached_exactly(self, fake_client: FakeClient) -> None:
         queue(fake_client, DESEQ, DESEQ, DESEQ, DESEQ, usage=self.big())
