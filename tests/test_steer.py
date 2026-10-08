@@ -224,6 +224,18 @@ class TestPausingAndStopping:
 
         assert fake_client.completions.calls == []
 
+    def test_no_agent_may_take_the_title_notes_are_given_under(
+        self, fake_client: FakeClient, team_lead: Agent, tmp_path: Path
+    ) -> None:
+        human = Agent(title=HUMAN_SPEAKER, expertise="x", goal="y", role="z", model=team_lead.model)
+
+        with pytest.raises(ValueError, match="Human researcher is the title of notes"):
+            team(team_lead, human, tmp_path)
+        with pytest.raises(ValueError, match="Human researcher is the title of notes"):
+            individual(human, tmp_path)
+
+        assert fake_client.completions.calls == []
+
     def test_steer_must_be_a_function(self, fake_client: FakeClient, team_member: Agent, tmp_path: Path) -> None:
         with pytest.raises(TypeError, match="steer is a function"):
             individual(team_member, tmp_path, steer="Focus on stability.")

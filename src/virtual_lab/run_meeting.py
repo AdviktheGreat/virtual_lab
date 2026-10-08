@@ -335,6 +335,10 @@ def hold_meeting(
         meeting_critic = critic if critic is not None else SCIENTIFIC_CRITIC.with_model(team_member.model)
         team = [team_member, meeting_critic]
 
+    # Notes are told apart from what agents say by who they are from, in a transcript without a record
+    if any(agent.title == HUMAN_SPEAKER for agent in team):
+        raise ValueError(f"{HUMAN_SPEAKER} is the title of notes given through steer, so no agent may have it")
+
     # Set up tools, keeping pubmed_search as a shorthand for including the PubMed tool
     meeting_tools = tools
 

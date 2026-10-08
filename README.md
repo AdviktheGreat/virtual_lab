@@ -167,7 +167,7 @@ def steer(turn: NextTurn) -> str | None:
 hold_meeting(..., steer=steer)
 ```
 
-- A note is added to the discussion after the agent's prompt, introduced as from the human researcher overseeing the meeting, so the agent about to speak reads it last, and everyone after it reads it too. It is kept in the transcript as from `Human researcher`, with the kind `note` in the record and in the `message` event, and saved documents show it. A note that is empty or only spaces is not added.
+- A note is added to the discussion after the agent's prompt, introduced as from the human researcher overseeing the meeting, so the agent about to speak reads it last, and everyone after it reads it too. It is kept in the transcript as from `Human researcher`, with the kind `note` in the record and in the `message` event, and saved documents show it, so no agent may have that title. A note that is empty or only spaces is not added.
 - The meeting waits while `steer` does, which is how it is paused: a function that waits for a person to resume holds the meeting before the turn, with nothing sent. `steer` is asked only between turns, so an agent running code or calling tools finishes its turn first.
 - An exception `steer` raises stops the meeting the way any other failure does, saving what was done under `save_dir/partial/`.
 - `Project` takes `steer` as an option for its meetings, which with `run_project` includes the meetings in which the team lead decides each step, so a note can reach the team lead before its next decision. Like `on_event`, it does not make a finished meeting a different one: what was said is in the meeting's transcript, and a project carried on reads it back.
