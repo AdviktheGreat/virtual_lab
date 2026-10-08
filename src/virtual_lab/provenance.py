@@ -74,8 +74,10 @@ class TurnRecord:
     across the calls that produced it.
 
     :param index: The turn's position in the transcript, matching the transcript's own ordering.
-    :param speaker: The title of whoever produced the turn, or "User" or "Tool".
-    :param kind: Whether the turn is a prompt, an agent's response, or tool output.
+    :param speaker: The title of whoever produced the turn, or "User", "Tool", "Session", or
+        "Human researcher".
+    :param kind: Whether the turn is a prompt, a note a person gave through steer, an agent's
+        response, its code, or what tools or code returned.
     :param timestamp: When the turn was recorded.
     :param name: The agent's author name, or None for prompts and tool output.
     :param model: The model that produced the turn, or None for prompts and tool output.

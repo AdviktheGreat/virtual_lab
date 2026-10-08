@@ -72,8 +72,11 @@ REPAIR_OPTIONS = frozenset(
 )
 
 # Options that decide what a step costs, how it is sent, or who is told of it as it goes, not what
-# it produces, so changing one does not make a finished step a different step
-NOT_INPUTS = frozenset({"max_cost", "on_usage", "before_request", "max_retries", "chat_model", "on_event", "stream"})
+# it is asked, so changing one does not make a finished step a different step. A person steering
+# a meeting can change what it produces, but what they said is in its transcript
+NOT_INPUTS = frozenset(
+    {"max_cost", "on_usage", "before_request", "max_retries", "chat_model", "on_event", "stream", "steer"}
+)
 
 
 class ProjectBudgetExceededError(BudgetExceededError):

@@ -109,6 +109,9 @@ TOKENS_PER_MESSAGE = 4
 # The API caps message author names at 64 characters
 MAX_AGENT_NAME_LENGTH = 64
 
+# Who a note given through a meeting's steer is from, in its transcript
+HUMAN_SPEAKER = "Human researcher"
+
 # Subdirectory for the transcript of a meeting that failed partway through. Kept out of the
 # meeting's own directory so that globs over finished meetings cannot match it.
 PARTIAL_MEETING_DIR_NAME = "partial"
