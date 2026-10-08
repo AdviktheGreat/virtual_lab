@@ -77,6 +77,15 @@ from virtual_lab.evaluation import (
     run_benchmark,
 )
 from virtual_lab.events import MeetingEvent, ProjectEvent
+from virtual_lab.export import (
+    PDFExportError,
+    meeting_html,
+    project_html,
+    save_meeting_html,
+    save_meeting_pdf,
+    save_project_html,
+    save_project_pdf,
+)
 from virtual_lab.execution import (
     DockerExecutor,
     DockerUnavailableError,
@@ -257,6 +266,7 @@ __all__ = [
     "MemoryEntry",
     "NextStep",
     "PDB_LOOKUP_TOOL",
+    "PDFExportError",
     "PUBCHEM_LOOKUP_TOOL",
     "PUBMED_TOOL",
     "PlanTask",
@@ -337,6 +347,8 @@ __all__ = [
     "list_data_files",
     "load_env",
     "load_know_how",
+    "meeting_html",
+    "project_html",
     "request_json",
     "request_text",
     "run_benchmark",
@@ -347,6 +359,10 @@ __all__ = [
     "sandbox_image",
     "save_artifacts",
     "save_execution_record",
+    "save_meeting_html",
+    "save_meeting_pdf",
+    "save_project_html",
+    "save_project_pdf",
     "search_articles",
     "search_drugs",
     "search_preprints",

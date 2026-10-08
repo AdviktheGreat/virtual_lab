@@ -22,6 +22,8 @@ dependencies = [
     "langchain-anthropic>=1.0",
     "langchain-core>=1.0",
     "langchain-openai>=1.0",
+    # Renders what the agents write as HTML, for meetings and projects saved as documents
+    "markdown-it-py>=3.0",
     "notebook",
     # parse on chat.completions outside beta, and the finish-reason errors carrying the response
     "openai>=1.92",
@@ -61,6 +63,9 @@ eval = ["numpy", "pandas", "pyarrow"]
 # Tools from MCP servers, with connect_mcp, and tools served over MCP, with serve_mcp and
 # virtual-lab-mcp. PyYAML reads Biomni's YAML configs
 mcp = ["mcp>=2.3,<3", "PyYAML"]
+# Meetings and projects saved as PDFs, as Biomni saves its conversations. WeasyPrint also needs
+# the Pango library, which pip cannot install
+pdf = ["weasyprint>=66"]
 nanobody-design = [
     "biopython",
     "pandas",
@@ -72,7 +77,9 @@ nanobody-design = [
 dev = [
     "pytest",
     # Every extra the tests use, so that none of them is skipped or fails for want of a package
-    "virtual-lab[bedrock,eval,mcp,ollama]",
+    "virtual-lab[bedrock,eval,mcp,ollama,pdf]",
+    # Reads back the PDFs the tests make
+    "pypdf",
 ]
 
 [project.scripts]
