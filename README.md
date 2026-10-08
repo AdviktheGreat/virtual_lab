@@ -598,6 +598,16 @@ run_benchmark(hle, TeamMeeting(principal_investigator, (geneticist, scientific_c
 
 Code written against Biomni's own classes runs against these: `BiomniEval1` has the methods of Biomni's (`evaluate`, `get_instance`, `list_tasks`, `get_task_stats`, `batch_evaluate`, `get_instances_by_task`), and `LabBench` and `HumanitysLastExam` have `get_example`, `get_iterator`, `evaluate`, and `output_class`.
 
+`tests/test_benchmark_parity.py` checks this against Biomni's own classes, on the real files: the same questions, prompts, answers, tables, and schemas, and the same score for over 7,000 answers to Biomni-Eval1 (the right answer written several ways, and many that are wrong or are not answers), and the same measures for LAB-Bench and Humanity's Last Exam answers. It is skipped unless it is told where the files and a clone of Biomni are, and scikit-learn, which Biomni's scoring uses, is installed:
+
+```bash
+pip install scikit-learn
+git clone https://github.com/snap-stanford/Biomni
+VIRTUAL_LAB_BENCHMARK_DIR=data/benchmarks VIRTUAL_LAB_BIOMNI_DIR=Biomni pytest tests/test_benchmark_parity.py
+```
+
+The one difference found: when a model refuses every LAB-Bench question, Biomni's precision is the mean of nothing, which current scikit-learn raises on, and here it is `None`.
+
 ## Querying scientific databases
 
 Tools that look something up go through `virtual_lab.web`, which decides where a request may be sent. An agent chooses the arguments to a tool, which means a model's output determines part of every URL, so the destination cannot be left to the tool:
