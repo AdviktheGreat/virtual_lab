@@ -12,8 +12,8 @@ at any time, including one that failed, from what it left under partial/. A tran
 before meetings kept records, as the Virtual Lab's original ones were, is exported from the
 transcript alone.
 
-Markdown is rendered without the HTML it may hold, and the PDF is made without fetching anything:
-figures are embedded in the document, and an image an agent linked to on the web is left out.
+Markdown is rendered without the HTML it may hold, and neither the HTML nor the PDF fetches anything:
+figures are embedded in the document, and an image an agent linked to on the web is shown as a link.
 """
 
 import base64
@@ -116,7 +116,20 @@ def load_meeting(transcript_path: Path) -> SavedMeeting:
 def markdown_renderer() -> Any:
     from markdown_it import MarkdownIt
 
-    return MarkdownIt("commonmark", {"html": False, "breaks": False}).enable(["table", "strikethrough"])
+    renderer = MarkdownIt("commonmark", {"html": False, "breaks": False}).enable(["table", "strikethrough"])
+    renderer.add_render_rule("image", render_image)
+    return renderer
+
+
+def render_image(self: Any, tokens: list[Any], idx: int, options: Any, env: Any) -> str:
+    """An image embedded in the Markdown is shown, and one elsewhere is linked to, so opening the
+    document never fetches anything."""
+    token = tokens[idx]
+    source = str(token.attrGet("src") or "")
+    alt = self.renderInlineAsText(token.children or [], options, env)
+    if source.startswith("data:"):
+        return f'<img src="{escape(source)}" alt="{escape(alt)}">'
+    return f'<a href="{escape(source)}">{escape(alt or source)}</a>'
 
 
 def markdown(text: str) -> str:
@@ -263,6 +276,7 @@ th { color: #6b665c; font-weight: 600; }
 td.number, th.number { text-align: right; font-variant-numeric: tabular-nums; }
 figure { margin: 10px 0; break-inside: avoid; }
 figure img { max-width: 100%; max-height: 120mm; border: 1px solid #e3ddcf; border-radius: 4px; background: white; }
+.body img { max-width: 100%; max-height: 120mm; }
 figcaption { font-size: 8pt; color: #6b665c; margin-top: 3px; }
 ul.plan { list-style: none; padding-left: 0; }
 ul.plan li::before { display: inline-block; width: 1.6em; font-family: "DejaVu Sans", sans-serif; }
@@ -397,8 +411,10 @@ def meeting_body(meeting: SavedMeeting, include_prompts: bool, max_output_chars:
     if responses:
         summary = meeting.transcript[responses[-1]]
         colour = colours.get(summary["agent"], AGENT_COLOURS[0])
+        # A meeting that stopped never reached its summary; a transcript without a record did
+        title = "Summary" if status in (None, "completed") else "Last said before it stopped"
         parts.append(
-            f'<h{sub}>Summary</h{sub}><div class="turn" style="--colour: {colour}">'
+            f'<h{sub}>{title}</h{sub}><div class="turn" style="--colour: {colour}">'
             f'<div class="speaker">{escape(summary["agent"])}</div>'
             f'<div class="body">{markdown(summary["message"])}</div></div>'
         )

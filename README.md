@@ -167,7 +167,7 @@ save_project_pdf("project", meetings=True)             # project/report.pdf
 - A PDF needs WeasyPrint, which `pip install "virtual-lab[pdf]"` installs, and the Pango library it draws text with, which pip cannot: `brew install pango` on macOS, or `apt install libpango-1.0-0 libpangoft2-1.0-0` on Debian and Ubuntu. Without them a PDF is refused with `PDFExportError`, saying what to install, and HTML can still be saved.
 - Everything is read from what was saved, so any meeting can be saved as a document at any time, including one that failed, from `partial/`, and a transcript saved before meetings kept records, which is shown from the transcript alone.
 - The prompts each agent was given are left out, since the agenda stands for them; `include_prompts=True` shows them. A tool's or the session's output is cut to `max_output_chars`, 6,000 characters by default, from the middle.
-- What the agents wrote is rendered as Markdown, with any HTML in it shown as text, and the document carries its figures, so a PDF is made without fetching anything: an image an agent linked to, on the web or on disk, is left out. A figure is read only from the session's own directory.
+- What the agents wrote is rendered as Markdown, with any HTML in it shown as text, and the document carries its figures, so neither the HTML nor the PDF fetches anything: an image an agent linked to, on the web or on disk, is shown as a link to it. A figure is read only from the session's own directory.
 - `meeting_html` and `project_html` return the document rather than saving it.
 
 

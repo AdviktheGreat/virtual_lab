@@ -369,6 +369,26 @@ class TestMeetings:
         assert "Chemist &lt;b onmouseover=&quot;x&quot;&gt;" in body
         assert "<title>Discussion</title>" in document
 
+    def test_images_an_agent_linked_to_are_shown_as_links_rather_than_loaded(
+        self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
+    ) -> None:
+        pixel = f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
+        fake_client.completions.responses = [
+            text_response(
+                f'See ![a "plot"](http://example.org/plot.png), ![](https://example.org/b.png), ![dot]({pixel}), '
+                "and ![x](javascript:alert(1))."
+            ),
+        ]
+        result = individual(team_member, tmp_path, num_rounds=0)
+
+        body = meeting_html(result.transcript_path).split("</style>", 1)[1]
+
+        assert "<img" in body and f'<img src="{pixel}" alt="dot">' in body
+        assert 'src="http' not in body
+        assert '<a href="http://example.org/plot.png">a &quot;plot&quot;</a>' in body
+        assert "javascript:" not in body.replace("![x](javascript:alert(1))", "")
+        assert '<a href="https://example.org/b.png">https://example.org/b.png</a>' in body
+
     def test_a_failed_meeting_is_shown_with_what_stopped_it(
         self, fake_client: FakeClient, team_member: Agent, tmp_path: Path
     ) -> None:
@@ -385,11 +405,16 @@ class TestMeetings:
         with pytest.raises(RuntimeError):
             individual(team_member, tmp_path, num_rounds=1, on_event=on_event)
 
-        text = text_of(meeting_html(tmp_path / "partial" / "discussion.json"))
+        document = meeting_html(tmp_path / "partial" / "discussion.json")
+        text = text_of(document)
 
-        assert "failed" in text
+        assert '<span class="badge bad">failed</span>' in document
         assert "The meeting stopped with RuntimeError: the lab lost power" in text
-        assert "A first answer." in text
+        # What was said last is not the meeting's summary, since it never reached one
+        assert "<h2>Summary</h2>" not in document
+        assert section(document, "Last said before it stopped") == (
+            f"Last said before it stopped {team_member.title} A first answer."
+        )
 
     def test_a_transcript_without_a_record_is_shown_from_the_transcript_alone(self, tmp_path: Path) -> None:
         transcript = [
