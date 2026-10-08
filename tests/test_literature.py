@@ -442,6 +442,20 @@ class TestReadingAFullText:
 
         return get_article_text("PMC3258128")
 
+    def test_a_full_text_that_names_its_dtd_as_jats_articles_do_is_read(self, web_transport) -> None:
+        declared = JATS.replace("?>", "?>\n" + TestRefusingAnUnsafeDocument.JATS_DECLARATION, 1)
+
+        text = self.read(web_transport, xml=declared)
+
+        assert [heading for heading, _ in text.sections] == ["Abstract", "INTRODUCTION", "RESULTS"]
+
+    def test_a_full_text_that_declares_entities_is_still_refused(self, web_transport) -> None:
+        declaration = '<!DOCTYPE article PUBLIC "-//NLM//DTD JATS//EN" "x.dtd" [<!ENTITY a "AAAA">]>'
+        bomb = JATS.replace("?>", f"?>\n{declaration}", 1)
+
+        with pytest.raises(WebRequestError, match="document type"):
+            self.read(web_transport, xml=bomb)
+
     def test_the_sections_worth_reading_are_kept(self, web_transport) -> None:
         text = self.read(web_transport)
 
@@ -533,6 +547,61 @@ class TestRefusingAnUnsafeDocument:
     def test_an_entity_declaration_without_a_doctype_is_refused(self) -> None:
         with pytest.raises(WebRequestError, match="document type"):
             parse_xml('<feed><!entity a "b"></feed>', WebRequestError)
+
+    JATS_DECLARATION = (
+        '<!DOCTYPE article\n  PUBLIC "-//NLM//DTD JATS (Z39.96) Journal Archiving and Interchange DTD v1.4//EN" '
+        '"JATS-archivearticle1-4.dtd">'
+    )
+
+    def test_a_declaration_that_only_names_a_dtd_is_refused_unless_it_is_allowed(self) -> None:
+        body = f"{self.JATS_DECLARATION}\n<article><body/></article>"
+
+        with pytest.raises(WebRequestError, match="document type"):
+            parse_xml(body, WebRequestError)
+
+        root = parse_xml(body, WebRequestError, allow_external_doctype=True)
+        assert root.tag == "article" and root.find("body") is not None
+
+    @pytest.mark.parametrize(
+        "declaration",
+        [
+            '<!DOCTYPE article SYSTEM "article.dtd">',
+            "<!DOCTYPE article SYSTEM 'article.dtd'>",
+            "<!DOCTYPE article PUBLIC '-//NLM//DTD//EN' 'x.dtd'  >",
+            "<!DOCTYPE article>",
+            '<!DOCTYPE\tarticle\r\nPUBLIC\r\n"-//A//EN"\t"a.dtd"\n>',
+        ],
+    )
+    def test_each_way_of_naming_a_dtd_is_allowed_when_asked(self, declaration: str) -> None:
+        body = f'<?xml version="1.0"?>\n{declaration}\n<article>text</article>'
+
+        assert parse_xml(body, WebRequestError, allow_external_doctype=True).text == "text"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # An internal subset, which is where entities are declared, after an identifier or without one
+            '<!DOCTYPE a PUBLIC "-//A//EN" "a.dtd" [<!ENTITY x "y">]><a>&x;</a>',
+            '<!DOCTYPE a SYSTEM "a.dtd" []><a/>',
+            '<!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>',
+            "<!DOCTYPE a []><a/>",
+            # An identifier that holds a bracket or a tag, so that the match could not end where it should
+            '<!DOCTYPE a SYSTEM "a.dtd[" ><a/>',
+            '<!DOCTYPE a SYSTEM "a><!ENTITY x \'y\'>"><a/>',
+            '<!DOCTYPE a PUBLIC "-//A//EN" "a&b.dtd"><a/>',
+            # A second declaration, one in the wrong case, and an entity declaration with none
+            '<!DOCTYPE a SYSTEM "a.dtd"><!DOCTYPE a SYSTEM "b.dtd"><a/>',
+            '<!DOCTYPE a SYSTEM "a.dtd"><!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>',
+            '<!doctype a SYSTEM "a.dtd"><a/>',
+            '<!DOCTYPE a SYSTEM "a.dtd"><a><!ENTITY x "y"></a>',
+            # Words that are not the ones a declaration may use, and a public identifier with no system one
+            '<!DOCTYPE a PUBLIC "-//A//EN"><a/>',
+            '<!DOCTYPE a EXTERNAL "a.dtd"><a/>',
+        ],
+    )
+    def test_nothing_that_could_declare_an_entity_is_allowed_through_even_when_asked(self, body: str) -> None:
+        with pytest.raises(WebRequestError, match="document type"):
+            parse_xml(body, WebRequestError, allow_external_doctype=True)
 
     def test_an_ordinary_document_is_parsed(self) -> None:
         assert parse_xml("<feed><entry/></feed>", WebRequestError).tag == "feed"

@@ -616,3 +616,37 @@ MAX_CONSOLIDATION_PASSES = 4
 # of how long its text takes to extract, and no paper has more pages than this
 MAX_PAPER_FILE_BYTES = 100_000_000
 MAX_PAPER_PAGES = 500
+
+# The bioRxiv subjects that Biomni's process_all_subjects.py reads papers from, as bioRxiv names
+# them
+BIORXIV_SUBJECTS = (
+    "evolutionary biology",
+    "ecology",
+    "neuroscience",
+    "developmental biology",
+    "plant biology",
+    "microbiology",
+    "cancer biology",
+    "immunology",
+    "cell biology",
+    "biochemistry",
+    "genetics",
+    "bioinformatics",
+    "animal behavior and cognition",
+    "biophysics",
+    "genomics",
+    "systems biology",
+    "bioengineering",
+    "molecular biology",
+    "physiology",
+    "zoology",
+    "scientific communication and education",
+    "pathology",
+    "synthetic biology",
+    "paleontology",
+    "pharmacology and toxicology",
+)
+
+# The most pages of bioRxiv's listing to read for one request, at about 30 preprints a page, so
+# that a sample of a long interval cannot become thousands of requests
+MAX_BIORXIV_PAGES = 200

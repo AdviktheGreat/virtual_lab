@@ -671,7 +671,7 @@ def get_article_text(pmcid: str) -> ArticleText:
         )
 
     url = build_url(f"{EUROPE_PMC_BASE}/{{pmcid}}/fullTextXML", pmcid=article.pmcid)
-    root = parse_xml(request_text(url), WebRequestError)
+    root = parse_xml(request_text(url), WebRequestError, allow_external_doctype=True)
 
     sections: list[tuple[str, str]] = []
     skipped: list[str] = []
