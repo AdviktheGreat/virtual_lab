@@ -513,6 +513,40 @@ everything = read_biorxiv_subjects("runs/all", "2024-01-01", papers_per_subject=
 - **What it spends.** `--max-cost` is for the run, including every subject, and a paper it stops is left unsaved to be read next time. `--max-cost-per-paper` fails the paper that reaches it and goes on. Three failed papers in a row stop the run, since that is more likely a missing key or no network than three bad papers (`--max-consecutive-failures`, or `--keep-going`); a paper with no text to read does not count. A paper that fails after some chunks were read keeps what they showed in its result, unfiltered and not counted. The command exits 0 when it did everything, 1 when a run stopped early, 2 on an error, and 130 on Ctrl-C.
 - **What it writes.** In the run's directory: `results/<key>.json` for each paper, `report.json`, `run.json` (what it was read with), `tasks_summary.csv`, `databases_summary.csv`, and `software_summary.csv` with a row for each thing found in each paper, and `frequency_summary.json` with how many papers each name was found in, the most common first. Names are compared as `normalize_name` compares them, so `DESeq2` and `deseq2` are one, and one paper counts a name once. `combine` adds the counts of several runs into `combined_summary.json` and `tasks_frequency.csv`, `databases_frequency.csv`, and `software_frequency.csv`; a paper in two of them is counted twice. A cell that a spreadsheet would read as a formula, because a paper's text can make a model write `=...` or `@...`, is written with a leading quote.
 
+### Writing a function for each task
+
+Biomni turns the tasks its papers turn up into code. Its `FunctionGenerator` asks a model, as a senior Python engineer, for the code that does a task, keeps the first code block of the reply in a file named for the first six words of the task, and leaves a person to read it and add it to Biomni's tool modules. `generate_function` asks the same way, and `virtual-lab-functions` does it for every task a run found:
+
+```bash
+virtual-lab-functions generate functions/ --tasks tasks.json --max-cost 5
+virtual-lab-functions generate functions/ --tasks runs/total --min-papers 5 --limit 20 --verify docker
+virtual-lab-functions generate functions/ --task "Align paired-end reads with BWA-MEM"
+virtual-lab-functions list functions/
+```
+
+```python
+from pathlib import Path
+
+from virtual_lab import DockerExecutor, DockerSession, function_tasks, generate_functions, tools_from_saved_functions
+
+tasks = function_tasks("runs/total", min_papers=5, limit=20)
+report = generate_functions(tasks, "functions", model="gpt-5.2", executor=DockerExecutor(), max_cost=5.0)
+
+with DockerSession(Path("results/session")) as session:
+    tools = tools_from_saved_functions("functions", session=session, verified_only=True)
+    hold_meeting(..., tools=tools)    # the agents call the functions as tools, which run in the sandbox
+```
+
+- **The tasks.** Biomni's file, `{"tasks": ["description", ...]}`, or a list; a summary that `virtual-lab-papers` wrote (`frequency_summary.json` or `combined_summary.json`), in the order of its counts, with `--min-papers` and `--limit`; objects with a `task_name` and what it does, takes, and gives; or a directory papers were read into. For a directory, what the papers say of each task (what it does, takes, and gives, how it is implemented, and its standard methods) is added to what the model is told, where Biomni's file of names gives it only the name. Tasks that differ only as `normalize_name` compares names are written once.
+- **What is asked.** Biomni's six requirements, in its words, and two more, because a function is going to be called as a tool by a program that sends JSON: one function named for the task, with a docstring and a type hint on every parameter of a type JSON has (a file is taken as a `str`), returning a value that can be written as JSON; and a file that only defines things when it is imported, with anything that runs the task under `main()`. The name is Biomni's, with a prefix `task_` for one that begins with a digit, a suffix `_task` for one that is a Python keyword or a standard module, and a few characters of a hash for tasks that share their first six words.
+- **What is checked.** The reply is read, and none of it is run: the code must parse, define that function, document it, type every parameter as a tool needs, and run nothing when imported (no bare calls or loops at the top level, and no call in a default, which would be computed once on import), and have no decorator. Everything wrong with it is given back to the model with its code, so that it can correct it, up to `--max-attempts` (3) times, and no more if a correction fails for the same reason as the one before. A reply that ran out of tokens, or was never closed, is asked for again with less. `--verify docker` also imports the file in a sandbox container, which finds a library the code needs and the image does not have, and that failure is given back too. `--verify local` imports it on this machine with no isolation, for code you would run anyway.
+- **What is saved.** `functions/<name>.py` for a function that passed, and `functions/records/<name>.json` for every task: what it was asked, the model, the attempts, what it cost, and its status. `verified` is a function that was imported in an executor, `unverified` one that was only read, and `failed` one that could not be made to pass, which has the last code written for it in its record and no file. Each is saved as soon as it is written, with `report.json` of the run.
+- **A run that stops carries on.** Running the command again writes only what is not saved. A function saved without being run is imported when `--verify` is given later, and written again only if that fails. A task said differently is written again, but never over a file that has been changed by hand, or one that no record speaks of: that is refused, before the model is asked for anything. A function that failed is not tried again unless `--retry-failed` is given, and a failure that is not the task's, such as a wrong key or no network, is not saved at all.
+- **What it spends.** `--max-cost` is for the run, and a function it stops is left unsaved to be written next time. `--max-cost-per-function` fails the function that reaches it and goes on. Three failed functions in a row stop the run (`--max-consecutive-failures`, or `--keep-going`). The command exits 0 when it did everything, 1 when a run stopped early, 2 on an error, and 130 on Ctrl-C.
+- **As tools.** `tools_from_saved_functions` (and `tool_from_source` for one) makes a `Tool` of each saved function by `tool_from_function`, from its own signature and docstring, which are read from the code's syntax, so making the tool runs nothing of what the model wrote. A call runs the function in the session you give, with the arguments sent as JSON and the result sent back as JSON, so in the sandbox if it is a `DockerSession`. `run_here=True` runs it in this process instead, as you, which is for code you have read. A function that fails raises `FunctionToolError` with its error and the end of what it printed. The file is read as it is now, so a function you corrected by hand is the one used.
+
+The functions are a model's, written from what a model made of a paper. Read them before you rely on them, as Biomni's own are read before they are added.
+
 ## Measuring an agent or a team on Biomni's benchmarks
 
 Biomni is measured on three benchmarks, and so can an agent or a team here, on the same questions and by the same rules. Reading them needs `pip install "virtual-lab[eval]"`. Their files, about 4 MB, are fetched once from where Biomni fetches them, under their own licenses, and are not shipped with this package:

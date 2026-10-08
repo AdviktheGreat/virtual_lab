@@ -650,3 +650,19 @@ BIORXIV_SUBJECTS = (
 # The most pages of bioRxiv's listing to read for one request, at about 30 preprints a page, so
 # that a sample of a long interval cannot become thousands of requests
 MAX_BIORXIV_PAGES = 200
+
+# Writing a function for a task, as Biomni's FunctionGenerator does. Its file is named from the
+# first six words of the task, and a model that writes code that does not pass the checks is asked
+# to correct it, up to this many times in all, the first writing counted
+DEFAULT_MAX_FUNCTION_ATTEMPTS = 3
+FUNCTION_NAME_WORDS = 6
+
+# The most characters a tool's name may have, which the OpenAI API limits. A function written for
+# a task is named within it, so that it can be made a tool as it is
+MAX_FUNCTION_NAME_CHARS = 64
+
+# The longest task a model is asked to write a function for, and the longest function it is
+# trusted to have written. A task is a sentence or a paragraph, and a function that is a hundred
+# thousand characters is not one
+MAX_FUNCTION_TASK_CHARS = 10_000
+MAX_FUNCTION_SOURCE_CHARS = 100_000

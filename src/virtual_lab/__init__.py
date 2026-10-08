@@ -96,6 +96,20 @@ from virtual_lab.execution import (
     biomni_package_directory,
     run_files,
 )
+from virtual_lab.function_checks import FunctionSourceError, read_function, script_name
+from virtual_lab.function_generator import (
+    FunctionBudgetExceededError,
+    FunctionGenerationError,
+    FunctionRunReport,
+    FunctionTask,
+    GeneratedFunction,
+    function_tasks,
+    generate_function,
+    generate_functions,
+    load_function,
+    saved_functions,
+)
+from virtual_lab.function_tools import FunctionToolError, tool_from_source, tools_from_saved_functions
 from virtual_lab.llm import detect_source, get_llm
 from virtual_lab.literature import (
     Article,
@@ -276,6 +290,13 @@ __all__ = [
     "ExecutionResult",
     "Finding",
     "Findings",
+    "FunctionBudgetExceededError",
+    "FunctionGenerationError",
+    "FunctionRunReport",
+    "FunctionSourceError",
+    "FunctionTask",
+    "FunctionToolError",
+    "GeneratedFunction",
     "HumanitysLastExam",
     "ImplementationPlan",
     "KnowHow",
@@ -378,6 +399,9 @@ __all__ = [
     "download_structure",
     "extract_paper_findings",
     "find_code_action",
+    "function_tasks",
+    "generate_function",
+    "generate_functions",
     "get_activities",
     "get_article",
     "get_article_text",
@@ -390,12 +414,14 @@ __all__ = [
     "hold_meeting",
     "list_data_files",
     "load_env",
+    "load_function",
     "load_know_how",
     "meeting_html",
     "paper_text",
     "papers_in",
     "project_html",
     "read_biorxiv_subjects",
+    "read_function",
     "read_paper",
     "read_papers",
     "request_json",
@@ -412,6 +438,8 @@ __all__ = [
     "save_meeting_pdf",
     "save_project_html",
     "save_project_pdf",
+    "saved_functions",
+    "script_name",
     "search_articles",
     "search_drugs",
     "search_preprints",
@@ -427,7 +455,9 @@ __all__ = [
     "structure_file_tool",
     "summarize_papers",
     "tool_from_function",
+    "tool_from_source",
     "tools_for",
+    "tools_from_saved_functions",
 ]
 
 # Imported when first used, so that python -m virtual_lab.mcp_server does not find the module it
