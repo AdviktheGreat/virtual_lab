@@ -123,6 +123,12 @@ class Interface:
         if missing := library.missing_keys([model]):
             raise gr.Error(f"{model} needs {', '.join(missing)}, which is not set. Set it in Settings.")
 
+    def check_free(self, kind: str) -> None:
+        try:
+            self.lab.check_free(kind)  # type: ignore[arg-type]
+        except RuntimeError as error:
+            raise gr.Error(str(error)) from None
+
     def code_setup(self, where: str, resources: str) -> CodeSetup:
         settings = self.settings()
         return CodeSetup(
@@ -155,9 +161,7 @@ class Interface:
         summaries: list[str],
         stream: bool,
     ) -> None:
-        running = self.lab.latest("meeting")
-        if running is not None and running.status == "running":
-            raise gr.Error("A meeting is going on. Stop it, or wait for it to end, before starting another.")
+        self.check_free("meeting")
         model = (model or "").strip()
         if not model:
             raise gr.Error("Choose a model")
@@ -187,7 +191,7 @@ class Interface:
                 ),
             )
             self.lab.start_meeting(setup)
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError, RuntimeError) as error:
             raise gr.Error(str(error)) from None
 
     def start_project(
@@ -209,9 +213,7 @@ class Interface:
         resources: str,
         stream: bool,
     ) -> None:
-        running = self.lab.latest("project")
-        if running is not None and running.status == "running":
-            raise gr.Error("A project is going on. Stop it, or wait for it to end, before starting another.")
+        self.check_free("project")
         model = (model or "").strip()
         if not model:
             raise gr.Error("Choose a model")
@@ -246,9 +248,7 @@ class Interface:
         """Carries on a project from the history, with its budget and rounds raised."""
         if not path:
             raise gr.Error("Choose a project in the history")
-        running = self.lab.latest("project")
-        if running is not None and running.status == "running":
-            raise gr.Error("A project is going on. Stop it, or wait for it to end, before carrying on another.")
+        self.check_free("project")
         setup = read_setup(Path(path))
         if not isinstance(setup, ProjectSetup):
             raise gr.Error("This project was not started here, so what it was set up with is not known")

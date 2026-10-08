@@ -4,6 +4,7 @@ steered with notes, a pause, a stop, and the person's approval of each decision.
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -247,6 +248,78 @@ class TestResources:
         finished(lab.start_project(project()))
 
         assert [options["resources"] for options in made] == ["all", "retrieve"]
+
+
+class TestOneRunOfAKind:
+    def started_at_once(self, start: Callable[[], Run], count: int = 8) -> tuple[list[Run], list[Exception]]:
+        """Calls start from count threads released together, and returns what they started and what refused."""
+        barrier = threading.Barrier(count)
+        started: list[Run] = []
+        refused: list[Exception] = []
+
+        def attempt() -> None:
+            barrier.wait()
+            try:
+                started.append(start())
+            except RuntimeError as error:
+                refused.append(error)
+
+        threads = [threading.Thread(target=attempt) for _ in range(count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(WAIT)
+        return started, refused
+
+    def test_meetings_started_at_once_are_one_meeting(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        release = threading.Event()
+        monkeypatch.setattr("virtual_lab.ui.runs.hold_meeting", lambda **options: release.wait(WAIT))
+        workspace = Workspace(tmp_path)
+        lab = Lab(workspace)
+
+        started, refused = self.started_at_once(lambda: lab.start_meeting(individual()))
+        release.set()
+
+        assert len(started) == 1 and len(refused) == 7
+        assert all("A meeting is going on" in str(error) for error in refused)
+        assert len(list(workspace.meetings_dir.iterdir())) == 1
+        finished(started[0])
+
+    def test_a_project_carried_on_at_once_from_two_pages_is_carried_on_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        release = threading.Event()
+        monkeypatch.setattr("virtual_lab.ui.runs.Project", lambda *args, **options: SimpleNamespace(spent=0.0))
+        monkeypatch.setattr("virtual_lab.ui.runs.run_project", lambda *args, **options: release.wait(WAIT))
+        workspace = Workspace(tmp_path)
+        lab = Lab(workspace)
+        directory = workspace.new_directory("project", "Carried on.")
+
+        started, refused = self.started_at_once(lambda: lab.start_project(project(), directory=directory))
+        release.set()
+
+        assert len(started) == 1 and len(refused) == 7
+        finished(started[0])
+
+    def test_a_meeting_and_a_project_go_on_together_and_another_starts_once_one_ends(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        release = threading.Event()
+        monkeypatch.setattr("virtual_lab.ui.runs.hold_meeting", lambda **options: release.wait(WAIT))
+        monkeypatch.setattr("virtual_lab.ui.runs.Project", lambda *args, **options: SimpleNamespace(spent=0.0))
+        monkeypatch.setattr("virtual_lab.ui.runs.run_project", lambda *args, **options: release.wait(WAIT))
+        lab = Lab(Workspace(tmp_path))
+
+        meeting = lab.start_meeting(individual())
+        going = lab.start_project(project())
+        with pytest.raises(RuntimeError, match="A project is going on"):
+            lab.start_project(project())
+        release.set()
+        finished(meeting)
+        finished(going)
+
+        assert finished(lab.start_meeting(individual())).view().status == "completed"
+        assert finished(lab.start_project(project())).view().status == "completed"
 
 
 class TestProjectRun:

@@ -702,6 +702,7 @@ class Lab:
         self.runs: dict[str, Run] = {}
         self.current: dict[str, str] = {}
         self._lock = threading.Lock()
+        self._starting = threading.Lock()
 
     def run(self, run_id: str | None) -> Run | None:
         return self.runs.get(run_id or "")
@@ -718,6 +719,15 @@ class Lab:
             None,
         )
 
+    def check_free(self, kind: RunKind) -> None:
+        """Refuses to start a run of this kind while one goes on, since the page follows one of each.
+
+        :raises RuntimeError: If a run of this kind is going on.
+        """
+        going = self.latest(kind)
+        if going is not None and going.status == "running":
+            raise RuntimeError(f"A {kind} is going on. Stop it, or wait for it to end, first.")
+
     def _begin(self, run: Run) -> None:
         with self._lock:
             self.runs[run.id] = run
@@ -730,9 +740,12 @@ class Lab:
         critic = agent_from(setup.critic) if setup.critic is not None else None
         summaries = load_summaries([Path(path) for path in setup.summaries])
 
-        directory = self.workspace.new_directory("meeting", setup.agenda)
-        save_setup(directory, setup)
-        run = Run("meeting", setup.agenda, directory, max_cost=setup.max_cost)
+        with self._starting:
+            self.check_free("meeting")
+            directory = self.workspace.new_directory("meeting", setup.agenda)
+            save_setup(directory, setup)
+            run = Run("meeting", setup.agenda, directory, max_cost=setup.max_cost)
+            self._begin(run)
 
         def work(run: Run) -> None:
             with ExitStack() as stack:
@@ -767,7 +780,6 @@ class Lab:
                     **people,
                 )
 
-        self._begin(run)
         run.start(work)
 
         return run
@@ -775,18 +787,21 @@ class Lab:
     def start_project(self, setup: ProjectSetup, directory: Path | None = None) -> Run:
         """Starts a project in a directory of its own, or carries on the one in directory.
 
-        :raises RuntimeError: If the project in directory is running already.
+        :raises RuntimeError: If a project is going on already.
         """
         lead = agent_from(setup.lead)
         critic = agent_from(setup.critic)
         team = tuple(agent_from(member) for member in setup.team) or None
 
-        if directory is None:
-            directory = self.workspace.new_directory("project", setup.goal)
-        elif self.running(directory) is not None:
-            raise RuntimeError("This project is running already")
-        save_setup(directory, setup)
-        run = Run("project", setup.goal, directory, max_cost=setup.max_cost, autonomous=setup.autonomous)
+        with self._starting:
+            if directory is not None and self.running(directory) is not None:
+                raise RuntimeError("This project is running already")
+            self.check_free("project")
+            if directory is None:
+                directory = self.workspace.new_directory("project", setup.goal)
+            save_setup(directory, setup)
+            run = Run("project", setup.goal, directory, max_cost=setup.max_cost, autonomous=setup.autonomous)
+            self._begin(run)
 
         def work(run: Run) -> None:
             with ExitStack() as stack:
@@ -823,7 +838,6 @@ class Lab:
                     on_event=run.on_event,
                 )
 
-        self._begin(run)
         run.start(work)
 
         return run
