@@ -50,7 +50,7 @@ cd virtual_lab
 pip install -e .
 ```
 
-Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`. Saving meetings as PDFs needs the `pdf` extra and the Pango library (see [Saving a meeting or a project as a document](#saving-a-meeting-or-a-project-as-a-document)).
+Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`. Saving meetings as PDFs needs the `pdf` extra and the Pango library (see [Saving a meeting or a project as a document](#saving-a-meeting-or-a-project-as-a-document)). The web interface needs Gradio, which the `ui` extra installs: `pip install "virtual-lab[ui]"` (see [The web interface](#the-web-interface)).
 
 
 ## Models and API keys
@@ -189,6 +189,38 @@ save_project_pdf("project", meetings=True)             # project/report.pdf
 - The prompts each agent was given are left out, since the agenda stands for them; `include_prompts=True` shows them. Notes a person gave through `steer` are always shown. A tool's or the session's output is cut to `max_output_chars`, 6,000 characters by default, from the middle.
 - What the agents wrote is rendered as Markdown, with any HTML in it shown as text, and the document carries its figures, so neither the HTML nor the PDF fetches anything: an image an agent linked to, on the web or on disk, is shown as a link to it. A figure is read only from the session's own directory.
 - `meeting_html` and `project_html` return the document rather than saving it.
+
+
+## The web interface
+
+Biomni has a Gradio page to work an agent from. The Virtual Lab has one for a lab: set up a meeting or a project, follow it as it happens, steer it or let it run, and read back everything it has done. It needs Gradio, which the `ui` extra installs.
+
+```bash
+pip install "virtual-lab[ui]"
+virtual-lab-ui                          # http://127.0.0.1:7860, opened in your browser
+virtual-lab-ui --workspace ~/lab --port 8000 --no-browser
+```
+
+```python
+from virtual_lab.ui import launch_ui
+
+launch_ui(workspace="~/lab", password="a secret")   # waits until stopped; block=False to carry on
+```
+
+The page has four tabs, in a light "lab notebook" look or a dark "control room" one, which the header switches between. It starts as your system is.
+
+- **Meeting room**: the agenda, the questions, who leads, who is on the team, the rounds, the model, the budget, the databases and MCP servers the agents may use, where their code runs, and what they are told of Biomni's tools, data, and know-how (`resources`, as `hold_meeting` takes it, which matters where code runs). The discussion appears reply by reply, as `on_event` reports it, and word by word if asked. While it runs, a note can be added for the next agent to speak (as `steer` takes it), the meeting can be paused, and it can be stopped, which saves what was done under `partial/`. A finished meeting can be followed up by a new one that builds on its summary, and saved as HTML or PDF. Scientists of your own can be added to the lab.
+- **Project**: a goal, and the team lead chooses the team (or you do), makes a plan, and decides each step. By default each decision waits on the page for you: approve it, approve it with your changes to the step, or stop the project, at once or after the step under way so that it ends with a report. Letting the project run on its own approves every step, still within its budget. The report can be saved as HTML or PDF, with its meetings if asked for.
+- **History**: every meeting and project in the workspace, read from the files they were saved in, including those run from a script and those that were interrupted. Selecting one shows it as a document. A project that stopped can be carried on from here, with a larger budget and more rounds.
+- **Settings**: the model, whether to stream, the budget, where code runs (nowhere, in a Docker container of plain Python or one of Biomni's three environments, or on this machine with no isolation), the interpreter for code on this machine, and a file of MCP servers to offer. These are what each new form starts with.
+
+Anything that waits for a person waits on the page: a step to approve, a tool that needs approval (see [Tools that wait for a person's approval](#tools-that-wait-for-a-persons-approval)), and a question an MCP server asks.
+
+- A run goes on whether or not a page is open, and a page opened later, or reloaded, shows the run that is going on. One meeting and one project can run at once.
+- Everything is kept in the workspace, `~/virtual_lab_workspace` unless `--workspace` says otherwise: `settings.json`, `scientists.json` for the scientists you add, and a directory for each meeting in `meetings/` and each project in `projects/`, named for the date and the agenda or goal, and saved as `hold_meeting` and `Project` save them. The page shows only what is in those files, so a run started from a script into the workspace appears in the history.
+- The page listens on this machine alone, with no password. Anyone who reaches it can spend on your API keys and, if code runs, run code on your machine or in its containers, so `--share` (a public link through Gradio, for 72 hours) and any `--host` beyond this machine are refused without a password, from `--password` or `$VIRTUAL_LAB_UI_PASSWORD`. Sign in with that password and any name.
+- The keys are the ones the models need, as [Models and API keys](#models-and-api-keys) says. A key can be set in Settings too, and is then used until the interface stops, never saved or shown. A model whose key is not set is refused when the run is started, saying which.
+- What the agents wrote is rendered as Markdown with any HTML shown as text, and a link opens in a new tab only if it is to a web page.
 
 
 ## Running the code that agents write
