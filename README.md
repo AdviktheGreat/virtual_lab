@@ -50,7 +50,7 @@ cd virtual_lab
 pip install -e .
 ```
 
-Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`. Saving meetings as PDFs needs the `pdf` extra and the Pango library (see [Saving a meeting or a project as a document](#saving-a-meeting-or-a-project-as-a-document)). The web interface needs Gradio, which the `ui` extra installs: `pip install "virtual-lab[ui]"` (see [The web interface](#the-web-interface)).
+Tools from MCP servers, and serving tools over MCP with `virtual-lab-mcp`, need the MCP SDK, which the `mcp` extra installs: `pip install "virtual-lab[mcp]"`. Saving meetings as PDFs needs the `pdf` extra and the Pango library (see [Saving a meeting or a project as a document](#saving-a-meeting-or-a-project-as-a-document)). The web interface needs Gradio, which the `ui` extra installs: `pip install "virtual-lab[ui]"` (see [The web interface](#the-web-interface)). Reading papers in PDFs needs pypdf, which the `papers` extra installs: `pip install "virtual-lab[papers]"` (see [Growing the toolset from papers](#growing-the-toolset-from-papers)).
 
 
 ## Models and API keys
@@ -467,6 +467,26 @@ memory.get(["F1"])
 memory.save(Path("memory.json"))
 ```
 
+
+## Growing the toolset from papers
+
+Biomni grows its toolset by reading papers for the computational tasks, databases, and software in them. `read_paper` and `extract_paper_findings` do the same reading. A PDF needs pypdf: `pip install "virtual-lab[papers]"`. Plain text, Markdown, and LaTeX files need nothing.
+
+```python
+from virtual_lab import extract_paper_findings, read_paper
+
+reading = extract_paper_findings(read_paper("paper.pdf"), model="gpt-5.2", max_cost=1.0)
+for task in reading.findings.tasks:
+    print(task.task_name, "|", task.inputs, "->", task.outputs)
+print(reading.chunks, reading.cost, reading.failed_chunks)
+```
+
+- The text is cut into chunks of 4,000 characters with 400 repeated between them, as Biomni cuts it, at paragraph breaks where it can, then line breaks, sentences, and words. Each chunk is read with Biomni's guidelines: only tasks that are common across biomedical research, with clear inputs and outputs, implementable with Python or Linux code, and named with their exact methods. Then the findings of every chunk are merged, one to each name, and one more request applies the same filter to the paper as a whole.
+- Every answer is asked for in a schema (`PaperFindings`: tasks, databases, and software, each with the fields Biomni records), and one that does not fit it is not used. Biomni reads each chunk as free text and parses the consolidation's reply as JSON, and when it cannot, returns the raw reply as a single "task" with an `error` field. Here a chunk the model refuses or cannot answer in the schema is recorded in `reading.failed_chunks` with why, and the rest are used; a paper none of whose chunks can be read is refused with `PaperReadingError`.
+- Findings too many for one request, more than `max_consolidation_chars`, are consolidated in batches and then again as a whole, where Biomni joins every chunk's reply into one request, which fails once they outgrow the model's context. If the consolidation fails, `PaperReadingError` holds what the chunks found, merged but not filtered, in its `findings`.
+- A paper is read as far as `max_chars` (200,000, as Biomni reads), cut at the end of a sentence, and `reading.truncated_from` says how long it was. A file over 100 MB, a PDF over 500 pages, an encrypted PDF, and a file that is not a PDF, text, or Markdown are refused.
+- `max_cost` is checked before every request and stops the reading with `PaperBudgetExceededError`. To keep one limit across many papers, pass the same `MeetingUsage` as `usage` to each. A model whose price is not known cannot be given a limit.
+- A PDF's text is as pypdf finds it, so the columns of a two-column paper and the labels of its figures can be mixed into the prose, as in what Biomni reads. Read the tasks as suggestions to check, not as facts about the paper.
 
 ## Measuring an agent or a team on Biomni's benchmarks
 
