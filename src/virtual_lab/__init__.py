@@ -112,6 +112,18 @@ from virtual_lab.mcp_auth import SignInError, sign_out_mcp
 from virtual_lab.mcp_presets import MCP_PRESETS, MCPPreset
 from virtual_lab.mcp_tools import MCPServerError, MCPToolError, MCPTools, connect_mcp
 from virtual_lab.memory import Finding, Findings, LabMemory, MemoryEntry
+from virtual_lab.papers import (
+    PaperBudgetExceededError,
+    PaperDatabase,
+    PaperFindings,
+    PaperReading,
+    PaperReadingError,
+    PaperSoftware,
+    PaperTask,
+    extract_paper_findings,
+    read_paper,
+    split_text,
+)
 from virtual_lab.planning import NextStep, PlanTask, ProjectReport, ProjectRound, ResearchPlan, Review, run_project
 from virtual_lab.project import Project, ProjectBudgetExceededError, ProjectStateError, ProjectStep
 from virtual_lab.records import DatabaseError, RecordNotFoundError
@@ -267,6 +279,13 @@ __all__ = [
     "NextStep",
     "NextTurn",
     "PDB_LOOKUP_TOOL",
+    "PaperBudgetExceededError",
+    "PaperDatabase",
+    "PaperFindings",
+    "PaperReading",
+    "PaperReadingError",
+    "PaperSoftware",
+    "PaperTask",
     "PDFExportError",
     "PUBCHEM_LOOKUP_TOOL",
     "PUBMED_TOOL",
@@ -334,6 +353,7 @@ __all__ = [
     "download_benchmarks",
     "download_data_lake",
     "download_structure",
+    "extract_paper_findings",
     "find_code_action",
     "get_activities",
     "get_article",
@@ -350,6 +370,7 @@ __all__ = [
     "load_know_how",
     "meeting_html",
     "project_html",
+    "read_paper",
     "request_json",
     "request_text",
     "run_benchmark",
@@ -375,6 +396,7 @@ __all__ = [
     "session_tool",
     "session_tools_prompt",
     "sign_out_mcp",
+    "split_text",
     "structure_file_tool",
     "tool_from_function",
     "tools_for",

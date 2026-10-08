@@ -596,3 +596,23 @@ MAX_NAMES_LISTED = 5
 # Sheets to name in a report. Unlike names in a warning, these are how a sheet is asked for, so
 # a workbook's ordinary handful is always listed in full.
 MAX_SHEETS_LISTED = 30
+
+# Reading a paper for its tasks, databases, and software, as Biomni's PaperTaskExtractor does:
+# the text is cut into chunks of this many characters, each overlapping the last by some, so that
+# a method described across a cut is whole in one chunk. Biomni's own sizes
+DEFAULT_PAPER_CHUNK_SIZE = 4_000
+DEFAULT_PAPER_CHUNK_OVERLAP = 400
+
+# The most of a paper to read, which Biomni's scripts also cap, cut at a sentence. A full text is
+# 40,000 to 100,000 characters, and what follows the methods and results is references
+MAX_PAPER_CHARS = 200_000
+
+# The most of the chunks' findings one consolidation request is given. A paper with more is
+# consolidated in batches, and those results again, so that no request outgrows its context
+MAX_CONSOLIDATION_CHARS = 60_000
+MAX_CONSOLIDATION_PASSES = 4
+
+# The largest paper file to open, and the most pages of a PDF to read. A PDF's size says little
+# of how long its text takes to extract, and no paper has more pages than this
+MAX_PAPER_FILE_BYTES = 100_000_000
+MAX_PAPER_PAGES = 500
