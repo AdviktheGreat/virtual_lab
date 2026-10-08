@@ -66,6 +66,8 @@ mcp = ["mcp>=2.3,<3", "PyYAML"]
 # Meetings and projects saved as PDFs, as Biomni saves its conversations. WeasyPrint also needs
 # the Pango library, which pip cannot install
 pdf = ["weasyprint>=66"]
+# The web interface, with virtual-lab-ui or launch_ui
+ui = ["gradio>=6.0"]
 nanobody-design = [
     "biopython",
     "pandas",
@@ -77,13 +79,14 @@ nanobody-design = [
 dev = [
     "pytest",
     # Every extra the tests use, so that none of them is skipped or fails for want of a package
-    "virtual-lab[bedrock,eval,mcp,ollama,pdf]",
+    "virtual-lab[bedrock,eval,mcp,ollama,pdf,ui]",
     # Reads back the PDFs the tests make
     "pypdf",
 ]
 
 [project.scripts]
 virtual-lab-mcp = "virtual_lab.mcp_server:main"
+virtual-lab-ui = "virtual_lab.ui:main"
 
 [tool.hatch.version]
 path = "src/virtual_lab/__about__.py"
