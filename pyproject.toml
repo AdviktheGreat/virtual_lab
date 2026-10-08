@@ -86,6 +86,7 @@ dev = [
 
 [project.scripts]
 virtual-lab-mcp = "virtual_lab.mcp_server:main"
+virtual-lab-papers = "virtual_lab.papers_cli:main"
 virtual-lab-ui = "virtual_lab.ui:main"
 
 [tool.hatch.version]

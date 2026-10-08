@@ -552,6 +552,8 @@ class TestExtractPaperFindings:
             (PAPER, {"chunk_overlap": CHUNK}),
             (PAPER, {"max_cost": -1}),
             (PAPER, {"max_cost": float("nan")}),
+            (PAPER, {"temperature": 2.5}),
+            (PAPER, {"temperature": float("nan")}),
         ]:
             with pytest.raises(ValueError):
                 read(fake_client, text, **options)

@@ -25,7 +25,10 @@ from openai.types.chat.parsed_chat_completion import ParsedChatCompletionMessage
 from openai.types.completion_usage import CompletionTokensDetails, PromptTokensDetails
 from pydantic import BaseModel
 
+from virtual_lab import paper_batch
 from virtual_lab.agent import Agent
+from virtual_lab.literature import Article, ArticleText
+from virtual_lab.records import RecordNotFoundError
 
 TEST_MODEL = "gpt-4o-2024-08-06"
 
@@ -463,3 +466,71 @@ def second_team_member() -> Agent:
         role="run simulations",
         model=TEST_MODEL,
     )
+
+
+def biorxiv_record(doi: str, published: str = "NA", **fields: Any) -> dict[str, Any]:
+    return {
+        "title": f"Title of {doi}",
+        "authors": "A. Author",
+        "doi": doi,
+        "date": "2024-01-02",
+        "version": "1",
+        "license": "cc_by",
+        "category": "neuroscience",
+        "abstract": "An abstract.",
+        "published": published,
+        **fields,
+    }
+
+
+class FakeListing:
+    """Stands in for bioRxiv's listing, which answers a page of records at a cursor."""
+
+    def __init__(self, records: list[dict[str, Any]], page_size: int = 2) -> None:
+        self.records = records
+        self.page_size = page_size
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def __call__(self, url: str, params: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        self.calls.append((url, params or {}))
+        cursor = int(url.split("/")[-2])
+        page = self.records[cursor : cursor + self.page_size]
+
+        return {"messages": [{"status": "ok", "total": str(len(self.records))}], "collection": page}
+
+
+@pytest.fixture
+def listing(monkeypatch: pytest.MonkeyPatch) -> FakeListing:
+    fake = FakeListing([biorxiv_record(f"10.1101/{number}", published=f"10.9/{number}") for number in range(7)])
+    monkeypatch.setattr(paper_batch, "request_json", fake)
+
+    return fake
+
+
+@pytest.fixture
+def europe_pmc(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Stands in for Europe PMC: the articles it holds by DOI, and the text of those by PMCID."""
+    held: dict[str, Any] = {"articles": {}, "texts": {}, "asked": []}
+
+    def get_article(identifier: str) -> Article:
+        held["asked"].append(("article", identifier))
+        if identifier not in held["articles"]:
+            raise RecordNotFoundError(f"Europe PMC has no article for {identifier}")
+
+        return held["articles"][identifier]
+
+    def get_article_text(pmcid: str) -> ArticleText:
+        held["asked"].append(("text", pmcid))
+        if pmcid not in held["texts"]:
+            raise RecordNotFoundError(f"Europe PMC holds no open full text for {pmcid}")
+
+        return held["texts"][pmcid]
+
+    monkeypatch.setattr(paper_batch, "get_article", get_article)
+    monkeypatch.setattr(paper_batch, "get_article_text", get_article_text)
+
+    return held
+
+
+def open_article(pmcid: str = "PMC1", title: str = "The article") -> Article:
+    return Article(article_id=pmcid, source="PMC", pmcid=pmcid, title=title, open_access=True, in_europe_pmc=True)

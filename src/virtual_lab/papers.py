@@ -26,6 +26,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from virtual_lab.completions import check_temperature
 from virtual_lab.constants import (
     CONSISTENT_TEMPERATURE,
     DEFAULT_MODEL,
@@ -234,6 +235,13 @@ def cut(text: str, separators: tuple[str, ...], size: int, overlap: int) -> list
     return chunks + join_pieces(run, size, overlap)
 
 
+def check_chunk_sizes(chunk_size: int, chunk_overlap: int) -> None:
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be above zero, not {chunk_size}")
+    if not 0 <= chunk_overlap < chunk_size:
+        raise ValueError(f"chunk_overlap must be from zero up to chunk_size ({chunk_size}), not {chunk_overlap}")
+
+
 def split_text(
     text: str,
     chunk_size: int = DEFAULT_PAPER_CHUNK_SIZE,
@@ -254,10 +262,7 @@ def split_text(
         chunk_size.
     :return: The chunks, in order, none of them empty.
     """
-    if chunk_size < 1:
-        raise ValueError(f"chunk_size must be above zero, not {chunk_size}")
-    if not 0 <= chunk_overlap < chunk_size:
-        raise ValueError(f"chunk_overlap must be from zero up to chunk_size ({chunk_size}), not {chunk_overlap}")
+    check_chunk_sizes(chunk_size, chunk_overlap)
 
     chunks = (chunk.strip() for chunk in cut(text, SEPARATORS, chunk_size, chunk_overlap))
 
@@ -472,6 +477,39 @@ def pdf_text(data: bytes, name: str = "the PDF") -> str:
         raise ValueError(f"{name} could not be read as a PDF: {error}") from error
 
 
+def check_reading_options(
+    model: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    max_chars: int | None,
+    max_consolidation_chars: int,
+    temperature: float | None,
+    max_cost: float | None,
+) -> None:
+    """Refuses options that every reading would fail on, so that many papers are not each tried.
+
+    :raises ValueError: If a size, the temperature, or the limit is out of range.
+    :raises CostUnknownError: If max_cost is given and the model's price is not known, since a
+        limit on spending is only a limit if the price is.
+    """
+    check_chunk_sizes(chunk_size, chunk_overlap)
+    check_temperature(temperature)
+    if max_chars is not None and max_chars < 1:
+        raise ValueError(f"max_chars must be above zero, not {max_chars}")
+    if max_consolidation_chars < 1_000:
+        raise ValueError(f"max_consolidation_chars must be at least 1,000, not {max_consolidation_chars}")
+    if max_cost is not None:
+        if not (math.isfinite(max_cost) and max_cost >= 0):
+            raise ValueError(f"max_cost must be a finite amount, zero or more, not {max_cost}")
+        try:
+            compute_token_cost(model, 0, 0)
+        except CostUnknownError as error:
+            raise CostUnknownError(
+                f"{error}, so a max_cost cannot be enforced. Add its prices to the tables in "
+                "virtual_lab.constants, or run without a limit."
+            ) from error
+
+
 def extract_paper_findings(
     text: str,
     model: str = DEFAULT_MODEL,
@@ -524,21 +562,7 @@ def extract_paper_findings(
         last two cases the error holds the merged findings of the chunks, unfiltered.
     :return: What was found, and what it took.
     """
-    if max_chars is not None and max_chars < 1:
-        raise ValueError(f"max_chars must be above zero, not {max_chars}")
-    if max_consolidation_chars < 1_000:
-        raise ValueError(f"max_consolidation_chars must be at least 1,000, not {max_consolidation_chars}")
-    if max_cost is not None:
-        if not (math.isfinite(max_cost) and max_cost >= 0):
-            raise ValueError(f"max_cost must be a finite amount, zero or more, not {max_cost}")
-        # A limit on spending is only a limit if the model's price is known
-        try:
-            compute_token_cost(model, 0, 0)
-        except CostUnknownError as error:
-            raise CostUnknownError(
-                f"{error}, so a max_cost cannot be enforced. Add its prices to the tables in "
-                "virtual_lab.constants, or run without a limit."
-            ) from error
+    check_reading_options(model, chunk_size, chunk_overlap, max_chars, max_consolidation_chars, temperature, max_cost)
     if not text.strip():
         raise ValueError("The paper has no text to read")
 

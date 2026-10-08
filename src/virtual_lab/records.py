@@ -167,22 +167,40 @@ def as_int(value: Any, default: int | None = None) -> int | None:
     return value
 
 
-def parse_xml(body: str, error: type[Exception], subject: str = "response") -> ElementTree.Element:
+# A declaration that only names a DTD, by a public and a system identifier or by a system one, and
+# has no internal subset, which is how JATS full text begins. It cannot declare an entity, and
+# ElementTree does not fetch the DTD it names. An identifier holds none of < > [ ] &, so the match
+# ends at the declaration's own closing bracket and never takes in an internal subset.
+XML_SPACE = r"[ \t\r\n]+"
+DTD_IDENTIFIER = r"""(?:"[^"<>\[\]&]*"|'[^'<>\[\]&]*')"""
+EXTERNAL_ID = rf"(?:PUBLIC{XML_SPACE}{DTD_IDENTIFIER}{XML_SPACE}{DTD_IDENTIFIER}|SYSTEM{XML_SPACE}{DTD_IDENTIFIER})"
+EXTERNAL_DOCTYPE = re.compile(rf"<!DOCTYPE{XML_SPACE}[A-Za-z_][\w.:-]*(?:{XML_SPACE}{EXTERNAL_ID})?[ \t\r\n]*>")
+
+
+def parse_xml(
+    body: str, error: type[Exception], subject: str = "response", allow_external_doctype: bool = False
+) -> ElementTree.Element:
     """Parses XML from elsewhere, refusing a document that declares entities.
 
     ElementTree resolves internal entities, and a document declaring a few nested ones expands to
     whatever size its author chose while the parser holds the result in memory. It is not a
     theoretical concern: the parser here does expand them, which was checked rather than assumed.
-    Nothing this library parses has any reason to carry a DOCTYPE, so the declaration is refused
-    outright instead of the expansion being bounded.
+    Nothing this library parses has any reason to carry a DOCTYPE, bar the one kind below, so the
+    declaration is refused outright instead of the expansion being bounded.
 
     :param body: The document.
     :param error: The exception to raise, so that a caller sees a failure of the kind it handles
         rather than one belonging to another module.
     :param subject: What the document is, for the message.
+    :param allow_external_doctype: Whether to accept one declaration that only names a DTD, as
+        JATS articles do, and no more than that: any internal subset, a second declaration, or an
+        entity declaration is still refused. The declaration is removed before parsing.
     :raises error: If the body declares a document type, or is not XML.
     :return: The root element.
     """
+    if allow_external_doctype:
+        body = EXTERNAL_DOCTYPE.sub("", body, count=1)
+
     # Searched for anywhere rather than near the start: the declaration may follow a comment or a
     # processing instruction of any length, and a prefix that stopped at 4 KB let a 6.6 KB feed
     # through that expanded to five megabytes. An entity declaration is refused on its own too,

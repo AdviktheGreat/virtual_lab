@@ -488,6 +488,31 @@ print(reading.chunks, reading.cost, reading.failed_chunks)
 - `max_cost` is checked before every request and stops the reading with `PaperBudgetExceededError`, which holds in `findings` what the chunks read so far showed, unfiltered, so that what was paid for is not lost. To keep one limit across many papers, pass the same `MeetingUsage` as `usage` to each. A model whose price is not known cannot be given a limit.
 - A PDF's text is as pypdf finds it, so the columns of a two-column paper and the labels of its figures can be mixed into the prose, as in what Biomni reads. Read the tasks as suggestions to check, not as facts about the paper.
 
+### Reading many papers, and counting what they share
+
+Biomni reads the bioRxiv preprints of 25 subjects that have been published, and counts how many papers each task, database, and package turns up in, so that the ones in hundreds of papers can become tools. `read_papers` does the reading, and `virtual-lab-papers` runs it from the command line:
+
+```bash
+virtual-lab-papers read papers/ runs/mine --max-cost 5
+virtual-lab-papers biorxiv runs/neuro --since 2024-01-01 --subject neuroscience --limit 20 --max-cost 5
+virtual-lab-papers biorxiv runs/all --since 2024-01-01 --all-subjects --limit 100 --max-cost 50
+virtual-lab-papers summarize runs/mine
+virtual-lab-papers combine runs/neuro runs/mine --output runs/total
+```
+
+```python
+from virtual_lab import biorxiv_papers, papers_in, read_papers, read_biorxiv_subjects
+
+report = read_papers(papers_in("papers"), "runs/mine", model="gpt-5.2", max_cost=5.0)
+report = read_papers(biorxiv_papers("2024-01-01", subject="neuroscience", limit=20), "runs/neuro")
+everything = read_biorxiv_subjects("runs/all", "2024-01-01", papers_per_subject=100, max_cost=50.0)
+```
+
+- **Where the papers come from.** A directory of PDF, text, Markdown, and LaTeX files (`papers_in`, with `--recursive` for the folders within it), or bioRxiv's listing (`biorxiv_papers`), by period and subject, the first ones or a random sample with a fixed seed, as Biomni takes them. Biomni then downloads each PDF from bioRxiv, which now answers a script's request with HTTP 429 however politely it is made, and this does not work around that. The listing is bioRxiv's API, which does answer, and the text is that of each preprint's published version where Europe PMC holds it open access. A preprint that has not been published, or whose published version is not open, is recorded as `unavailable` and not read; in a trial on six January 2024 neuroscience preprints, half were open. That text is the abstract and the sections of the article, without its references, which is not quite what bioRxiv's PDF holds. To read papers from anywhere else, download them and point `read` at the directory.
+- **A run that stops carries on.** Each paper's result is saved under `results/` as soon as it is read, so running the same command again reads only the rest, and nothing is paid for twice. A directory holding a run with another model or other reading options is refused, since its results could not be counted with these. A paper that failed or had no text is not read again unless `--retry-failed` is given. Ctrl-C is safe.
+- **What it spends.** `--max-cost` is for the run, including every subject, and a paper it stops is left unsaved to be read next time. `--max-cost-per-paper` fails the paper that reaches it and goes on. Three failed papers in a row stop the run, since that is more likely a missing key or no network than three bad papers (`--max-consecutive-failures`, or `--keep-going`); a paper with no text to read does not count. A paper that fails after some chunks were read keeps what they showed in its result, unfiltered and not counted. The command exits 0 when it did everything, 1 when a run stopped early, 2 on an error, and 130 on Ctrl-C.
+- **What it writes.** In the run's directory: `results/<key>.json` for each paper, `report.json`, `run.json` (what it was read with), `tasks_summary.csv`, `databases_summary.csv`, and `software_summary.csv` with a row for each thing found in each paper, and `frequency_summary.json` with how many papers each name was found in, the most common first. Names are compared as `normalize_name` compares them, so `DESeq2` and `deseq2` are one, and one paper counts a name once. `combine` adds the counts of several runs into `combined_summary.json` and `tasks_frequency.csv`, `databases_frequency.csv`, and `software_frequency.csv`; a paper in two of them is counted twice. A cell that a spreadsheet would read as a formula, because a paper's text can make a model write `=...` or `@...`, is written with a leading quote.
+
 ## Measuring an agent or a team on Biomni's benchmarks
 
 Biomni is measured on three benchmarks, and so can an agent or a team here, on the same questions and by the same rules. Reading them needs `pip install "virtual-lab[eval]"`. Their files, about 4 MB, are fetched once from where Biomni fetches them, under their own licenses, and are not shipped with this package:
