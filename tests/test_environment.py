@@ -119,6 +119,8 @@ class TestFullStage:
         check = full_stage_runs()[-1]
 
         assert ".tools[].binary_path" in check and "cli_tools_config.json" in check
+        assert "jq -e '.tools | length > 0'" in check, "a config with no tools must not pass as checked"
+        assert 'test -x "/opt/biomni_tools/bin/' in check and "exit 1" in check
         for program in ("plink2", "iqtree2", "gcta64", "bwa", "findMotifs.pl"):
             assert re.search(rf"\b{re.escape(program)}\b", check), program
 
@@ -143,6 +145,7 @@ class TestFullStage:
         assert "-local" not in run
         assert "test -x bin/findMotifs.pl" in run
         assert 'ln -sf "$PWD/$program" "/opt/biomni_tools/bin/' in run
+        assert '$(basename "$program")" || exit 1' in run, "a link that cannot be made must fail the step"
 
     def test_biomnis_script_still_gives_homer_the_options_that_make_the_step_above_necessary(self) -> None:
         script = (sandbox_context() / "biomni_env" / "install_cli_tools.sh").read_text()

@@ -121,7 +121,7 @@ RUN rm -rf /opt/biomni_tools/gcta /opt/biomni_tools/gcta.zip \
     && test -x bin/findMotifs.pl \
     && for program in bin/*; do \
         if [ -f "$program" ] && [ -x "$program" ]; then \
-            ln -sf "$PWD/$program" "/opt/biomni_tools/bin/$(basename "$program")"; \
+            ln -sf "$PWD/$program" "/opt/biomni_tools/bin/$(basename "$program")" || exit 1; \
         fi; \
     done
 
@@ -159,6 +159,7 @@ RUN Rscript -e ' \
         missing <- wanted[!vapply(wanted, requireNamespace, logical(1), quietly = TRUE)]; \
         if (length(missing)) stop("R packages not installed: ", paste(missing, collapse = ", ")); \
         library(DESeq2); library(clusterProfiler)' \
+    && jq -e '.tools | length > 0' cli_tools_config.json > /dev/null \
     && jq -r '.tools[].binary_path' cli_tools_config.json | while read -r binary; do \
         test -x "/opt/biomni_tools/bin/$(basename "$binary")" \
             || { echo "$binary was not installed" >&2; exit 1; }; \
