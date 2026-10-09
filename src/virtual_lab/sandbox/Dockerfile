@@ -76,8 +76,22 @@ RUN python3 -c "import scanpy, Bio, rdkit, pysam, gseapy, lifelines" \
 
 FROM bio AS full
 
+# What compiling the R packages and command-line tools below needs, which Biomni's scripts
+# assume a machine has: cmake, which nloptr (and so lme4) builds its library with; zlib's
+# headers, which BWA compiles against; and zip, which HOMER's installer will not run without
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake zip zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Conda's compiler, which builds R's packages, looks only in the environment, so what they link
+# against is installed there: xz (igraph and Rhtslib), libxml2 (XML), and netcdf (ncdf4). gdtools
+# comes built, as it cannot find the environment's cairo when compiled.
+# install_r_packages.R prints a failure and goes on, so the last step of this stage checks what it
+# was to install.
 COPY biomni_env/r_packages.yml biomni_env/install_r_packages.R ./
 RUN conda env update -n biomni_e1 -f r_packages.yml \
+    && conda install -y -n biomni_e1 -c conda-forge --override-channels \
+        xz libxml2-devel libnetcdf r-gdtools \
     && conda clean -afy \
     && Rscript install_r_packages.R \
     && rm -rf /tmp/Rtmp* /tmp/.cache
@@ -85,6 +99,31 @@ RUN conda env update -n biomni_e1 -f r_packages.yml \
 COPY biomni_env/install_cli_tools.sh biomni_env/cli_tools_config.json ./
 RUN BIOMNI_AUTO_INSTALL=1 BIOMNI_TOOLS_DIR=/opt/biomni_tools SHELL=/bin/bash bash install_cli_tools.sh \
     && rm -rf /tmp/.cache /tmp/.bashrc*
+
+# install_cli_tools.sh reports success for two tools it did not install:
+#
+# GCTA: its server answers a download that is not from a browser with a page of JavaScript, which
+#   the script saves as the zip. The authors' release on GitHub is the same program, in version
+#   1.94.1 where the script asks for 1.94.4, and is checked against the hash of that file.
+# HOMER: the script gives its installer options it no longer takes, so it prints its usage and
+#   installs nothing. It is run here as its own documentation says, in the directory it installs
+#   to, and its programs are linked beside the others, as the script means to.
+RUN rm -rf /opt/biomni_tools/gcta /opt/biomni_tools/gcta.zip \
+    && curl -fsSL --retry 3 -o /opt/biomni_tools/bin/gcta64 \
+        https://github.com/jianyangqt/gcta/releases/download/v1.94.1/gcta-1.94.1-linux-x86_64-static \
+    && echo "dbb2b5e5d51e278328ff297a403d3dd8ee5f5280f0b6d3d8db74b3e7fead7b49  /opt/biomni_tools/bin/gcta64" \
+        | sha256sum -c - \
+    && chmod 755 /opt/biomni_tools/bin/gcta64 \
+    && mkdir -p /opt/biomni_tools/homer/homer \
+    && cp /opt/biomni_tools/bin/configureHomer.pl /opt/biomni_tools/homer/homer/ \
+    && cd /opt/biomni_tools/homer/homer \
+    && perl configureHomer.pl -install \
+    && test -x bin/findMotifs.pl \
+    && for program in bin/*; do \
+        if [ -f "$program" ] && [ -x "$program" ]; then \
+            ln -sf "$PWD/$program" "/opt/biomni_tools/bin/$(basename "$program")" || exit 1; \
+        fi; \
+    done
 
 ENV PATH=/opt/biomni_tools/bin:$PATH
 
@@ -110,13 +149,24 @@ RUN pip install --no-cache-dir transformers sentencepiece langchain-google-genai
     && conda clean -afy \
     && rm -rf /tmp/.cache
 
-# install_cli_tools.sh exits successfully even when a tool fails to install, so each binary it
-# should have put in place is checked for here
-RUN Rscript -e 'library(DESeq2); library(clusterProfiler)' \
+# Neither install_r_packages.R nor install_cli_tools.sh fails when something is not installed, so
+# every R package the first names, and every binary the second should have put in place, is
+# checked for here, and not in the steps above, so that a failure does not discard their hours
+RUN Rscript -e ' \
+        wanted <- c("ggplot2", "lme4", "dplyr", "tidyr", "readr", "stringr", "Matrix", "Rcpp", "devtools", \
+                    "remotes", "harmony", "DESeq2", "dada2", "xcms", "flowCore", "edgeR", "limma", "WGCNA", \
+                    "clusterProfiler"); \
+        missing <- wanted[!vapply(wanted, requireNamespace, logical(1), quietly = TRUE)]; \
+        if (length(missing)) stop("R packages not installed: ", paste(missing, collapse = ", ")); \
+        library(DESeq2); library(clusterProfiler)' \
+    && jq -e '.tools | length > 0' cli_tools_config.json > /dev/null \
     && jq -r '.tools[].binary_path' cli_tools_config.json | while read -r binary; do \
         test -x "/opt/biomni_tools/bin/$(basename "$binary")" \
             || { echo "$binary was not installed" >&2; exit 1; }; \
     done \
     && plink2 --version \
     && iqtree2 --version \
+    && gcta64 --version 2>&1 | grep -q "Genome-wide Complex Trait Analysis" \
+    && bwa 2>&1 | grep -q Version \
+    && findMotifs.pl 2>&1 | grep -q Usage \
     && state --help > /dev/null

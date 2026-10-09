@@ -57,6 +57,102 @@ class TestImageDefinition:
         assert "scanpy" in SANDBOX_LIBRARIES
 
 
+def full_stage_runs() -> list[str]:
+    """The RUN steps of the full stage, in order, with their continued lines joined."""
+    steps, current = [], ""
+    for line in DOCKERFILE.read_text().splitlines():
+        if not current and (not line.strip() or line.lstrip().startswith("#")):
+            continue
+
+        if current and line.lstrip().startswith("#"):
+            continue
+
+        if line.rstrip().endswith("\\"):
+            current += line.rstrip()[:-1] + " "
+            continue
+
+        steps.append(current + line)
+        current = ""
+
+    start = next(index for index, step in enumerate(steps) if step.startswith("FROM ") and step.endswith("AS full"))
+    return [step[len("RUN ") :] for step in steps[start + 1 :] if step.startswith("RUN ")]
+
+
+def names_in(script: str, variable: str) -> list[str]:
+    """The strings in a vector the R script assigns, such as cran_packages <- c("a", "b")."""
+    vector = re.search(rf"{variable}\s*<-\s*c\((.*?)\)", script, flags=re.DOTALL)
+    assert vector, variable
+    return re.findall(r'"([^"]+)"', vector.group(1))
+
+
+class TestFullStage:
+    """Biomni's R and command-line installers report success for what they did not install, which
+    is what these steps are for. They are tested as text; the image's own build runs them."""
+
+    def test_what_the_builds_need_is_installed_before_they_run(self) -> None:
+        runs = full_stage_runs()
+        needs = next(index for index, run in enumerate(runs) if "apt-get install" in run)
+        r_install = next(index for index, run in enumerate(runs) if "Rscript install_r_packages.R" in run)
+        cli_install = next(index for index, run in enumerate(runs) if "install_cli_tools.sh" in run)
+
+        assert needs < r_install < cli_install
+        for package in ("cmake", "zip", "zlib1g-dev"):
+            assert re.search(rf"apt-get install .*\b{package}\b", runs[needs]), package
+
+    def test_the_libraries_r_packages_link_against_are_installed_before_they_are_built(self) -> None:
+        r_install = next(run for run in full_stage_runs() if "Rscript install_r_packages.R" in run)
+
+        before = r_install[: r_install.index("Rscript install_r_packages.R")]
+        for library in ("xz", "libxml2-devel", "libnetcdf", "r-gdtools"):
+            assert re.search(rf"conda install .*\b{library}\b", before), library
+
+    def test_every_r_package_the_script_installs_is_checked_for_at_the_end(self) -> None:
+        script = (sandbox_context() / "biomni_env" / "install_r_packages.R").read_text()
+        installed = {*names_in(script, "cran_packages"), *names_in(script, "bioc_packages"), "WGCNA", "clusterProfiler"}
+
+        check = full_stage_runs()[-1]
+
+        assert "stop(" in check
+        assert installed <= set(names_in(check, "wanted")), installed - set(names_in(check, "wanted"))
+
+    def test_every_tool_in_the_config_is_checked_for_at_the_end(self) -> None:
+        check = full_stage_runs()[-1]
+
+        assert ".tools[].binary_path" in check and "cli_tools_config.json" in check
+        assert "jq -e '.tools | length > 0'" in check, "a config with no tools must not pass as checked"
+        assert 'test -x "/opt/biomni_tools/bin/' in check and "exit 1" in check
+        for program in ("plink2", "iqtree2", "gcta64", "bwa", "findMotifs.pl"):
+            assert re.search(rf"\b{re.escape(program)}\b", check), program
+
+    def test_the_check_is_not_in_a_step_whose_failure_would_discard_the_builds(self) -> None:
+        builds = [
+            run for run in full_stage_runs()[:-1] if re.search(r"install_r_packages\.R|install_cli_tools\.sh", run)
+        ]
+
+        assert len(builds) == 2
+        assert all("stop(" not in run and "requireNamespace" not in run for run in builds)
+
+    def test_gcta_is_fetched_from_where_it_can_be_and_checked_against_a_hash(self) -> None:
+        run = next(run for run in full_stage_runs() if "gcta64" in run and "curl" in run)
+
+        assert "github.com/jianyangqt/gcta/releases/download/" in run
+        assert re.search(r"echo \"[0-9a-f]{64}  /opt/biomni_tools/bin/gcta64\" +\| +sha256sum -c -", run)
+
+    def test_homer_is_installed_by_its_documented_command_and_linked_beside_the_other_tools(self) -> None:
+        run = next(run for run in full_stage_runs() if "configureHomer.pl" in run)
+
+        assert "perl configureHomer.pl -install" in run
+        assert "-local" not in run
+        assert "test -x bin/findMotifs.pl" in run
+        assert 'ln -sf "$PWD/$program" "/opt/biomni_tools/bin/' in run
+        assert '$(basename "$program")" || exit 1' in run, "a link that cannot be made must fail the step"
+
+    def test_biomnis_script_still_gives_homer_the_options_that_make_the_step_above_necessary(self) -> None:
+        script = (sandbox_context() / "biomni_env" / "install_cli_tools.sh").read_text()
+
+        assert 'configureHomer.pl" -install -local' in script
+
+
 class TestTags:
     def test_the_tag_names_the_stage_and_version(self) -> None:
         assert sandbox_image("bio") == f"virtual-lab-sandbox:bio-{__version__}-linux-amd64"
