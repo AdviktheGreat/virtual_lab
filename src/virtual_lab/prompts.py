@@ -456,3 +456,125 @@ CODING_RULES = (
     "If your code needs user-provided values, write code to parse those values from the command line.",
     "Your code must be high quality, well-engineered, efficient, and well-documented (including docstrings, comments, and Python type hints if using Python).",
 )
+
+
+
+def lab_chat_prompt(lead: Agent, team: Iterable[Agent], can_run_code: bool) -> str:
+    """Tells the head of a lab how to work in a conversation with a human researcher: answer,
+    run code, or have the team work on it.
+
+    :param lead: The head of the lab, who the researcher talks to.
+    :param team: The scientists the lead can bring in, besides itself. With none, the lead works alone.
+    :param can_run_code: Whether the lead has a session to run code in.
+    """
+    members = list(team)
+
+    rules = [
+        "Answer directly when you can. Be specific and concise, say what you are unsure of, and claim nothing "
+        "that nobody checked. If a request is unclear in a way that would change the work, ask one question; "
+        "otherwise state your assumption and go on."
+    ]
+    if can_run_code:
+        rules.append(
+            "You have a running Python session"
+            f"{', shared with your team' if members else ''}. Use it to look at the files the researcher gives "
+            "you, to compute answers rather than estimate them, and to draw figures. Variables and loaded data "
+            "persist between runs and between messages. Say what you ran and what it showed."
+        )
+    else:
+        rules.append(
+            "There is no session to run code in, so you can reason and write but not run anything. Say so when "
+            "a question needs a computation or a file to be opened."
+        )
+    if members:
+        rules.append(
+            "To have your team work on something, call convene_team for a discussion among several scientists, "
+            "which you lead, when a question needs more than one kind of expertise or someone to push back, or "
+            "consult for one scientist to work on a focused task, with the Scientific Critic reviewing it. "
+            "Neither can see this conversation, so give the agenda everything the work needs: the goal, the "
+            "files and data, what has been tried, and what you want back. You are given the summary the team "
+            "reached. Check it against what the researcher asked before you rely on it, and say where it was "
+            "uncertain."
+        )
+    rules.append(
+        "When you answer after doing work, say what was done and found, and name the files and figures it made."
+    )
+
+    sections = [
+        lead.prompt,
+        "You are talking with a human researcher who has brought you a question or a task. "
+        + (
+            "You are the person they talk to, and the head of a lab: you can answer yourself, and you can have "
+            "your team work on a question, then tell the researcher what the lab found."
+            if members
+            else "You are the person they talk to."
+        ),
+        "How to work:\n" + "\n".join(f"- {rule}" for rule in rules),
+    ]
+    if members:
+        roster = "\n".join(f"- {member.title}: {member.expertise}" for member in members)
+        sections.append(f"Your team, whom you can bring in by title:\n{roster}")
+
+    return "\n\n".join(sections)
+
+
+def chat_session_prompt(working_directory: str, network: bool, data_lake: str | None) -> str:
+    """Tells the head of a lab about the session it runs code in, for a conversation.
+
+    :param working_directory: Where the code runs, as the code sees it.
+    :param network: Whether the code can reach the internet.
+    :param data_lake: Where Biomni's data lake is, as the code sees it, if it is mounted.
+    """
+    where = [
+        f"The code runs in {working_directory}, and files written there are kept. Files the researcher "
+        "attaches are saved in its uploads/ directory.",
+        "Code can reach the internet." if network else "Code cannot reach the internet.",
+    ]
+    if data_lake is not None:
+        where.append(f"Biomni's data lake of curated biomedical tables is at {data_lake}.")
+
+    return (
+        "To run code, call the run_code tool. A matplotlib figure left open is saved to plots/ and shown to the "
+        f"researcher. {' '.join(where)}"
+    )
+
+
+def chat_resources_prompt(counts: dict[str, int]) -> str:
+    """Tells the head of a lab that it can ask which of Biomni's resources suit a task.
+
+    :param counts: How many of each kind of resource there are, as Resources.counts gives them.
+    """
+    kinds = {
+        "tools": "tool functions",
+        "data_lake": "data lake files",
+        "libraries": "software libraries",
+        "know_how": "know-how documents",
+    }
+    listed = ", ".join(f"{count} {kinds[kind]}" for kind, count in counts.items() if count)
+
+    return (
+        f"The session's environment has Biomni's {listed}, too many to list here. Before you write code for a "
+        "task that may use them, call find_resources with a description of the task: it lists the ones that "
+        "suit it, with how to use them."
+    )
+
+
+def chat_note_prompt(note: str) -> str:
+    """Generates the message that gives the lead a note the human researcher added while it worked.
+
+    :param note: What the researcher wrote.
+    """
+    return f"The human researcher added a note while you were working:\n\n{note}"
+
+
+def chat_attachments_prompt(files: Iterable[tuple[str, str]], can_open: bool) -> str:
+    """Tells the lead which files the human researcher attached to their message.
+
+    :param files: Each file's path in the session's working directory, and its size as a person reads it.
+    :param can_open: Whether there is a session to open them in.
+    """
+    listed = "\n".join(f"- {path} ({size})" for path, size in files)
+    if can_open:
+        return f"The researcher attached these files, which are in the session's working directory:\n{listed}"
+
+    return f"The researcher attached these files, but there is no session to open them in:\n{listed}"

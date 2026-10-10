@@ -11,6 +11,9 @@ meetings it holds.
 An event is told of once it has happened, apart from "tool_calls" and "code", which are told of
 before the tools or code run, so that what is running can be shown while it does.
 
+A conversation with the head of a lab, which has the lab's meetings held for it, is followed the same
+way, with a ChatEvent that wraps the events of the meetings it starts.
+
 A meeting can also be steered as it goes, through a function given as steer, which is asked
 before every turn for a note from the person following it. A note is added to the discussion,
 for the agent about to speak and every one after it to read, and the meeting waits while the
@@ -37,6 +40,23 @@ MeetingEventKind = Literal[
 ]
 
 ProjectEventKind = Literal["team", "plan", "decided", "code", "round", "finished"]
+
+ChatEventKind = Literal[
+    "user",
+    "title",
+    "resources",
+    "writing",
+    "tool_calls",
+    "tool_output",
+    "cell",
+    "lab",
+    "note",
+    "usage",
+    "answer",
+    "stopped",
+    "failed",
+    "status",
+]
 
 
 @dataclass(frozen=True)
@@ -121,6 +141,96 @@ class ProjectEvent:
 
 
 @dataclass(frozen=True)
+class ChatEvent:
+    """Something that happened in a conversation with the head of a lab.
+
+    A conversation is a series of turns. A turn begins with the researcher's "user" message and
+    ends with one of "answer", "stopped", or "failed".
+
+    :param kind: What happened:
+
+        - "user": the researcher said something, which begins a turn. text is what they wrote, and
+          data["attachments"] holds the files they attached, each with its name, its path in the
+          session's directory, and its size in bytes.
+        - "title": the conversation was given a title, as text.
+        - "resources": the resources of Biomni's environment the lead is told of were worked out, or
+          it asked for those that suit a task. data holds them as a meeting's record does: its mode,
+          commercial_mode, the available counts, those selected by name, and how they were chosen.
+        - "writing": part of a reply has been written, by the lead, or, with data["meeting"], by a
+          scientist in a team session. text is the reply so far, which replaces what an earlier
+          "writing" event with the same data["request"] and data["meeting"] said. Only with
+          stream, and never kept in the saved log.
+        - "tool_calls": the lead called tools, which are about to run. text is what it said
+          beside them, and data["calls"] holds each one's id, name, and arguments.
+        - "tool_output": a tool the lead called finished. text is what it returned, and data holds
+          the call's id and the tool's name.
+        - "cell": code the lead ran in the session ran. data is the run, as CellResult.to_dict gives
+          it, with plot_paths, where each of its figures is on this machine, and the call's id.
+        - "lab": something happened in a team session the lead started, with data["call"] the id of
+          the call that started it. speaker and text are those of the meeting event, data["event"]
+          is its kind, data["meeting"] its name, data["round"] its round, and data["details"] the
+          rest of its data, as MeetingEvent describes. A meeting's prompts and usage are left out,
+          since they are saved with its transcript and told of as the conversation's usage.
+        - "note": the researcher's note was read, or was not. text is the note, and data holds to,
+          "lead" or "lab" for who read it, and read, which is False, with to None, for a note that
+          arrived too late for anyone to.
+        - "usage": a response came back. data is the usage of the whole conversation, as
+          MeetingUsage.to_dict gives it, with its cost, or None if that is not known, and
+          max_cost.
+        - "answer": the lead answered, which ends the turn. text is the answer, and data holds the
+          conversation's usage and elapsed_time.
+        - "stopped": the researcher stopped the turn, which ends it. text says so.
+        - "failed": the turn ended with an error. text is the error, and data holds its type, which
+          is "Interrupted" for a turn that the process running it did not live to end.
+        - "status": the conversation's state changed. data["state"] is "idle", "running",
+          "pausing", "paused", or "stopping". Never kept in the saved log.
+
+    :param id: Its number in the conversation, from 1, in the order told of, across turns and
+        across runs of the same conversation. Every event has a number of its own, including a
+        "writing" event that replaces an earlier one, so that a page that follows by number is told
+        of the change.
+    :param turn: The turn it belongs to, from 1, or 0 for what happens outside one.
+    :param speaker: Who spoke, by title, where someone did.
+    :param text: What was said, written, or found, as kind describes.
+    :param data: Everything else, as kind describes, in JSON's types.
+    :param time: When it happened, in seconds since the epoch.
+    """
+
+    kind: ChatEventKind
+    id: int = 0
+    turn: int = 0
+    speaker: str | None = None
+    text: str = ""
+    data: Mapping[str, Any] = field(default_factory=dict)
+    time: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        """The event in JSON's types, as it is saved and sent."""
+        return {
+            "kind": self.kind,
+            "id": self.id,
+            "turn": self.turn,
+            "speaker": self.speaker,
+            "text": self.text,
+            "data": dict(self.data),
+            "time": self.time,
+        }
+
+    @classmethod
+    def from_dict(cls, saved: Mapping[str, Any]) -> "ChatEvent":
+        """Rebuilds the event to_dict described."""
+        return cls(
+            kind=saved["kind"],
+            id=saved["id"],
+            turn=saved["turn"],
+            speaker=saved["speaker"],
+            text=saved["text"],
+            data=saved["data"],
+            time=saved["time"],
+        )
+
+
+@dataclass(frozen=True)
 class NextTurn:
     """The turn a meeting is about to take, as the function given as steer is told of it.
 
@@ -135,6 +245,9 @@ class NextTurn:
 
 
 OnMeetingEvent = Callable[[MeetingEvent], None]
+
+# What a conversation calls, with each ChatEvent
+OnChatEvent = Callable[[ChatEvent], None]
 
 # What run_project calls, with its own events and those of every meeting it holds
 OnProjectEvent = Callable[[MeetingEvent | ProjectEvent], None]
