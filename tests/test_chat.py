@@ -4,6 +4,7 @@ steering, and keeping the conversation so that it can be carried on."""
 import io
 import json
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from virtual_lab.constants import HUMAN_SPEAKER
 from virtual_lab.events import ChatEvent
 from virtual_lab.prompts import PRINCIPAL_INVESTIGATOR, SCIENTIFIC_CRITIC
 from virtual_lab.session import LocalSession
+from virtual_lab.tools import Tool
 from virtual_lab.utils import ContextLengthExceededError, CostUnknownError, compute_token_cost
 
 from conftest import TEST_MODEL, FakeClient, make_usage, text_response, tool_call_response
@@ -347,8 +349,6 @@ class TestCode:
     def test_tools_given_to_the_conversation_are_the_leads_to_call(
         self, fake_client: FakeClient, tmp_path: Path
     ) -> None:
-        from virtual_lab.tools import Tool
-
         look_up = Tool(
             name="look_up",
             description="Looks something up.",
@@ -425,9 +425,53 @@ class TestFiles:
         assert safe_filename("a\x00b\n.txt") == "ab.txt"
         assert safe_filename("") == "upload"
         long = safe_filename("n" * 400 + ".csv")
-        assert len(long) == 150 and long.endswith(".csv")
+        assert len(long) == 200 and long.endswith(".csv")
         assert describe_size(8) == "8 bytes" and describe_size(1536) == "1.5 KB"
         assert describe_size(5 * 1024**2) == "5.0 MB" and describe_size(3 * 1024**3) == "3.0 GB"
+
+    def test_a_name_is_kept_short_in_bytes_not_in_characters(self, tmp_path: Path) -> None:
+        long = safe_filename("é" * 300 + ".csv")
+
+        assert len(long.encode()) <= 200 and long.endswith(".csv") and set(long[:-4]) == {"é"}
+        assert len(safe_filename("a" + "é" * 300 + ".tar" + "ü" * 40).encode()) <= 200
+
+        # A file system takes it, and a number added to it
+        chat = make_chat(tmp_path)
+        first = chat.save_upload("é" * 300 + ".csv", b"one")
+        second = chat.save_upload("é" * 300 + ".csv", b"two")
+        assert second.name == f"{first.name[:-4]} (2).csv"
+        assert [(tmp_path / "chat" / "uploads" / name).read_bytes() for name in (first.name, second.name)] == [
+            b"one",
+            b"two",
+        ]
+
+    def test_files_saved_at_once_under_one_name_all_keep_their_own(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chat = make_chat(tmp_path)
+        replace = chat_module.os.replace
+
+        def slowly(source: Any, target: Any) -> None:
+            # Long enough for every upload to have looked for a free name before any takes it
+            time.sleep(0.05)
+            replace(source, target)
+
+        monkeypatch.setattr(chat_module.os, "replace", slowly)
+        saved: list[Attachment] = []
+        threads = [
+            threading.Thread(target=lambda number=number: saved.append(chat.save_upload("a.txt", f"{number}".encode())))
+            for number in range(6)
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert len({attachment.name for attachment in saved}) == 6
+        assert sorted((chat.uploads_dir / attachment.name).read_bytes() for attachment in saved) == [
+            f"{number}".encode() for number in range(6)
+        ]
 
     def test_the_lead_is_told_of_the_files_attached_to_a_message(
         self, fake_client: FakeClient, session: LocalSession, tmp_path: Path
@@ -459,6 +503,17 @@ class TestFiles:
             "- uploads/counts.csv (3 bytes)"
         )
         assert chat.title == "counts.csv"
+
+    def test_a_link_that_code_made_is_not_a_file_that_was_attached(self, tmp_path: Path) -> None:
+        chat = make_chat(tmp_path)
+        chat.save_upload("counts.csv", b"abc")
+        (tmp_path / "secret.txt").write_text("secret")
+        (chat.uploads_dir / "link.txt").symlink_to(tmp_path / "secret.txt")
+
+        with pytest.raises(ValueError, match="was attached to this conversation"):
+            chat.send("Look.", attachments=["link.txt"])
+
+        assert chat.turns == 0
 
     @pytest.mark.parametrize("name", ["missing.csv", "../outside.csv", "uploads/counts.csv"])
     def test_a_file_that_was_not_attached_is_refused(self, name: str, tmp_path: Path) -> None:
@@ -1126,6 +1181,170 @@ class TestSteering:
         assert chat.last_reply is not None and chat.last_reply.status == "stopped"
 
 
+class TestCallbacks:
+    def test_a_callback_that_fails_does_not_leave_the_conversation_running(
+        self, fake_client: FakeClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        fake_client.completions.responses = [tool_call_response("look_up", {}), text_response("Back.")]
+
+        def on_event(event: ChatEvent) -> None:
+            if event.kind in ("tool_calls", "tool_output", "failed", "status"):
+                raise RuntimeError("The page went away")
+
+        chat = make_chat(tmp_path, on_event=on_event)
+
+        reply = chat.send("Go")
+
+        assert (reply.status, reply.error) == ("failed", "RuntimeError: The page went away")
+        assert chat.state == "idle" and chat.last_reply == reply
+        # Every call has its answer, and the ending is told of, and kept, though no one could be told
+        reason = "Not run: RuntimeError: The page went away"
+        assert [(m["role"], m.get("content")) for m in chat.messages][-1] == ("tool", reason)
+        assert kinds(chat.events_since()) == ["user", "title", "usage", "tool_calls", "tool_output", "failed"]
+        assert json.loads((tmp_path / "chat" / "chat.json").read_text())["running"] is False
+        assert "Warning: on_event failed when told of the end of the turn" in capsys.readouterr().out
+
+        # And it goes on
+        chat.on_event = None
+        fake_client.completions.responses = [text_response("Back.")]
+        assert chat.send("Again").text == "Back."
+
+    def test_a_turn_that_cannot_be_ended_properly_still_gives_the_conversation_back(
+        self, fake_client: FakeClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client.completions.responses = [tool_call_response("look_up", {}), text_response("Back.")]
+
+        def on_event(event: ChatEvent) -> None:
+            if event.kind == "tool_calls":
+                raise RuntimeError("The page went away")
+
+        append = chat_module.append_json_line
+
+        def failing(path: Path, item: Any) -> None:
+            if item.get("role") == "tool":
+                raise OSError("No space left on device")
+            append(path, item)
+
+        chat = make_chat(tmp_path, on_event=on_event)
+        monkeypatch.setattr(chat_module, "append_json_line", failing)
+
+        with pytest.raises(OSError, match="No space left"):
+            chat.send("Go")
+
+        assert chat.state == "idle"
+        assert json.loads((tmp_path / "chat" / "chat.json").read_text())["running"] is False
+
+    def test_no_callback_is_called_with_the_conversations_lock_held(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        inside, go = threading.Event(), threading.Event()
+
+        def work() -> str:
+            inside.set()
+            go.wait(20)
+            return "Worked."
+
+        working = Tool(name="work", description="Works", parameters={"type": "object", "properties": {}}, function=work)
+        held: list[str] = []
+        states: list[str] = []
+
+        def on_event(event: ChatEvent) -> None:
+            if chat._changed._is_owned():  # type: ignore[attr-defined]
+                held.append(f"{event.kind} {event.data.get('state', '')}")
+            if event.kind == "status":
+                states.append(event.data["state"])
+
+        chat = make_chat(tmp_path, tools=(working,), on_event=on_event)
+        fake_client.completions.responses = [tool_call_response("work", {}), text_response("Done.")]
+        turn = chat.start("First")
+        assert inside.wait(10)
+        chat.pause()
+        go.set()
+        while chat.state != "paused":
+            chat.wait_for_events(0, timeout=0.01)
+        chat.resume()
+        turn.join(timeout=10)
+
+        inside.clear()
+        go.clear()
+        fake_client.completions.responses = [tool_call_response("work", {}), text_response("Done.")]
+        turn = chat.start("Second")
+        assert inside.wait(10)
+        chat.stop()
+        go.set()
+        turn.join(timeout=10)
+
+        assert held == []
+        assert states == ["running", "pausing", "paused", "running", "idle", "running", "stopping", "idle"]
+
+    def test_a_callback_for_the_start_of_a_turn_that_is_slow_holds_up_no_one_either(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        entered, release = threading.Event(), threading.Event()
+
+        def on_event(event: ChatEvent) -> None:
+            if event.kind == "status" and event.data["state"] == "running":
+                entered.set()
+                release.wait(20)
+
+        chat = make_chat(tmp_path, on_event=on_event)
+        starting = threading.Thread(target=lambda: chat.start("Go").join(timeout=20))
+        starting.start()
+        assert entered.wait(10)
+
+        following = threading.Thread(target=lambda: (chat.events_since(), chat.state, chat.wait_for_events(0, 0.01)))
+        following.start()
+        following.join(timeout=5)
+        stuck = following.is_alive()
+        release.set()
+        starting.join(timeout=20)
+
+        assert not stuck
+        assert chat.last_reply is not None and chat.last_reply.status == "answered"
+
+    def test_a_callback_that_is_slow_does_not_hold_up_those_following_the_conversation(
+        self, fake_client: FakeClient, tmp_path: Path
+    ) -> None:
+        inside, release, go = threading.Event(), threading.Event(), threading.Event()
+        working = Tool(
+            name="work",
+            description="Works until told to stop",
+            parameters={"type": "object", "properties": {}},
+            function=lambda: (inside.set(), go.wait(20), "Worked.")[-1],
+        )
+        fake_client.completions.responses = [tool_call_response("work", {}), text_response("Done.")]
+        entered = threading.Event()
+
+        def on_event(event: ChatEvent) -> None:
+            if event.kind == "status" and event.data["state"] == "pausing":
+                entered.set()
+                release.wait(20)
+
+        chat = make_chat(tmp_path, tools=(working,), on_event=on_event)
+        turn = chat.start("Go")
+        assert inside.wait(10)
+
+        pausing = threading.Thread(target=chat.pause)
+        pausing.start()
+        assert entered.wait(10)
+
+        # The callback is waiting. Anyone else can still look at the conversation, and steer it
+        following = threading.Thread(target=lambda: (chat.events_since(), chat.state, chat.add_note("Hi")))
+        following.start()
+        following.join(timeout=5)
+        stuck = following.is_alive()
+        release.set()
+        go.set()
+        pausing.join(timeout=10)
+
+        assert not stuck
+        while chat.state != "paused":
+            chat.wait_for_events(0, timeout=0.01)
+        assert chat.resume()
+        turn.join(timeout=10)
+        assert chat.last_reply is not None and chat.last_reply.text == "Done."
+
+
 class TestResources:
     def test_resources_given_are_listed_to_the_lead(
         self, fake_client: FakeClient, session: LocalSession, tmp_path: Path
@@ -1308,6 +1527,37 @@ class TestKeeping:
         assert again.send("Three").status == "answered"
         assert kinds(make_chat(tmp_path).events_since()).count("failed") == 1
 
+    def test_text_that_python_would_split_lines_at_is_kept_whole(self, fake_client: FakeClient, tmp_path: Path) -> None:
+        fake_client.completions.responses = [text_response("An answer\u2028with\x85odd\x0bbreaks.")]
+        chat = make_chat(tmp_path)
+        chat.send("A line\u2028another\x85 and\x1ca third")
+        chat.close()
+
+        again = make_chat(tmp_path)
+
+        assert again.messages == chat.messages
+        assert again.messages[0]["content"] == "A line\u2028another\x85 and\x1ca third"
+        assert again.events_since() == [event for event in chat.events_since() if event.kind != "status"]
+
+    def test_a_last_line_that_is_whole_but_not_ended_is_not_run_into_the_next(self, tmp_path: Path) -> None:
+        path = tmp_path / "lines.jsonl"
+        path.write_text('{"a": 1}\n{"b": 2}', encoding="utf-8")
+
+        assert chat_module.read_json_lines(path) == [{"a": 1}, {"b": 2}]
+        chat_module.append_json_line(path, {"c": 3})
+
+        assert chat_module.read_json_lines(path) == [{"a": 1}, {"b": 2}, {"c": 3}]
+
+    def test_a_last_line_cut_in_the_middle_of_a_character_is_dropped(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / "lines.jsonl"
+        path.write_bytes('{"a": "é"}\n{"b": "é'.encode()[:-1])
+
+        assert chat_module.read_json_lines(path) == [{"a": "é"}]
+        assert path.read_bytes() == '{"a": "é"}\n'.encode()
+        assert "was cut short" in capsys.readouterr().out
+
     def test_a_line_cut_short_by_a_crash_is_dropped_and_any_other_is_an_error(
         self, fake_client: FakeClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1471,8 +1721,6 @@ class TestFailures:
             Chat(tmp_path / "chat", LEAD, (Agent(" ", "x", "y", "z", TEST_MODEL),))
 
     def test_the_tools_that_are_the_conversations_own_cannot_be_taken(self, tmp_path: Path) -> None:
-        from virtual_lab.tools import Tool
-
         tool = Tool(
             name="consult", description="x", parameters={"type": "object", "properties": {}}, function=lambda: ""
         )

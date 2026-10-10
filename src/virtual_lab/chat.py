@@ -53,7 +53,7 @@ from virtual_lab.constants import (
     MAX_CHAT_TITLE_CHARS,
     MAX_TOOL_ITERATIONS,
     MAX_UPLOAD_BYTES,
-    MAX_UPLOAD_NAME_CHARS,
+    MAX_UPLOAD_NAME_BYTES,
     SESSION_MAX_TOOL_ITERATIONS,
 )
 from virtual_lab.events import ChatEvent, ChatEventKind, MeetingEvent, NextTurn, OnChatEvent
@@ -172,18 +172,24 @@ class ChatReply:
     elapsed_time: float
 
 
+def cut_to_bytes(text: str, size: int) -> str:
+    """The start of text that is at most size bytes in UTF-8, without half of a character."""
+    return text.encode()[:size].decode(errors="ignore")
+
+
 def safe_filename(name: str) -> str:
     """Makes a name a file can be saved under in a directory, whatever it was uploaded as.
 
     :param name: The name the file came with, which may have a path, as a browser sends it.
-    :return: Its last part, without control characters or a leading dot, and not too long.
+    :return: Its last part, without control characters or a leading dot, and short enough, in bytes,
+        for a file system to take with a number added to it.
     """
     name = re.sub(r"[\x00-\x1f\x7f]", "", name.replace("\\", "/").rsplit("/", 1)[-1])
     name = name.strip().lstrip(".").strip()
-    if len(name) > MAX_UPLOAD_NAME_CHARS:
+    if len(name.encode()) > MAX_UPLOAD_NAME_BYTES:
         stem, suffix = os.path.splitext(name)
-        suffix = suffix[:20]
-        name = stem[: MAX_UPLOAD_NAME_CHARS - len(suffix)] + suffix
+        suffix = cut_to_bytes(suffix, 20)
+        name = cut_to_bytes(stem, MAX_UPLOAD_NAME_BYTES - len(suffix.encode())) + suffix
 
     return name or "upload"
 
@@ -223,8 +229,14 @@ def read_json_lines(path: Path) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
 
-    lines = path.read_text(encoding="utf-8").splitlines()
+    # A crash can cut the last line in the middle of a character, which is then dropped with the line
+    text = path.read_bytes().decode("utf-8", errors="replace")
+    # Only a newline ends a line: text may hold the other characters splitlines breaks at, such as U+2028
+    lines = text.split("\n")
+    if lines[-1] == "":
+        lines.pop()
     items: list[dict[str, Any]] = []
+    mend = bool(text) and not text.endswith("\n")
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -234,15 +246,22 @@ def read_json_lines(path: Path) -> list[dict[str, Any]]:
             if number < len(lines):
                 raise ValueError(f"Line {number} of {path} is not JSON: {error}") from error
             print(f"Warning: the last line of {path} was cut short, and is left out")
-            write_atomically(path, "".join(f"{json.dumps(item, default=str)}\n" for item in items).encode("utf-8"))
+            mend = True
+
+    if mend:
+        write_atomically(path, "".join(json_line(item) for item in items).encode("utf-8"))
 
     return items
+
+
+def json_line(item: Any) -> str:
+    return json.dumps(item, ensure_ascii=False, default=str) + "\n"
 
 
 def append_json_line(path: Path, item: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(item, ensure_ascii=False, default=str) + "\n")
+        file.write(json_line(item))
 
 
 def describe_call(call: ToolCall) -> dict[str, str]:
@@ -290,10 +309,13 @@ class Chat:
     :param stream: Whether on_event, and anyone following the conversation, is also told of each
         reply as it is written, with "writing" events, as hold_meeting takes it.
     :param on_event: Called with every ChatEvent in the thread that caused it, which can be any
-        thread that steers the conversation. It may call the conversation's own methods, but it must
+        thread that steers the conversation, with no lock of the conversation's held, so that a slow
+        one holds up only that thread. Events from different threads may arrive out of order: their
+        id is the order they happened in. It may call the conversation's own methods, but it must
         not wait for another thread that does. An exception it raises ends the turn the way any
-        other failure does, except from an event that ends it, or one told of from a thread that
-        did not start the turn, which are warned of.
+        other failure does, except from an event that tells of how the turn ended or of the state
+        the conversation is in, which are warned of, so that a failing callback, such as one for
+        a page that went away, cannot leave the conversation running.
     :param max_upload_bytes: The most bytes of one file the researcher may attach.
     :raises ValueError: If an argument is not valid, or the lead and the team do not have titles of
         their own.
@@ -410,6 +432,7 @@ class Chat:
         self._consultants = tuple(agent for agent in team if agent is not critic)
 
         self._changed = threading.Condition()
+        self._uploading = threading.Lock()
         self._events: list[ChatEvent] = []
         self._live: dict[tuple[Any, ...], ChatEvent] = {}
         self._state_event: ChatEvent | None = None
@@ -485,7 +508,7 @@ class Chat:
 
         reason = "The process running this conversation stopped before the turn ended."
         self._close_open_calls(f"Not run. {reason}")
-        self._emit("failed", text=reason, type="Interrupted")
+        self._emit_ending("failed", reason, type="Interrupted")
         self._save_info()
 
     def _save_info(self) -> None:
@@ -554,17 +577,23 @@ class Chat:
         except Exception as error:
             print(f"Warning: on_event failed when told of the end of the turn: {error!r}")
 
-    def _set_state(self, state: ChatState) -> None:
-        with self._changed:
-            if self._state == state:
-                return
-            self._state = state
-            event = self._record("status", None, "", {"state": state})
-        if self.on_event is not None:
-            try:
-                self.on_event(event)
-            except Exception as error:
-                print(f"Warning: on_event failed when told the conversation was {state}: {error!r}")
+    def _change_state(self, state: ChatState) -> ChatEvent | None:
+        """Moves the conversation to a state, with self._changed held, and numbers the event that tells
+        of it, which is for _tell_state to pass on once the lock is released, so that a callback that
+        is slow cannot hold up whoever else is steering or following the conversation."""
+        if self._state == state:
+            return None
+        self._state = state
+
+        return self._record("status", None, "", {"state": state})
+
+    def _tell_state(self, event: ChatEvent | None) -> None:
+        if event is None or self.on_event is None:
+            return
+        try:
+            self.on_event(event)
+        except Exception as error:
+            print(f"Warning: on_event failed when told the conversation was {event.data['state']}: {error!r}")
 
     def events_since(self, after: int = 0) -> list[ChatEvent]:
         """What has happened since the event numbered after, in order, for a page to catch up with.
@@ -653,8 +682,8 @@ class Chat:
             if self._state not in ("running", "pausing", "paused"):
                 return False
             self._paused = True
-            if self._state == "running":
-                self._set_state("pausing")
+            told = self._change_state("pausing") if self._state == "running" else None
+        self._tell_state(told)
 
         return True
 
@@ -664,9 +693,9 @@ class Chat:
             if not self._paused:
                 return False
             self._paused = False
-            if self._state in ("pausing", "paused"):
-                self._set_state("running")
+            told = self._change_state("running") if self._state in ("pausing", "paused") else None
             self._changed.notify_all()
+        self._tell_state(told)
 
         return True
 
@@ -677,8 +706,9 @@ class Chat:
             if self._state == "idle":
                 return False
             self._stopping = True
-            self._set_state("stopping")
+            told = self._change_state("stopping")
             self._changed.notify_all()
+        self._tell_state(told)
 
         return True
 
@@ -748,13 +778,15 @@ class Chat:
                     file.write(block)
 
             stem, suffix = os.path.splitext(filename)
-            for number in itertools.count(1):
-                target = directory / (filename if number == 1 else f"{stem} ({number}){suffix}")
-                if not target.exists():
-                    os.replace(temporary, target)
-                    break
-                if sha256_file(target) == digest.hexdigest():
-                    break
+            # Choosing a name and taking it are one step, or two uploads of a name could both take it
+            with self._uploading:
+                for number in itertools.count(1):
+                    target = directory / (filename if number == 1 else f"{stem} ({number}){suffix}")
+                    if not target.exists():
+                        os.replace(temporary, target)
+                        break
+                    if sha256_file(target) == digest.hexdigest():
+                        break
         finally:
             Path(temporary).unlink(missing_ok=True)
 
@@ -765,7 +797,7 @@ class Chat:
         for item in items:
             name = item.name if isinstance(item, Attachment) else item
             path = self.uploads_dir / name
-            if name != safe_filename(name) or not path.is_file():
+            if name != safe_filename(name) or path.is_symlink() or not path.is_file():
                 raise ValueError(f"No file named {name!r} was attached to this conversation")
             files.append(Attachment(name=name, path=f"{CHAT_UPLOADS_DIR_NAME}/{name}", size=path.stat().st_size))
 
@@ -828,8 +860,9 @@ class Chat:
             self._stopping = False
             self._notes = []
             self._delegations = 0
-            self._set_state("running")
+            told = self._change_state("running")
             self._save_info()
+        self._tell_state(told)
 
         try:
             self._emit("user", speaker=HUMAN_SPEAKER, text=text, attachments=[file.to_dict() for file in files])
@@ -846,10 +879,22 @@ class Chat:
             self._paused = False
             self._stopping = False
             self._notes = []
-            self._set_state("idle")
+            told = self._change_state("idle")
             self._save_info()
+        self._tell_state(told)
 
     def _run_turn(self, text: str, files: list[Attachment]) -> ChatReply:
+        try:
+            reply, crash = self._answer(text, files)
+        finally:
+            # Whatever went wrong, the conversation is given back, so that it is not left running for good
+            self._end_turn()
+        if crash is not None:
+            raise crash
+
+        return reply
+
+    def _answer(self, text: str, files: list[Attachment]) -> tuple[ChatReply, BaseException | None]:
         started = time.monotonic()
         status: ChatStatus = "answered"
         answer = ""
@@ -878,6 +923,8 @@ class Chat:
             self._emit_ending("note", note, to=None, read=False)
 
         elapsed = round(time.monotonic() - started, 3)
+        reply = ChatReply(status=status, text=answer, error=error, usage=usage, elapsed_time=elapsed)
+        self.last_reply = reply
         if status == "answered":
             self._emit_ending("answer", answer, usage=usage, elapsed_time=elapsed)
         elif status == "stopped":
@@ -886,12 +933,7 @@ class Chat:
             assert error is not None
             self._emit_ending("failed", error, type=error.split(":", 1)[0], elapsed_time=elapsed)
 
-        self._end_turn()
-        self.last_reply = ChatReply(status=status, text=answer, error=error, usage=usage, elapsed_time=elapsed)
-        if crash is not None:
-            raise crash
-
-        return self.last_reply
+        return reply, crash
 
     def _what_was_sent(self, text: str, files: list[Attachment]) -> str:
         if not files:
@@ -1129,14 +1171,17 @@ class Chat:
 
         :param to: Who is about to read them.
         """
-        with self._changed:
-            while self._paused and not self._stopping:
-                if self._state == "pausing":
-                    self._set_state("paused")
-                self._changed.wait()
-            if self._stopping:
-                raise ChatStopped()
-            notes, self._notes = self._notes, []
+        while True:
+            with self._changed:
+                if self._stopping:
+                    raise ChatStopped()
+                if not self._paused:
+                    notes, self._notes = self._notes, []
+                    break
+                told = self._change_state("paused") if self._state == "pausing" else None
+                if told is None:
+                    self._changed.wait()
+            self._tell_state(told)
 
         for note in notes:
             self._emit("note", speaker=HUMAN_SPEAKER, text=note, to=to, read=True)
@@ -1156,7 +1201,7 @@ class Chat:
 
         for call in open_calls:
             self._append({"role": "tool", "tool_call_id": call["id"], "content": reason})
-            self._emit("tool_output", text=reason, call=call["id"], name=call["function"]["name"])
+            self._emit_ending("tool_output", reason, call=call["id"], name=call["function"]["name"])
 
     # Resources
 

@@ -399,9 +399,10 @@ CHAT_LAB_DIR_NAME = "lab"
 MAX_CHAT_DELEGATIONS = 3
 MAX_CHAT_DELEGATION_ROUNDS = 3
 
-# The most bytes of one file the researcher may attach, and the most characters kept of its name
+# The most bytes of one file the researcher may attach, and the most bytes kept of its name, which
+# leaves room under the 255 that file systems take for a number to be added to it
 MAX_UPLOAD_BYTES = 4 * 1024**3
-MAX_UPLOAD_NAME_CHARS = 150
+MAX_UPLOAD_NAME_BYTES = 200
 
 # The most characters of the researcher's first message used as the conversation's title
 MAX_CHAT_TITLE_CHARS = 80
