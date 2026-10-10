@@ -470,6 +470,48 @@ memory.save(Path("memory.json"))
 ```
 
 
+## Talking to the head of a lab
+
+A meeting or a project is run to a plan. A `Chat` is the other way round: you talk to one agent, the lead, and it answers directly when it can. When the answer needs a computation it runs code in the session, and when a question needs more than one kind of expertise it brings the team in, through two tools it is given:
+
+- `convene_team`: several scientists of the team discuss an agenda with the lead leading, and the lead is given the summary they reached.
+- `consult`: one scientist works on an agenda with the Scientific Critic reviewing, and the lead is given its answer.
+
+```python
+from virtual_lab import Chat, LocalSession
+
+with LocalSession(Path("work")) as session:
+    chat = Chat(
+        Path("chats/nanobody"), lead=principal_investigator,
+        team=(immunologist, ml_specialist, scientific_critic), session=session, max_cost=5.0,
+    )
+    counts = chat.save_upload("counts.csv", open("counts.csv", "rb"))
+    reply = chat.send("Which genes are higher in the treated samples?", attachments=[counts])
+    print(reply.status, reply.text)
+```
+
+- These are meetings, held as a `Project` holds them, in the conversation's directory under `lab/`: they run in the same session, get the same resources and tools, are saved and counted the same way, and count towards the same `max_cost` as the lead's own requests, in every run of the conversation on that directory. The lead may start `max_delegations` of them in answering one message, and asks for at most `max_rounds` rounds of each, so a question cannot run up a bill the researcher did not expect. Without a team, or with `max_delegations=0`, the lead works alone. Without a `session` nobody runs code.
+- A turn ends `answered`, `stopped`, or `failed`, as the `ChatReply` says. A failure is reported there and as an event, not raised, and the conversation goes on from it. `send` waits for the answer, and `start` answers in a thread of its own, to be followed through the events.
+- Files are attached with `save_upload`, which keeps one under a name that is safe whatever it was uploaded as, never replaces another, and refuses one larger than `max_upload_bytes`. They are saved in the session's `uploads/`, where its code reads them, and the lead is told what was attached. `resources` is as for a meeting: the lead is told of Biomni's tools, data lake, libraries, and know-how, by default through a `find_resources` tool that asks which of them suit a task, and the team is told of the same.
+- Everything that happens is a `ChatEvent`, numbered in order: the message, each reply as it is written with `stream=True`, each tool call and its output, each run of code with where its figures are, what the team does, notes, and usage, and how the turn ended. `on_event` is called with each, and `events_since(n)` and `wait_for_events(n, timeout)` give what has happened after number `n`, so a page that reconnects catches up from the last one it saw without missing any. The state the conversation is in, and the reply being written, are the latest of each, not what they were as they changed.
+- `on_event` is called in the thread that caused the event, with none of the conversation's locks held, so a slow callback holds up only its own thread. Events from different threads can reach it out of order, and their number is the order they happened in. An exception it raises ends the turn like any other failure, except when it is told how the turn ended or what state the conversation is in, which is only warned about, so a callback for a page that went away cannot leave the conversation running.
+
+```python
+thread = chat.start("Design a nanobody against KP.3.")
+last = 0
+while thread.is_alive():
+    for event in chat.wait_for_events(last, timeout=1):
+        last = event.id
+        if event.kind == "lab":
+            print(f"[{event.data['meeting']}] {event.speaker}: {event.text}")
+        elif event.kind == "answer":
+            print(event.text)
+```
+
+- The researcher steers from any other thread. `add_note` gives the lead, or the team if it is working, a note to read before it goes on. `pause` holds the turn before its next request, or the team's next turn, until `resume`. `stop` ends it at the next point it can be, with what was done kept and every tool call answered, so the next message starts from a valid conversation; code or a tool that is running is not interrupted. `close` stops a turn and ends waits on the events.
+- The conversation is saved as it goes in its directory: `chat.json`, `messages.jsonl` (what the lead was sent and said), `events.jsonl`, `uploads/`, and `lab/`. A `Chat` opened on the same directory carries on from there, with the same title, usage, and messages and the same numbering of events. If the process was killed during a turn, that turn is ended as `Interrupted` when the conversation is opened.
+- A conversation that has outgrown what the lead's model can read says so, in an error that names what to do, rather than being sent to fail. `max_cost` is checked before every request, so it can be overrun by the cost of one, and a model with no known price cannot be given one.
+
 ## Growing the toolset from papers
 
 Biomni grows its toolset by reading papers for the computational tasks, databases, and software in them. `read_paper` and `extract_paper_findings` do the same reading. A PDF needs pypdf: `pip install "virtual-lab[papers]"`. Plain text, Markdown, and LaTeX files need nothing.

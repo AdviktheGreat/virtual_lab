@@ -30,6 +30,7 @@ from virtual_lab.benchmarks import (
     Question,
     download_benchmarks,
 )
+from virtual_lab.chat import Attachment, Chat, ChatBusyError, ChatClosedError, ChatReply, UploadTooLargeError
 from virtual_lab.chemistry import (
     Activity,
     ActivityResults,
@@ -76,7 +77,7 @@ from virtual_lab.evaluation import (
     TeamMeeting,
     run_benchmark,
 )
-from virtual_lab.events import MeetingEvent, NextTurn, ProjectEvent
+from virtual_lab.events import ChatEvent, MeetingEvent, NextTurn, ProjectEvent
 from virtual_lab.export import (
     PDFExportError,
     meeting_html,
@@ -249,6 +250,7 @@ __all__ = [
     "Article",
     "ArticleResults",
     "ArticleText",
+    "Attachment",
     "Attempt",
     "Benchmark",
     "BenchmarkDownload",
@@ -263,6 +265,11 @@ __all__ = [
     "CHEMBL_TARGET_SEARCH_TOOL",
     "CellResult",
     "Chain",
+    "Chat",
+    "ChatBusyError",
+    "ChatClosedError",
+    "ChatEvent",
+    "ChatReply",
     "CodeAction",
     "CodeArtifacts",
     "CodeFile",
@@ -379,6 +386,7 @@ __all__ = [
     "UNIPROT_SEARCH_TOOL",
     "UnsafeFilenameError",
     "UnsupportedLanguageError",
+    "UploadTooLargeError",
     "WebRequestError",
     "all_tools",
     "answer_in_terminal",

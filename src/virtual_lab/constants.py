@@ -384,6 +384,29 @@ REPORT_MARKDOWN_FILE_NAME = "report.md"
 # The findings a project run to its goal has made, as its LabMemory keeps them
 MEMORY_FILE_NAME = "memory.json"
 
+# A conversation with the head of a lab keeps in its directory what it is, the messages the lead
+# was sent, one JSON object to a line, and what happened as it went, in the same form; the files
+# the researcher attached; and, as a project, the team sessions the lead started
+CHAT_FILE_NAME = "chat.json"
+CHAT_MESSAGES_FILE_NAME = "messages.jsonl"
+CHAT_EVENTS_FILE_NAME = "events.jsonl"
+CHAT_UPLOADS_DIR_NAME = "uploads"
+CHAT_LAB_DIR_NAME = "lab"
+
+# The most team sessions the lead may start in answering one message, and the most rounds of
+# discussion it may ask one for. Each costs many requests, so a lead that has not been told
+# there is a limit can spend a good deal on one question.
+MAX_CHAT_DELEGATIONS = 3
+MAX_CHAT_DELEGATION_ROUNDS = 3
+
+# The most bytes of one file the researcher may attach, and the most bytes kept of its name, which
+# leaves room under the 255 that file systems take for a number to be added to it
+MAX_UPLOAD_BYTES = 4 * 1024**3
+MAX_UPLOAD_NAME_BYTES = 200
+
+# The most characters of the researcher's first message used as the conversation's title
+MAX_CHAT_TITLE_CHARS = 80
+
 # Identifies this library to the services it queries. NCBI and EMBL-EBI both ask clients to say
 # who they are, and an unidentified client is the first to be throttled.
 WEB_USER_AGENT = "virtual-lab (https://github.com/zou-group/virtual_lab)"
