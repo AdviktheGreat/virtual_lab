@@ -512,6 +512,33 @@ while thread.is_alive():
 - The conversation is saved as it goes in its directory: `chat.json`, `messages.jsonl` (what the lead was sent and said), `events.jsonl`, `uploads/`, and `lab/`. A `Chat` opened on the same directory carries on from there, with the same title, usage, and messages and the same numbering of events. If the process was killed during a turn, that turn is ended as `Interrupted` when the conversation is opened.
 - A conversation that has outgrown what the lead's model can read says so, in an error that names what to do, rather than being sent to fail. `max_cost` is checked before every request, so it can be overrun by the cost of one, and a model with no known price cannot be given one.
 
+### Serving the conversation to a page
+
+A page talks to a `Chat` through a server, which keeps each conversation under `chats/` in the workspace, runs its code in the session the settings choose, and tells the page of every event as it happens. It needs FastAPI and Uvicorn, which the `server` extra installs.
+
+```bash
+pip install "virtual-lab[server]"
+virtual-lab-server                      # http://127.0.0.1:8765, or the first free port after it
+virtual-lab-server --workspace ~/lab --port 9000 --no-browser
+```
+
+```python
+from virtual_lab.server import serve
+
+serve(workspace="~/lab", port=9000)     # waits until stopped
+```
+
+It prints a link with a token in it. Opening the link keeps the token in a cookie, and takes it out of the address.
+
+- The server is for one person. Anyone who reaches it can spend on your keys and, where code runs, run code on your machine, so it answers only a request that names this machine in its Host header (which turns away a page at another address that was made to point here), wants the token for everything under `/api` but `/api/health` (as the cookie, or as `Authorization: Bearer`), and turns away a request that changes anything and comes from a page of another address. Listening beyond this machine with `--host` is refused unless `--allowed-host` names what it is reached by, and it says so when it starts. `--token` or `$VIRTUAL_LAB_SERVER_TOKEN` sets the token; otherwise one is made for each run.
+- Every route is under `/api` and answers in JSON, and an error answers `{"error": {"code": ..., "message": ...}}` with a code a page can act on: `missing_keys` (422, naming which keys), `busy` and `closed` (409), `too_large` (413), `not_found`, and `invalid` (422).
+- `GET /api/chats` lists the conversations, `POST /api/chats` starts one (the model, the lead, the team, where code runs, the budget, and whether to stream, each taken from the settings or the library if left out), and `GET`, `PATCH`, and `DELETE /api/chats/{id}` show, rename, and remove one. A conversation that was saved is opened again when it is asked for, with its events numbered as they were. One whose model's key is not set can be read, and is asked nothing until the key is set.
+- `POST /api/chats/{id}/messages` answers at once (202), and the answer comes as events. `note`, `pause`, `resume`, and `stop` steer the turn that is running, and say whether they could.
+- `GET /api/chats/{id}/events` is a stream of server-sent events, each with its number as its `id`. It starts after `?after=` or the `Last-Event-ID` a browser sends when it opens the stream again, whichever is later, so a page that was cut off misses nothing. The server keeps nothing for a stream: it reads the conversation, so a slow page is told of the latest of a reply being written, and not of every word.
+- `POST /api/chats/{id}/uploads?name=...` takes a file as the body, and gives back what `save_upload` does, to name in the next message. `GET /api/chats/{id}/files` lists what the conversation made or was given, and `/files/{path}` sends one. A file the agents' code wrote is never run by the page: HTML and scripts are sent as plain text, only types that are safe to show are shown in the page and the rest are saved, all with a CSP that allows nothing, and a path that leaves the conversation's directory is not a file.
+- `GET` and `PATCH /api/settings` show and change what each new conversation starts with, `GET /api/models` lists the models and whether their keys are set, and `GET /api/keys` says which providers have theirs. `PUT /api/keys/{name}` sets a key until the server stops, and `DELETE` takes it away. A key is never saved or sent back. `/api/scientists` keeps the scientists you describe, as the web interface does.
+- With `--static-dir` (or pages in the install), the server also shows the built pages of an interface, and any address that is not a file or under `/api` shows its first page.
+
 ## Growing the toolset from papers
 
 Biomni grows its toolset by reading papers for the computational tasks, databases, and software in them. `read_paper` and `extract_paper_findings` do the same reading. A PDF needs pypdf: `pip install "virtual-lab[papers]"`. Plain text, Markdown, and LaTeX files need nothing.

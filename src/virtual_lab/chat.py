@@ -478,6 +478,8 @@ class Chat:
             stream=stream,
         )
         self._recover()
+        if not (self.save_dir / CHAT_FILE_NAME).is_file():
+            self._save_info()
 
     # Loading and saving
 
@@ -616,6 +618,30 @@ class Chat:
         pending = [*self._events, *self._live.values(), *latest]
 
         return sorted((event for event in pending if event.id > after), key=lambda event: event.id)
+
+    def describe(self) -> dict[str, Any]:
+        """What the conversation is and where it stands, in JSON's types, for a page that lists it.
+
+        It holds its id, title, created_at, state, how many turns and team sessions there have been, what it
+        has cost and may cost, its usage, the number of the last event, who leads and who is on the team by
+        title, and whether anyone can run code.
+        """
+        with self._changed:
+            return {
+                "id": self.id,
+                "title": self.title,
+                "created_at": self.created_at,
+                "state": self._state,
+                "turns": self._turn,
+                "lab_calls": self._lab_calls,
+                "spent": self.spent,
+                "max_cost": self.max_cost,
+                "usage": self._total_usage().to_dict(),
+                "last_event_id": self._next_id - 1,
+                "lead": self.lead.title,
+                "team": [agent.title for agent in self.team],
+                "can_run_code": self.session is not None,
+            }
 
     @property
     def messages(self) -> list[dict[str, Any]]:

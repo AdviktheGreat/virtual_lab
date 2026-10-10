@@ -254,6 +254,38 @@ class TestAnswering:
         with pytest.raises(ChatClosedError):
             chat.send("Hello")
 
+    def test_a_conversation_describes_itself_for_a_page_that_lists_it(
+        self, fake_client: FakeClient, session: LocalSession, tmp_path: Path
+    ) -> None:
+        chat = make_chat(tmp_path, session=session, max_cost=1.0)
+
+        before = chat.describe()
+        assert json.loads((tmp_path / "chat" / "chat.json").read_text())["title"] == ""
+        chat.send("What is a nanobody?")
+        after = chat.describe()
+
+        assert (before["title"], before["state"], before["turns"], before["last_event_id"], before["spent"]) == (
+            "",
+            "idle",
+            0,
+            0,
+            0.0,
+        )
+        assert (before["lead"], before["team"], before["can_run_code"]) == (
+            "Principal Investigator",
+            ["Immunologist", "Computational Biologist", "Scientific Critic"],
+            True,
+        )
+        assert (after["title"], after["state"], after["turns"], after["max_cost"]) == (
+            "What is a nanobody?",
+            "idle",
+            1,
+            1.0,
+        )
+        assert after["spent"] == pytest.approx(PER_RESPONSE) and after["usage"]["num_calls"] == 1
+        assert after["last_event_id"] == chat.events_since()[-1].id and after["created_at"] == before["created_at"]
+        assert json.loads(json.dumps(after)) == after
+
     def test_the_title_is_the_first_message_unless_it_was_given(self, fake_client: FakeClient, tmp_path: Path) -> None:
         chat = make_chat(tmp_path, title="Nanobody design")
         chat.send("What is a nanobody?")

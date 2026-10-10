@@ -4,6 +4,7 @@ and its settings, all under one workspace directory.
     virtual_lab_workspace/
         settings.json                                    what every new form starts with
         scientists.json                                  the scientists the person described
+        chats/2026-10-07_1500_what-is-a-nanobody/        a conversation with the head of a lab, as Chat saves it
         meetings/2026-10-07_1530_choose-the-epitopes/    a meeting, saved as hold_meeting saves it
         projects/2026-10-07_1600_design-nanobodies/      a project, as Project saves it
 
@@ -130,8 +131,13 @@ class Workspace:
 
     def __init__(self, root: Path = DEFAULT_WORKSPACE) -> None:
         self.root = Path(root).expanduser().resolve()
+        self.chats_dir.mkdir(parents=True, exist_ok=True)
         self.meetings_dir.mkdir(parents=True, exist_ok=True)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def chats_dir(self) -> Path:
+        return self.root / "chats"
 
     @property
     def meetings_dir(self) -> Path:
@@ -186,11 +192,11 @@ class Workspace:
     def new_directory(self, kind: str, title: str, now: datetime | None = None) -> Path:
         """A new directory for a meeting or project, named after when it began and what it is about.
 
-        :param kind: "meeting" or "project".
-        :param title: Its agenda or goal.
+        :param kind: "meeting", "project", or "chat".
+        :param title: Its agenda or goal, or what the conversation is called.
         :param now: When it begins, defaulting to now.
         """
-        parent = self.meetings_dir if kind == "meeting" else self.projects_dir
+        parent = {"meeting": self.meetings_dir, "project": self.projects_dir, "chat": self.chats_dir}[kind]
         base = f"{(now or datetime.now()).strftime('%Y-%m-%d_%H%M')}_{slug(title)}"
         path = parent / base
         number = 2
