@@ -34,6 +34,32 @@ def make_client(token: str | None = TOKEN, allowed_hosts: Any = LOCAL_HOSTS, bas
     return TestClient(app, base_url=base_url, follow_redirects=False)
 
 
+def ask_guard(
+    inner: Any,
+    path: str = "/page",
+    query: bytes = b"",
+    token: str | None = None,
+    headers: Any = ((b"host", b"localhost"),),
+) -> list[dict[str, Any]]:
+    """What a guard sends for a GET to an application that is called directly, as no client would call it."""
+    sent: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {"type": "http", "method": "GET", "path": path, "query_string": query, "headers": list(headers)}
+    asyncio.run(Guard(inner, token=token)(scope, receive, send))
+
+    return sent
+
+
+async def refuse_to_be_reached(scope: Any, receive: Any, send: Any) -> None:
+    raise AssertionError("A request that should have been turned away reached the application")
+
+
 def error_code(response: Any) -> str:
     return response.json()["error"]["code"]
 
@@ -78,19 +104,7 @@ class TestHost:
         assert client.get("/api/things", headers={"authorization": f"Bearer {TOKEN}"}).status_code == 200
 
     def test_a_request_that_names_no_host_is_turned_away(self) -> None:
-        sent: list[dict[str, Any]] = []
-
-        async def receive() -> dict[str, Any]:
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message: dict[str, Any]) -> None:
-            sent.append(message)
-
-        async def inner(scope: Any, receive: Any, send: Any) -> None:
-            raise AssertionError("a request that names no host reached the application")
-
-        scope = {"type": "http", "method": "GET", "path": "/api/things", "query_string": b"", "headers": []}
-        asyncio.run(Guard(inner, token=None)(scope, receive, send))
+        sent = ask_guard(refuse_to_be_reached, "/api/things", headers=())
 
         assert sent[0]["status"] == 403
 
@@ -210,6 +224,14 @@ class TestToken:
         assert "Max-Age" not in cookie and "expires" not in cookie.lower()
         assert client.get("/api/things").status_code == 200
 
+    @pytest.mark.parametrize("path", ["//evil.example/page", "///evil.example", "//"])
+    def test_the_link_with_the_token_never_sends_the_browser_to_another_address(self, path: str) -> None:
+        sent = ask_guard(refuse_to_be_reached, path, f"token={TOKEN}".encode(), token=TOKEN)
+
+        location = dict(sent[0]["headers"])[b"location"].decode()
+        assert sent[0]["status"] == 303
+        assert location.startswith("/") and not location.startswith("//")
+
     def test_the_link_with_only_the_token_goes_to_the_first_page(self) -> None:
         response = make_client().get(f"/?token={TOKEN}")
 
@@ -276,26 +298,11 @@ class TestHeaders:
             assert response.headers["referrer-policy"] == "no-referrer"
 
     def test_what_a_route_says_for_itself_is_left_as_it_said_however_it_wrote_the_name(self) -> None:
-        sent: list[dict[str, Any]] = []
-
-        async def receive() -> dict[str, Any]:
-            return {"type": "http.request", "body": b"", "more_body": False}
-
-        async def send(message: dict[str, Any]) -> None:
-            sent.append(message)
-
         async def inner(scope: Any, receive: Any, send: Any) -> None:
             await send({"type": "http.response.start", "status": 200, "headers": [(b"X-Frame-Options", b"SAMEORIGIN")]})
             await send({"type": "http.response.body", "body": b""})
 
-        scope = {
-            "type": "http",
-            "method": "GET",
-            "path": "/page",
-            "query_string": b"",
-            "headers": [(b"host", b"localhost")],
-        }
-        asyncio.run(Guard(inner, token=None)(scope, receive, send))
+        sent = ask_guard(inner)
 
         framing = [value for name, value in sent[0]["headers"] if name.lower() == b"x-frame-options"]
         assert framing == [b"SAMEORIGIN"]

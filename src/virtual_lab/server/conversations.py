@@ -167,11 +167,14 @@ class Conversations:
         self.chat_models = chat_models
         self.loop: asyncio.AbstractEventLoop | None = None
         self._open: dict[str, ChatHandle] = {}
+        self._deleting: set[str] = set()
         self._lock = threading.RLock()
 
     def directory(self, chat_id: str) -> Path:
         """A conversation's directory, if there is one with this id."""
-        if not CHAT_ID_PATTERN.fullmatch(chat_id):
+        with self._lock:
+            deleting = chat_id in self._deleting
+        if deleting or not CHAT_ID_PATTERN.fullmatch(chat_id):
             raise not_found("conversation with that id")
         directory = self.workspace.chats_dir / chat_id
         if directory.resolve().parent != self.workspace.chats_dir or not (directory / CHAT_FILE_NAME).is_file():
@@ -275,12 +278,18 @@ class Conversations:
 
     def delete(self, chat_id: str) -> None:
         """Stops a conversation, if it is running, and removes it and everything it saved."""
-        directory = self.directory(chat_id)
         with self._lock:
+            directory = self.directory(chat_id)
             handle = self._open.pop(chat_id, None)
-        if handle is not None:
-            handle.close()
-        shutil.rmtree(directory)
+            # Until it is gone, it cannot be opened again, which would leave a conversation open on nothing
+            self._deleting.add(chat_id)
+        try:
+            if handle is not None:
+                handle.close()
+            shutil.rmtree(directory)
+        finally:
+            with self._lock:
+                self._deleting.discard(chat_id)
 
     def close(self) -> None:
         """Closes every conversation that is open, which the server does as it stops."""

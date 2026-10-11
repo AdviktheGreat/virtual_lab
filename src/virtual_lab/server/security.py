@@ -119,7 +119,9 @@ class Guard:
             return None
 
         rest = urlencode([(name, value) for name, value in query if name != TOKEN_PARAMETER])
-        response = RedirectResponse(scope["path"] + (f"?{rest}" if rest else ""), status_code=303)
+        # Not "//", which a browser would take for another address
+        path = "/" + scope["path"].lstrip("/")
+        response = RedirectResponse(path + (f"?{rest}" if rest else ""), status_code=303)
         response.set_cookie(TOKEN_COOKIE, self.token, httponly=True, samesite="strict", path="/api")
 
         return response

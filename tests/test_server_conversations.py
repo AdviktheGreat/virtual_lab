@@ -372,6 +372,29 @@ class TestClosing:
 
 
 class TestRemoving:
+    def test_a_conversation_that_is_being_removed_cannot_be_opened_or_removed_again_meanwhile(
+        self, conversations: Conversations, workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        handle = conversations.create({"team": []})
+        statuses: list[int] = []
+        close = handle.close
+
+        def close_and_try_everything() -> None:
+            for attempt in (conversations.get, conversations.ready, conversations.delete):
+                with pytest.raises(ApiError) as caught:
+                    attempt(handle.id)
+                statuses.append(caught.value.status)
+            close()
+
+        monkeypatch.setattr(handle, "close", close_and_try_everything)
+
+        conversations.delete(handle.id)
+
+        assert statuses == [404, 404, 404]
+        assert directories(workspace) == []
+        assert handle.id not in conversations._open
+        assert not conversations._deleting
+
     def test_a_conversation_is_removed_with_everything_it_saved(
         self, conversations: Conversations, workspace: Workspace, fake_client: FakeClient
     ) -> None:
